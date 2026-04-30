@@ -7,8 +7,6 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 ## Install
 
 ```bash
-pi install ./packages/pi-vision-proxy
-# or after publishing:
 pi install npm:pi-vision-proxy
 ```
 
