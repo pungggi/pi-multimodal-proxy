@@ -1,15 +1,19 @@
 {
   "name": "pi-vision-proxy",
-  "version": "1.0.1",
+  "version": "1.2.0",
   "description": "Automatic image description for non-vision models in Pi. Routes images to a vision model and injects descriptions into context.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "node --experimental-strip-types --no-warnings --test extensions/__tests__/*.test.ts"
   },
   "pi": {
-    "extensions": ["./extensions/vision-proxy.ts"]
+    "extensions": [
+      "./extensions/vision-proxy.ts"
+    ]
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",

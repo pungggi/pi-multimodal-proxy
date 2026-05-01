@@ -20,6 +20,8 @@ pi install npm:pi-vision-proxy
 
 ## Configuration
 
+Settings persist across sessions in `~/.pi/agent/vision-proxy.json`. Environment variables override file settings; in-session commands override both.
+
 ### Interactive
 
 ```

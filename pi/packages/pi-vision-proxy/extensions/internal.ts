@@ -4,6 +4,9 @@
  */
 
 import { createHash } from "node:crypto";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import os from "node:os";
+import { dirname, extname, join } from "node:path";
 import type { ImageContent as PiAiImage } from "@mariozechner/pi-ai";
 import type { SessionEntry } from "@mariozechner/pi-coding-agent";
 
@@ -60,6 +63,37 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	].join(" "),
 	includeContext: true,
 };
+
+// ── Persistent file storage ────────────────────────────────────────────────
+
+/** Path to the persistent config file stored alongside settings.json */
+export function getPersistentConfigPath(agentDir?: string): string {
+	const base = agentDir ?? join(os.homedir(), ".pi", "agent");
+	return join(base, "vision-proxy.json");
+}
+
+/** Read config from the persistent file. Returns empty object on any failure. */
+export async function readPersistentFile(agentDir?: string): Promise<Partial<VisionConfig>> {
+	try {
+		const raw = await readFile(getPersistentConfigPath(agentDir), "utf8");
+		const parsed = JSON.parse(raw);
+		if (parsed && typeof parsed === "object") return parsed as Partial<VisionConfig>;
+	} catch {
+		// file doesn't exist or is invalid — that's fine
+	}
+	return {};
+}
+
+/** Write config to the persistent file. Best-effort; errors are logged, not thrown. */
+export async function writePersistentFile(config: Partial<VisionConfig>, agentDir?: string): Promise<void> {
+	try {
+		const path = getPersistentConfigPath(agentDir);
+		await mkdir(dirname(path), { recursive: true });
+		await writeFile(path, JSON.stringify(config, null, 2) + "\n", "utf8");
+	} catch (err) {
+		// Best effort — don't break the extension if disk write fails
+	}
+}
 
 // ── Config resolution ──────────────────────────────────────────────────────
 
@@ -129,8 +163,12 @@ export function persistedBase(entries: readonly SessionEntry[]): VisionConfig {
 	return sanitize({ ...DEFAULT_CONFIG, ...readPersistedConfig(entries) });
 }
 
-export function resolveConfig(entries: readonly SessionEntry[], env: NodeJS.ProcessEnv = process.env): VisionConfig {
-	return sanitize({ ...DEFAULT_CONFIG, ...readPersistedConfig(entries), ...readEnvOverrides(env) });
+export function resolveConfig(
+	entries: readonly SessionEntry[],
+	env: NodeJS.ProcessEnv = process.env,
+	fileConfig: Partial<VisionConfig> = {},
+): VisionConfig {
+	return sanitize({ ...DEFAULT_CONFIG, ...fileConfig, ...readPersistedConfig(entries), ...readEnvOverrides(env) });
 }
 
 // ── Session-entry helpers ──────────────────────────────────────────────────
@@ -177,6 +215,182 @@ export function hashImageData(data: string): string {
 
 export function pluralImages(n: number): string {
 	return n === 1 ? "1 image" : `${n} images`;
+}
+
+// ── File-path image detection ──────────────────────────────────────────────
+
+const EXT_TO_MIME: Record<string, string> = {
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png": "image/png",
+	".gif": "image/gif",
+	".webp": "image/webp",
+	".bmp": "image/bmp",
+	".tiff": "image/tiff",
+	".tif": "image/tiff",
+	".ico": "image/x-icon",
+	".avif": "image/avif",
+};
+
+const IMAGE_EXT_ALT = "jpg|jpeg|png|gif|webp|bmp|tiff|tif|ico|avif";
+
+export const IMAGE_PATH_PLACEHOLDER = "[image file — see vision proxy description]";
+
+function mimeTypeForExt(filePath: string): string | undefined {
+	return EXT_TO_MIME[extname(filePath).toLowerCase()];
+}
+
+/**
+ * Extract candidate image file paths from prompt text.
+ * Matches `pi-clipboard-*` temp files and general paths ending with image extensions.
+ * Paths with spaces are not supported (use CLI `@file` for those).
+ */
+export function extractCandidateImagePaths(text: string): string[] {
+	const paths: string[] = [];
+	const seen = new Set<string>();
+
+	function add(p: string) {
+		p = p.trim();
+		if (p && !seen.has(p)) {
+			seen.add(p);
+			paths.push(p);
+		}
+	}
+
+	// Pass 1: pi-clipboard temp files — match from drive/root to filename, no whitespace inside path
+	for (const m of text.matchAll(
+		/(?:^|[\s"'])([a-zA-Z]:[/\\][^\s"'*?|]*?pi-clipboard-[a-f0-9-]+\.[a-zA-Z0-9]+|\/[^\s"'*?|]*?pi-clipboard-[a-f0-9-]+\.[a-zA-Z0-9]+)/gim,
+	)) {
+		add(m[1]);
+	}
+
+	// Pass 2: general image file paths ending with common extensions (no spaces)
+	// Requires a recognized path prefix (drive letter, /, ~/) followed by at least
+	// one directory separator — this filters out bare filenames in HTML/Markdown attributes.
+	const pass2Pattern = new RegExp(
+		`(?:^|[\\s"'(])((?:[a-zA-Z]:[/\\\\]|/|~)[\\w./\\\\+-]*[/\\\\][\\w.+-]+\\.(?:${IMAGE_EXT_ALT}))\\b`,
+		"gi",
+	);
+	for (const m of text.matchAll(pass2Pattern)) {
+		add(m[1]);
+	}
+	// Also match ./ and ../ relative paths
+	const relPattern = new RegExp(
+		`(?:^|[\\s"'(])(\\.\\.?/[\\w./\\\\+-]+\\.(?:${IMAGE_EXT_ALT}))\\b`,
+		"gi",
+	);
+	for (const m of text.matchAll(relPattern)) {
+		add(m[1]);
+	}
+
+	return paths;
+}
+
+// ── Safe file read ─────────────────────────────────────────────────────────
+
+/**
+ * Size limit for images read from file paths.
+ * Override with PI_VISION_PROXY_MAX_IMAGE_BYTES.
+ */
+function maxImageFileBytes(): number {
+	const raw = process.env.PI_VISION_PROXY_MAX_IMAGE_BYTES;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n > 0) return n;
+	}
+	return 10 * 1024 * 1024;
+}
+
+export type ReadImageReason =
+	| "not-an-image"
+	| "denied"
+	| "unreadable"
+	| "empty"
+	| "too-large";
+
+export interface ReadImageResult {
+	image: PiAiImage | null;
+	reason?: ReadImageReason;
+	bytes?: number;
+}
+
+async function canonical(p: string | undefined): Promise<string | null> {
+	if (!p) return null;
+	try {
+		return (await realpath(p)).toLowerCase();
+	} catch {
+		return p.toLowerCase();
+	}
+}
+
+/**
+ * Check that a resolved file path is within a safe directory.
+ * By default allows tmpdir and cwd; opt into homedir via PI_VISION_PROXY_ALLOW_HOME=1.
+ * Both sides are canonicalized via realpath to handle symlinks and Windows 8.3 short names.
+ */
+export async function isPathAllowed(filePath: string): Promise<boolean> {
+	let resolved: string;
+	try {
+		resolved = (await realpath(filePath)).toLowerCase();
+	} catch {
+		return false;
+	}
+
+	const tmp = await canonical(os.tmpdir?.() ?? "/tmp");
+	const cwd = await canonical(process.cwd());
+
+	if (tmp && resolved.startsWith(tmp)) return true;
+	if (cwd && resolved.startsWith(cwd)) return true;
+
+	if (process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
+		const home = await canonical(os.homedir?.());
+		if (home && resolved.startsWith(home)) return true;
+	}
+
+	return false;
+}
+
+/**
+ * Read an image file and return as base64 ImageContent with a structured reason on failure.
+ */
+export async function readImageFileWithReason(filePath: string): Promise<ReadImageResult> {
+	const mimeType = mimeTypeForExt(filePath);
+	if (!mimeType) return { image: null, reason: "not-an-image" };
+	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
+	let content: Buffer;
+	try {
+		content = await readFile(filePath);
+	} catch {
+		return { image: null, reason: "unreadable" };
+	}
+	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
+	const limit = maxImageFileBytes();
+	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
+	return {
+		image: { type: "image", data: content.toString("base64"), mimeType },
+		bytes: content.length,
+	};
+}
+
+/**
+ * Read an image file. Returns null on any failure. Prefer readImageFileWithReason for diagnostics.
+ */
+export async function readImageFile(filePath: string): Promise<PiAiImage | null> {
+	return (await readImageFileWithReason(filePath)).image;
+}
+
+/**
+ * Replace detected image file paths in text with a placeholder.
+ */
+export function stripImagePaths(text: string, paths: readonly string[]): string {
+	// Sort longest-first to avoid partial replacements
+	const sorted = [...paths].sort((a, b) => b.length - a.length);
+	let result = text;
+	for (const p of sorted) {
+		const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		result = result.replace(new RegExp(escaped, "g"), IMAGE_PATH_PLACEHOLDER);
+	}
+	return result;
 }
 
 export function splitSubcommand(arg: string): { sub: string; value: string } {
