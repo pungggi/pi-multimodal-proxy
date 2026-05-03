@@ -140,7 +140,7 @@ const CropEntrySchema = Type.Union([
 
 const AnalyzeImageParams = Type.Object({
 	images: Type.Array(Type.String(), {
-		description: "1..maxImagesPerCall image file paths",
+		description: "1..maxImagesPerCall image file paths (sha256 references are not supported)",
 		minItems: 1,
 		maxItems: 20,
 	}),
@@ -547,6 +547,20 @@ async function handleAnalyzeImage(
 		return `Error: too many images (${imageRefs.length}). Maximum is ${config.maxImagesPerCall}.`;
 	}
 
+	// Validate crop indices: no duplicates, all in range
+	if (crops && crops.length > 0) {
+		const seen = new Set<number>();
+		for (const c of crops) {
+			if (seen.has(c.image_index)) {
+				return `Error: duplicate crop for image index ${c.image_index}. At most one crop per image.`;
+			}
+			seen.add(c.image_index);
+			if (c.image_index < 0 || c.image_index >= imageRefs.length) {
+				return `Error: crop image_index ${c.image_index} is out of range (0-${imageRefs.length - 1}).`;
+			}
+		}
+	}
+
 	// Resolve model (override or default)
 	let visionProvider = config.provider;
 	let visionModelId = config.modelId;
@@ -571,26 +585,14 @@ async function handleAnalyzeImage(
 	// Check consent for the resolved vision provider
 	const entries = ctx.sessionManager.getEntries();
 	if (!hasConsent(entries, visionProvider)) {
-		return `Error: consent required before sending data to ${visionProvider}. Run /vision-proxy consent yes to grant.`;
+		return `Error: consent required before sending data to ${visionProvider}. Use /vision-proxy model ${visionProvider}/... then /vision-proxy consent yes, or call without a model override.`;
 	}
 
 	// Resolve image references to PiAiImage objects
 	const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 	for (const ref of imageRefs) {
 		if (ref.startsWith("sha256:")) {
-			// Hash reference: look up the image data from prior session entries
-			const hex = ref.slice(7).toLowerCase();
-			const descriptions = findDescriptions(ctx.sessionManager.getEntries());
-			if (!descriptions.has(hex)) {
-				return `Error: image hash "${hex}" not found in session. Provide a file path instead.`;
-			}
-			const meta = _imageMeta.get(hex);
-			if (!meta) {
-				return `Error: image metadata for hash "${hex}" not available (dimensions unknown). Provide a file path instead.`;
-			}
-			// Hash references can only be used for re-analysis if the raw image data is still in the session.
-			// For now, return a clear error indicating the limitation.
-			return `Error: sha256 references require the original image data which is not stored in session entries. Provide a file path for the image.`;
+			return `Error: sha256 references are not supported. Provide a file path for the image.`;
 		}
 
 		// File path
@@ -605,6 +607,9 @@ async function handleAnalyzeImage(
 		storeImageMeta(hash, r.image.data, r.filename);
 		resolvedImages.push({ image: r.image, hash, meta: _imageMeta.get(hash) });
 	}
+
+	// Build grounding instruction (needed for cache hit telemetry too)
+	const groundingFormat = getGroundingFormat(config, visionProvider, visionModelId);
 
 	// Apply crops and build per-image payloads
 	const imagePayloads: { image: PiAiImage; hash: string; meta: ImageMeta | undefined; crop?: ReturnType<typeof resolveCropEntry> }[] = [];
@@ -628,8 +633,28 @@ async function handleAnalyzeImage(
 		}
 	}
 
-	// Build cache key (original order — different order = different cache entry,
-	// since the prompt refers to images by index)
+	// Apply crops to image bytes BEFORE cache key and sending to vision model
+	let anyCropApplied = false;
+	for (const p of imagePayloads) {
+		if (p.crop) {
+			const buf = piAiImageToBuffer(p.image);
+			const cropped = await cropImage(buf, p.crop, p.image.mimeType);
+			if (cropped) {
+				p.image = bufferToPiAiImage(cropped, p.image.mimeType);
+				anyCropApplied = true;
+			} else {
+				ctx.ui.notify(
+					`[vision-proxy] Crop failed for an image — sending full image instead.`,
+					"warning",
+				);
+				p.crop = undefined; // don't report crop in fence
+			}
+		}
+	}
+
+	// Build cache key AFTER crop resolution (so failed crops don't create stale crop keys)
+	// Uses original order — different order = different cache entry,
+	// since the prompt refers to images by index
 	const orderedHashes = imagePayloads.map((p) => p.hash);
 	const cropSig = crops?.length
 		? imagePayloads.map((p) => p.crop ? cropSignature(p.crop) : "full").join("+")
@@ -655,25 +680,6 @@ async function handleAnalyzeImage(
 		return cached;
 	}
 
-	// Apply crops to image bytes BEFORE sending to vision model
-	let anyCropApplied = false;
-	for (const p of imagePayloads) {
-		if (p.crop) {
-			const buf = piAiImageToBuffer(p.image);
-			const cropped = await cropImage(buf, p.crop, p.image.mimeType);
-			if (cropped) {
-				p.image = bufferToPiAiImage(cropped, p.image.mimeType);
-				anyCropApplied = true;
-			} else {
-				ctx.ui.notify(
-					`[vision-proxy] Crop failed for an image — sending full image instead.`,
-					"warning",
-				);
-				p.crop = undefined; // don't report crop in fence
-			}
-		}
-	}
-
 	// Call vision model
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(visionModel);
 	if (!auth.ok || !auth.apiKey) {
@@ -686,7 +692,6 @@ async function handleAnalyzeImage(
 	);
 
 	// Build grounding instruction
-	const groundingFormat = getGroundingFormat(config, visionProvider, visionModelId);
 	const groundingInstruction = buildGroundingInstruction(groundingFormat);
 
 	const systemPrompt = config.systemPrompt + groundingInstruction;
@@ -760,11 +765,9 @@ async function handleAnalyzeImage(
 			groundingFormat !== "none" ? groundingFormat : undefined,
 		);
 	} else {
-		result = buildAnalysisFence(
-			orderedHashes.join("+"),
+		result = buildJointDescriptionFence(
+			imagePayloads.map((p) => ({ hash: p.hash, meta: p.meta })),
 			text,
-			undefined,
-			undefined,
 			groundingFormat !== "none" ? groundingFormat : undefined,
 		);
 	}
@@ -846,7 +849,6 @@ export default function (pi: ExtensionAPI) {
 		// Clear per-session state from previous sessions
 		_imageMeta.clear();
 		_toolCache.clear();
-		_toolCallCount = 0;
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -865,6 +867,9 @@ export default function (pi: ExtensionAPI) {
 			event: BeforeAgentStartEvent,
 			ctx: ExtensionContext,
 		): Promise<BeforeAgentStartEventResult | void> => {
+			// Reset per-turn tool call counter
+			_toolCallCount = 0;
+
 			// Collect images: structured attachments + file paths detected in prompt text
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
 			const filePaths = extractCandidateImagePaths(event.prompt);
@@ -1184,7 +1189,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					`[vision-proxy] Consent: ${
-						hasConsent(entries) ? "granted" : "not granted"
+						hasConsent(entries, effective.provider) ? "granted" : "not granted"
 					}. Use /vision-proxy consent yes|no.`,
 					"info",
 				);
@@ -1236,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (valueLower === "off") {
 					writePersisted({ ...persisted, tool: "off" });
-					ctx.ui.notify(`[vision-proxy] analyze_image tool: OFF (takes effect next session)`, "warning");
+					ctx.ui.notify(`[vision-proxy] analyze_image tool: OFF (existing calls will return disabled error)`, "warning");
 					return;
 				}
 				ctx.ui.notify(
@@ -1467,6 +1472,26 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("[vision-proxy] No valid images provided.", "error");
 					return;
 				}
+				if (resolvedImages.length > descConfig.maxImagesPerCall) {
+					ctx.ui.notify(`[vision-proxy] Too many images (${resolvedImages.length}). Maximum is ${descConfig.maxImagesPerCall}.`, "error");
+					return;
+				}
+
+				// Validate crop indices
+				if (parsed.crops && parsed.crops.length > 0) {
+					const seen = new Set<number>();
+					for (const c of parsed.crops) {
+						if (seen.has(c.image_index)) {
+							ctx.ui.notify(`[vision-proxy] Duplicate crop for image index ${c.image_index}.`, "error");
+							return;
+						}
+						seen.add(c.image_index);
+						if (c.image_index < 0 || c.image_index >= resolvedImages.length) {
+							ctx.ui.notify(`[vision-proxy] Crop image_index ${c.image_index} is out of range (0-${resolvedImages.length - 1}).`, "error");
+							return;
+						}
+					}
+				}
 
 				// Apply crops
 				const imagePayloads: { image: PiAiImage; hash: string; meta: ImageMeta | undefined; crop?: ReturnType<typeof resolveCropEntry> }[] = [];
@@ -1581,11 +1606,9 @@ export default function (pi: ExtensionAPI) {
 							groundingFormat !== "none" ? groundingFormat : undefined,
 						);
 					} else {
-						fence = buildAnalysisFence(
-							imagePayloads.map((p) => p.hash).join("+"),
+						fence = buildJointDescriptionFence(
+							imagePayloads.map((p) => ({ hash: p.hash, meta: p.meta })),
 							text,
-							undefined,
-							undefined,
 							groundingFormat !== "none" ? groundingFormat : undefined,
 						);
 					}
@@ -1623,7 +1646,7 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}\n` +
 				`Max batch: ${effective.maxBatch}\n` +
 				`Cache size: ${effective.cacheSize}\n` +
-				`Consent: ${hasConsent(entries) ? "granted" : "not granted"}\n` +
+				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}\n` +
 				(env.mode || env.model || env.context
 					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize"]
 							.filter(Boolean)
@@ -1647,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}`,
 				`Max batch: ${effective.maxBatch}`,
 				`Cache size: ${effective.cacheSize}`,
-				`Consent: ${hasConsent(entries) ? "granted" : "not granted"}`,
+				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}`,
 			]);
 
 			if (!choice) return;
@@ -1747,7 +1770,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (choice.startsWith("Consent")) {
-				const granted = !hasConsent(entries);
+				const granted = !hasConsent(entries, effective.provider);
 				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
 				ctx.ui.notify(`Consent: ${granted ? "granted" : "revoked"}`, granted ? "info" : "warning");
 				return;
