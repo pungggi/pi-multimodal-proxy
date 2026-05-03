@@ -348,12 +348,15 @@ describe("hasConsent", () => {
 		assert.equal(hasConsent(entries), true);
 	});
 
-	it("global consent (no provider) matches any provider", () => {
+	it("global consent (no provider) does NOT satisfy per-provider check", () => {
 		const entries: Entry[] = [
 			customEntry(CUSTOM_TYPE_CONSENT, { granted: true }),
 		];
-		assert.equal(hasConsent(entries, "anthropic"), true);
-		assert.equal(hasConsent(entries, "openai"), true);
+		// Global consent is valid when no specific provider is requested
+		assert.equal(hasConsent(entries), true);
+		// But it does NOT satisfy a per-provider consent check
+		assert.equal(hasConsent(entries, "anthropic"), false);
+		assert.equal(hasConsent(entries, "openai"), false);
 	});
 });
 
@@ -1001,6 +1004,16 @@ describe("fenceUntrusted (all three tags)", () => {
 		// The opening bracket of each tag should be neutralized
 		assert.ok(!out.includes("<vision_proxy"), "opening < should be neutralized");
 		assert.ok(!out.includes("</vision_proxy"), "closing < should be neutralized");
+	});
+
+	it("neutralizes tags with trailing whitespace", () => {
+		const out = fenceUntrusted('</vision_proxy_description >');
+		assert.ok(!out.includes("</vision_proxy_description >"), "closing tag with space should be neutralized");
+	});
+
+	it("neutralizes tags with attributes", () => {
+		const out = fenceUntrusted('<vision_proxy_description image="abc" >');
+		assert.ok(!out.includes("<vision_proxy_description"), "opening tag with attrs should be neutralized");
 	});
 });
 

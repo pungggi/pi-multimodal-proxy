@@ -105,21 +105,21 @@ const NamedRegionSchema = Type.Union(
 
 const CropEntrySchema = Type.Union([
 	Type.Object({
-		image_index: Type.Number({ description: "0-based index into the images array" }),
+		image_index: Type.Integer({ minimum: 0, description: "0-based index into the images array" }),
 		region: NamedRegionSchema,
-	}),
+	}, { additionalProperties: false }),
 	Type.Object({
-		image_index: Type.Number({ description: "0-based index into the images array" }),
+		image_index: Type.Integer({ minimum: 0, description: "0-based index into the images array" }),
 		normalized: Type.Object({
 			x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number(),
 		}),
-	}),
+	}, { additionalProperties: false }),
 	Type.Object({
-		image_index: Type.Number({ description: "0-based index into the images array" }),
+		image_index: Type.Integer({ minimum: 0, description: "0-based index into the images array" }),
 		pixels: Type.Object({
 			x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number(),
 		}),
-	}),
+	}, { additionalProperties: false }),
 ]);
 
 const AnalyzeImageParams = Type.Object({
@@ -556,16 +556,28 @@ async function handleAnalyzeImage(
 	const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 	for (const ref of imageRefs) {
 		if (ref.startsWith("sha256:")) {
-			return `Error: hash references (sha256:...) are not yet supported as standalone inputs. Provide a file path for the image.`;
+			// Hash reference: look up the image data from prior session entries
+			const hex = ref.slice(7).toLowerCase();
+			const descriptions = findDescriptions(ctx.sessionManager.getEntries());
+			if (!descriptions.has(hex)) {
+				return `Error: image hash "${hex}" not found in session. Provide a file path instead.`;
+			}
+			const meta = _imageMeta.get(hex);
+			if (!meta) {
+				return `Error: image metadata for hash "${hex}" not available (dimensions unknown). Provide a file path instead.`;
+			}
+			// Hash references can only be used for re-analysis if the raw image data is still in the session.
+			// For now, return a clear error indicating the limitation.
+			return `Error: sha256 references require the original image data which is not stored in session entries. Provide a file path for the image.`;
 		}
 
 		// File path
 		if (ref.includes("..")) {
-			return `Error: path "${ref}" contains \"..\" segments which are not allowed.`;
+			return `Error: path contains disallowed ".." segments.`;
 		}
 		const r = await readImageFileWithReason(ref);
 		if (!r.image) {
-			return `Error: could not read image "${ref}": ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
+			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
 		}
 		const hash = hashImageData(r.image.data);
 		storeImageMeta(hash, r.image.data, r.filename);
@@ -594,17 +606,32 @@ async function handleAnalyzeImage(
 		}
 	}
 
-	// Build cache key
-	const sortedHashes = imagePayloads.map((p) => p.hash).sort();
+	// Build cache key (original order — different order = different cache entry,
+	// since the prompt refers to images by index)
+	const orderedHashes = imagePayloads.map((p) => p.hash);
 	const cropSig = crops?.length
 		? imagePayloads.map((p) => p.crop ? cropSignature(p.crop) : "full").join("+")
 		: undefined;
 	const questionHash = hashImageData(question);
-	const cacheKey = buildToolCacheKey(sortedHashes, cropSig, questionHash, `${visionProvider}/${visionModelId}`);
+	const cacheKey = buildToolCacheKey(orderedHashes, cropSig, questionHash, `${visionProvider}/${visionModelId}`);
 
 	// Check cache
 	const cached = _toolCache.get(cacheKey);
-	if (cached) return cached;
+	if (cached) {
+		// Log telemetry for cache hit
+		pi.appendEntry(CUSTOM_TYPE_TOOL_CALL, {
+			images: orderedHashes,
+			cropForm: crops?.length ? (crops[0].region ? "region" : crops[0].normalized ? "normalized" : "pixels") : "none",
+			cropApplied: false,
+			question: question.slice(0, 200),
+			reason: reason ? reason.slice(0, 200) : undefined,
+			model: `${visionProvider}/${visionModelId}`,
+			latencyMs: 0,
+			cacheHit: true,
+			groundingFormat,
+		});
+		return cached;
+	}
 
 	// Call vision model
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(visionModel);
@@ -626,9 +653,8 @@ async function handleAnalyzeImage(
 	// Build the user message content
 	const contentParts: Array<{ type: "text"; text: string } | PiAiImage> = [];
 	const imageLabels = imagePayloads.map((p, i) => {
-		const dim = p.crop
-			? `${p.crop.width}x${p.crop.height} (cropped from ${p.meta?.width ?? "?"}x${p.meta?.height ?? "?"})`
-			: `${p.meta?.width ?? "?"}x${p.meta?.height ?? "?"}`;
+		// NOTE: crop is resolved but NOT applied to bytes, so report full image dimensions
+		const dim = `${p.meta?.width ?? "?"}x${p.meta?.height ?? "?"}`;
 		return `Image ${i + 1}: ${dim} pixels${p.meta?.filename ? ` (${p.meta.filename})` : ""}`;
 	}).join("\n");
 
@@ -707,7 +733,7 @@ async function handleAnalyzeImage(
 		);
 	} else {
 		result = buildAnalysisFence(
-			sortedHashes.join("+"),
+			orderedHashes.join("+"),
 			text,
 			undefined,
 			undefined,
@@ -720,7 +746,7 @@ async function handleAnalyzeImage(
 
 		// Log telemetry
 		pi.appendEntry(CUSTOM_TYPE_TOOL_CALL, {
-			images: imagePayloads.map((p) => p.hash),
+			images: orderedHashes,
 			cropForm: crops?.length ? (crops[0].region ? "region" : crops[0].normalized ? "normalized" : "pixels") : "none",
 			cropApplied: false, // cropping not yet implemented
 			question: question.slice(0, 200),

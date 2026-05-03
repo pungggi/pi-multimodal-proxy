@@ -375,8 +375,12 @@ export function hasConsent(entries: readonly SessionEntry[], provider?: string):
 		if (e?.type === "custom" && e.customType === CUSTOM_TYPE_CONSENT && e.data) {
 			const entry = e.data as ConsentEntry;
 			if (!entry.granted) return false;
-			// If a specific provider is requested, check it matches
-			if (provider && entry.provider && entry.provider !== provider) continue;
+			// Per-provider consent: both must match exactly.
+			// A provider-less entry is only valid when no specific provider is requested.
+			if (provider) {
+				if (entry.provider && entry.provider !== provider) continue;
+				if (!entry.provider) continue; // global consent doesn't satisfy per-provider check
+			}
 			return true;
 		}
 	}
@@ -591,8 +595,8 @@ export function splitSubcommand(arg: string): { sub: string; value: string } {
 }
 
 // Defensive fence — replace any closing/opening tag of any of the three fence types
-// in untrusted text so it can't break out.
-const FENCE_TAG_RE = /<\/?vision_proxy_(?:description|analysis|joint_description)>/gi;
+// in untrusted text so it can't break out. Handles whitespace/attribute variants.
+const FENCE_TAG_RE = /<\/?vision_proxy_(?:description|analysis|joint_description)\b[^>]*>/gi;
 export function fenceUntrusted(text: string): string {
 	return text.replace(FENCE_TAG_RE, (m) => m.replace(/</g, "<​").replace(/>/g, ">​"));
 }
@@ -712,9 +716,11 @@ export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string,
 	if (Buffer.isBuffer(imageBufferOrData)) {
 		buf = imageBufferOrData;
 	} else {
-		// Only decode the first ~1KB for dimension extraction (image-size reads headers only)
-		const headerB64 = imageBufferOrData.slice(0, 1400); // ~1KB of base64 ≈ 1KB decoded
-		buf = Buffer.from(headerB64, "base64");
+		// Only decode enough for dimension extraction (image-size reads headers only).
+		// Round up to next multiple of 4 (base64 quantum boundary) to avoid corruption.
+		const headerB64 = imageBufferOrData.slice(0, 1400);
+		const aligned = headerB64.length - (headerB64.length % 4);
+		buf = Buffer.from(headerB64.slice(0, aligned || 4), "base64");
 	}
 	const dims = extractDimensions(buf);
 	if (dims) {
