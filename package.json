@@ -8,7 +8,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pungggi/pi-vision-proxy.git"
+    "url": "git+https://github.com/pungggi/pi-vision-proxy.git",
+    "directory": "pi/packages/pi-vision-proxy"
   },
   "homepage": "https://github.com/pungggi/pi-vision-proxy#readme",
   "type": "module",
