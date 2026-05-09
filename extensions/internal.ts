@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { basename, dirname, extname, join } from "node:path";
-import type { ImageContent as PiAiImage } from "@mariozechner/pi-ai";
-import type { SessionEntry } from "@mariozechner/pi-coding-agent";
+import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import imageSize from "image-size";
 import { Image } from "imagescript";
 

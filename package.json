@@ -1,6 +1,6 @@
 {
   "name": "pi-vision-proxy",
-  "version": "1.4.0-beta.2",
+  "version": "1.4.0-beta.3",
   "description": "Automatic image description for non-vision models in Pi. Routes images to a vision model and injects descriptions into context.",
   "keywords": [
     "pi-package"
@@ -27,8 +27,8 @@
     "imghash": "^1.1.4"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": ">=0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
     "typebox": "*"
   }
 }

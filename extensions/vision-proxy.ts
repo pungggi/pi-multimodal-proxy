@@ -31,7 +31,7 @@
  *   pi install ./packages/pi-vision-proxy
  */
 
-import { type ImageContent as PiAiImage, complete } from "@mariozechner/pi-ai";
+import { type ImageContent as PiAiImage, complete } from "@earendil-works/pi-ai";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -40,7 +40,7 @@ import type {
 	ExtensionContext,
 	SessionEntry,
 	SessionStartEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	buildAnalysisFence,
