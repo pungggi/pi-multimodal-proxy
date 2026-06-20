@@ -746,8 +746,30 @@ describe("isPathAllowed", () => {
 		}
 	});
 
-	it("denies non-existent files", async () => {
-		assert.equal(await isPathAllowed(join(os.tmpdir(), "does-not-exist-xyz.png")), false);
+	it("allows non-existent files whose parent directory is in the allow-list", async () => {
+		// Non-existent files in tmpdir pass the check so callers can return "unreadable"
+		// instead of the misleading "denied" / "path outside allowed directories" message.
+		assert.equal(await isPathAllowed(join(os.tmpdir(), "does-not-exist-xyz.png")), true);
+	});
+
+	it("denies non-existent files outside the allow-list", async () => {
+		assert.equal(await isPathAllowed("/etc/does-not-exist-vp-xyz.png"), false);
+	});
+
+	it("allows files inside /tmp (system-wide Unix temp dir)", async () => {
+		if (os.platform() === "win32") return;
+		const file = join("/tmp", `vp-test-direct-${Date.now()}.png`);
+		await writeFile(file, TINY_PNG);
+		try {
+			assert.equal(await isPathAllowed(file), true);
+		} finally {
+			try { await rm(file); } catch { /* ignore */ }
+		}
+	});
+
+	it("allows non-existent files inside /tmp", async () => {
+		if (os.platform() === "win32") return;
+		assert.equal(await isPathAllowed("/tmp/does-not-exist-vp-xyz.png"), true);
 	});
 
 	it("allows local Windows drive paths by default", async () => {
@@ -824,11 +846,18 @@ describe("readImageFileWithReason", () => {
 	});
 
 	it("returns reason=denied for path outside allow-list", async () => {
-		// /etc/passwd.png does not exist but extension is image-like.
-		// realpath fails → denied. Either reason is acceptable in that order; assert non-null reason.
 		const r = await readImageFileWithReason("/etc/never-exists-vp.png");
 		assert.equal(r.image, null);
 		assert.equal(r.reason, "denied");
+	});
+
+	it("returns reason=unreadable for non-existent file inside /tmp", async () => {
+		if (os.platform() === "win32") return;
+		// Previously returned "denied" (misleading); now returns "unreadable" so the user
+		// knows the file is simply missing, not that /tmp itself is forbidden.
+		const r = await readImageFileWithReason("/tmp/does-not-exist-vp-xyz.png");
+		assert.equal(r.image, null);
+		assert.equal(r.reason, "unreadable");
 	});
 
 	it("returns reason=empty for zero-byte image", async () => {
