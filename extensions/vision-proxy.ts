@@ -130,6 +130,9 @@ import {
 	storeImageData,
 	getImageData,
 	parseRecallRef,
+	spinnerFrame,
+	formatProgressStatus,
+	RECALL_HINT,
 	DEFAULT_VIDEO_SYSTEM_PROMPT,
 } from "./internal.js";
 
@@ -388,6 +391,49 @@ function friendlyModelLabel(
 	return modelLabel(config);
 }
 
+/** Steady-state status-line text shown when no media call is in flight. */
+function steadyStatusText(
+	config: VisionConfig,
+	registry: ExtensionContext["modelRegistry"],
+): string {
+	return (
+		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)} ` +
+		`| video: ${config.videoProvider}/${config.videoModelId}` +
+		`${config.tool === "on" && config.mode !== "off" ? " [+tool]" : ""}`
+	);
+}
+
+/**
+ * Run a slow task while animating a live status-line indicator. The status line
+ * is updated on a fixed interval with a spinner frame, the given label, and the
+ * elapsed seconds, then restored to the steady-state text in a `finally` block.
+ * No-op spinner (task runs unchanged) when there is no UI.
+ */
+async function withProgress<T>(
+	ctx: ExtensionContext,
+	label: () => string,
+	steady: string,
+	task: () => Promise<T>,
+): Promise<T> {
+	if (!ctx.hasUI) return task();
+	const start = Date.now();
+	let tick = 0;
+	const render = () => {
+		const elapsed = (Date.now() - start) / 1000;
+		ctx.ui.setStatus("multimodal-proxy", formatProgressStatus(label(), spinnerFrame(tick), elapsed));
+		tick++;
+	};
+	render();
+	const timer = setInterval(render, 500);
+	if (typeof timer.unref === "function") timer.unref();
+	try {
+		return await task();
+	} finally {
+		clearInterval(timer);
+		ctx.ui.setStatus("multimodal-proxy", steady);
+	}
+}
+
 /** Cached config loaded from persistent file on startup */
 let _fileConfig: Partial<VisionConfig> = {};
 
@@ -498,7 +544,8 @@ async function analyzeImages(
 		? `\n\n## Recent conversation (untrusted user dialogue, for grounding only)\n<conversation>\n${conversationContext}\n</conversation>`
 		: "";
 
-	const tasks = images.map(async (raw, i): Promise<AnalysisResult> => {
+	let completed = 0;
+	const rawTasks = images.map(async (raw, i): Promise<AnalysisResult> => {
 		let piAiImage: PiAiImage;
 		try {
 			piAiImage = toPiAiImage(raw);
@@ -552,7 +599,18 @@ async function analyzeImages(
 		}
 	});
 
-	const results = await Promise.all(tasks);
+	// Count completions for the live progress label.
+	const tasks = rawTasks.map((p) => p.finally(() => { completed++; }));
+	const label = () =>
+		images.length > 1
+			? `Analyzing image ${Math.min(completed + 1, images.length)}/${images.length}…`
+			: "Analyzing image…";
+	const results = await withProgress(
+		ctx,
+		label,
+		steadyStatusText(config, ctx.modelRegistry),
+		() => Promise.all(tasks),
+	);
 
 	if (results.length > 0 && results.every((r) => r.error === "aborted")) {
 		ctx.ui.notify("[multimodal-proxy] Cancelled.", "info");
@@ -1251,10 +1309,7 @@ export default function (pi: ExtensionAPI) {
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
-		ctx.ui.setStatus(
-			"multimodal-proxy",
-			`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, ctx.modelRegistry)} | video: ${config.videoProvider}/${config.videoModelId}${config.tool === "on" && config.mode !== "off" ? " [+tool]" : ""}`,
-		);
+		ctx.ui.setStatus("multimodal-proxy", steadyStatusText(config, ctx.modelRegistry));
 
 		// Register tool if enabled
 		syncToolRegistration(config);
@@ -1350,15 +1405,24 @@ export default function (pi: ExtensionAPI) {
 					};
 				} else {
 					const videoResults: VideoAnalysisResult[] = [];
-					for (const mf of mediaFiles) {
-						const result = await analyzeVideo(
-							mf.file,
-							mf.filename,
-							event.prompt,
-							conversationContext,
-							config,
+					for (const [mi, mf] of mediaFiles.entries()) {
+						const label = () =>
+							mediaFiles.length > 1
+								? `Analyzing ${mf.filename} (${mi + 1}/${mediaFiles.length})…`
+								: `Analyzing ${mf.filename}…`;
+						const result = await withProgress(
 							ctx,
-							mf.path,
+							label,
+							steadyStatusText(config, ctx.modelRegistry),
+							() => analyzeVideo(
+								mf.file,
+								mf.filename,
+								event.prompt,
+								conversationContext,
+								config,
+								ctx,
+								mf.path,
+							),
 						);
 						if (result) videoResults.push(result);
 					}
@@ -1588,6 +1652,12 @@ export default function (pi: ExtensionAPI) {
 
 		const descriptions = findDescriptions(entries);
 
+		// Restate the recall affordance once per context build (not per image),
+		// so the agent is reminded it can re-query earlier images even on turns
+		// where no new image was attached. Trusted extension text — kept outside
+		// the untrusted description fence.
+		let recallHintInjected = false;
+
 		let modified = false;
 		const messages = event.messages.map((msg) => {
 			if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
@@ -1604,7 +1674,7 @@ export default function (pi: ExtensionAPI) {
 					const hash = hashImageData(c.data);
 					const desc = descriptions.get(hash);
 					const meta = _imageMeta.get(hash);
-					return [
+					const blocks: { type: "text"; text: string }[] = [
 						{
 							type: "text" as const,
 							text: desc
@@ -1612,6 +1682,11 @@ export default function (pi: ExtensionAPI) {
 								: "[Image - vision-proxy description not available]",
 						},
 					];
+					if (desc && config.tool === "on" && !recallHintInjected) {
+						recallHintInjected = true;
+						blocks.push({ type: "text" as const, text: `[vision-proxy: ${RECALL_HINT}]` });
+					}
+					return blocks;
 				}
 				if (c.type === "text") {
 					const paths = extractCandidateImagePaths(c.text);

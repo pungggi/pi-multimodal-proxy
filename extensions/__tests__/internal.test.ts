@@ -74,6 +74,10 @@ import {
 	getImageData,
 	clearImageData,
 	parseRecallRef,
+	spinnerFrame,
+	formatProgressStatus,
+	SPINNER_FRAMES,
+	RECALL_HINT,
 	_imageData,
 	_imageMeta,
 } from "../internal.ts";
@@ -395,6 +399,41 @@ describe("session image recall store", () => {
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
 			clearImageData();
 		}
+	});
+});
+
+describe("spinnerFrame", () => {
+	it("returns a frame from the set and wraps around", () => {
+		assert.equal(spinnerFrame(0), SPINNER_FRAMES[0]);
+		assert.equal(spinnerFrame(SPINNER_FRAMES.length), SPINNER_FRAMES[0]);
+		assert.equal(spinnerFrame(SPINNER_FRAMES.length + 1), SPINNER_FRAMES[1]);
+		assert.ok(SPINNER_FRAMES.includes(spinnerFrame(7)));
+	});
+
+	it("handles negative ticks without throwing", () => {
+		assert.ok(SPINNER_FRAMES.includes(spinnerFrame(-1)));
+		assert.ok(SPINNER_FRAMES.includes(spinnerFrame(-13)));
+	});
+});
+
+describe("formatProgressStatus", () => {
+	it("includes frame, label, and elapsed seconds", () => {
+		assert.equal(
+			formatProgressStatus("Analyzing image 2/4…", "⠙", 3),
+			"multimodal-proxy ⠙ Analyzing image 2/4… (3s)",
+		);
+	});
+
+	it("floors and clamps elapsed seconds", () => {
+		assert.match(formatProgressStatus("x", "⠋", 4.9), /\(4s\)$/);
+		assert.match(formatProgressStatus("x", "⠋", -2), /\(0s\)$/);
+	});
+});
+
+describe("RECALL_HINT", () => {
+	it("mentions analyze_image and the image id", () => {
+		assert.match(RECALL_HINT, /analyze_image/);
+		assert.match(RECALL_HINT, /image id/i);
 	});
 });
 

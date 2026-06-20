@@ -161,6 +161,35 @@ export function parseRecallRef(ref: string): string | null {
 	return re.test(hashPart) ? hashPart.toLowerCase() : null;
 }
 
+// ── Live progress indicator ─────────────────────────────────────────────────
+
+/** Braille spinner frames used by the live status indicator during slow calls. */
+export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Pick a spinner frame for a given tick (wraps around). */
+export function spinnerFrame(tick: number): string {
+	const n = SPINNER_FRAMES.length;
+	const i = ((Math.trunc(tick) % n) + n) % n;
+	return SPINNER_FRAMES[i];
+}
+
+/** Format the status-line text shown while a vision/video call is in flight. */
+export function formatProgressStatus(label: string, frame: string, elapsedSec: number): string {
+	const secs = Math.max(0, Math.trunc(elapsedSec));
+	return `multimodal-proxy ${frame} ${label} (${secs}s)`;
+}
+
+// ── Recall affordance ───────────────────────────────────────────────────────
+
+/**
+ * Persistent reminder injected once per turn alongside recalled image
+ * descriptions, restating that earlier images can be re-queried by id. This is
+ * trusted extension text (not image-derived), so it is placed outside the
+ * untrusted description fence.
+ */
+export const RECALL_HINT =
+	'You can re-examine or crop this or any earlier image at any time by calling analyze_image with its image id (the image="…" value above) — no re-attachment or file path needed.';
+
 // ── Crop types ────────────────────────────────────────────────────────────
 
 export type NamedRegion =

@@ -8,7 +8,8 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 ## What's new in 1.7.0
 
-- **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB).
+- **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB). A once-per-turn reminder keeps the recall affordance visible to the agent even on turns where no new image was attached.
+- **Live progress indicator** — slow image and video/audio analysis animate a spinner with elapsed seconds on the status line (e.g. `multimodal-proxy ⠙ Analyzing image 2/4… (3s)`) instead of a single static message, then restore the steady-state status when the call finishes.
 
 ## What's new in 1.5.0
 
