@@ -2089,9 +2089,22 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// Resolve image references to PiAiImage
+				// Resolve image references to PiAiImage (recall handle or file path)
 				const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 				for (const ref of parsed.images) {
+					const recallHash = parseRecallRef(ref);
+					if (recallHash) {
+						const stored = getImageData(recallHash);
+						if (!stored) {
+							ctx.ui.notify(`[multimodal-proxy] Image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.`, "error");
+							return;
+						}
+						const image: PiAiImage = { type: "image", data: stored.data, mimeType: stored.mimeType };
+						storeImageMeta(recallHash, stored.data);
+						resolvedImages.push({ image, hash: recallHash, meta: _imageMeta.get(recallHash) });
+						continue;
+					}
+
 					if (ref.includes("..")) {
 						ctx.ui.notify(`[multimodal-proxy] Error: path contains disallowed \"..\" segments.`, "error");
 						return;

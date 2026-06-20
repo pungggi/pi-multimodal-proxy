@@ -84,10 +84,10 @@ function evictImageMeta(): void {
 /** In-memory map: image hash → retained base64 bytes + mime type, for recall. */
 export const _imageData = new Map<string, { data: string; mimeType: string }>();
 
-/** Running total of retained base64 string length across _imageData. */
+/** Running total of retained decoded image bytes across _imageData. */
 let _imageDataBytes = 0;
 
-/** Default byte budget for retained image data (base64 length, ≈64 MB). */
+/** Default byte budget for retained image data (decoded bytes, ≈64 MB). */
 const IMAGE_DATA_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
 
 /** Resolve the recall byte budget, allowing an env override. */
@@ -102,8 +102,10 @@ function imageDataMaxBytes(): number {
 
 function evictImageData(): void {
 	const budget = imageDataMaxBytes();
-	// Keep at least one entry so a single oversized image is still recallable.
-	while (_imageDataBytes > budget && _imageData.size > 1) {
+	// When budget is 0, allow full eviction (recall disabled).
+	// Otherwise keep at least one entry so an oversized image is still recallable.
+	const minRetained = budget === 0 ? 0 : 1;
+	while (_imageDataBytes > budget && _imageData.size > minRetained) {
 		const first = _imageData.keys().next().value;
 		if (first === undefined) break;
 		const v = _imageData.get(first);
