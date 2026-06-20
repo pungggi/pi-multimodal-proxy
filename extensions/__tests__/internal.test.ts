@@ -9,7 +9,7 @@
 
 import { strict as assert } from "node:assert";
 import { after, describe, it } from "node:test";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, parse } from "node:path";
 import {
@@ -900,6 +900,34 @@ describe("readImageFileWithReason", () => {
 				await symlink(target, link);
 			} catch {
 				return; // platform doesn't support symlinks (e.g., Windows w/o admin) → skip
+			}
+			const r = await readImageFileWithReason(link);
+			assert.equal(r.image, null);
+			assert.equal(r.reason, "denied");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("denies symlink to existing file outside allow-list (TOCTOU post-read check)", async () => {
+		// Simulate the TOCTOU race: the symlink target exists and is readable, so
+		// readFile() succeeds, but the post-read realpath re-verification must catch that
+		// the resolved path is outside the allow-list and return "denied".
+		if (os.platform() === "win32") return;
+		// Find a readable file outside the allow-list to use as a target.
+		// /etc/hostname is present on most Unix systems; use it if it exists.
+		const target = "/etc/hostname";
+		let targetExists = false;
+		try { await lstat(target); targetExists = true; } catch { /* skip if absent */ }
+		if (!targetExists) return;
+
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const link = join(dir, "link.png");
+		try {
+			try {
+				await symlink(target, link);
+			} catch {
+				return; // no symlink support → skip
 			}
 			const r = await readImageFileWithReason(link);
 			assert.equal(r.image, null);

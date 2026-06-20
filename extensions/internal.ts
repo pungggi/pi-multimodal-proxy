@@ -1125,6 +1125,11 @@ export async function readImageFileWithReason(filePath: string): Promise<ReadIma
 	} catch {
 		return { image: null, reason: "unreadable" };
 	}
+	// Post-read re-verification: the initial isPathAllowed() may have passed via the
+	// parent-dir fallback when the file did not yet exist. A symlink could have been
+	// swapped in during that window. Now that the file exists, realpath() resolves it
+	// fully — catching any symlink pointing outside the allow-list (TOCTOU mitigation).
+	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
 	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
 	const limit = maxImageFileBytes();
 	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
