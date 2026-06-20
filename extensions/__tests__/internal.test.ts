@@ -1574,12 +1574,16 @@ describe("cropImage (ImageScript)", () => {
 	});
 
 	it("hard-terminates the worker on timeout (returns null, does not hang)", async () => {
-		// Worker thread bootstrap + WASM decode cannot complete within 1ms, so the
-		// main-thread timer fires and terminate()s the worker — proving the timeout
-		// is a hard limit rather than a best-effort race against synchronous WASM.
+		// Force pool=0 so a *fresh* worker is spawned (never a warmed pooled one).
+		// Spinning up a thread + loading ImageScript + instantiating the WASM codec
+		// is reliably far slower than the 1ms timeout regardless of machine speed,
+		// so the main-thread timer fires and terminate()s the worker — proving the
+		// timeout is a hard limit, without depending on wall-clock scheduling luck.
 		const prevWorker = process.env.PI_VISION_PROXY_DECODE_WORKER;
+		const prevPool = process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
 		const prevTimeout = process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
 		process.env.PI_VISION_PROXY_DECODE_WORKER = "1";
+		process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = "0";
 		process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = "1";
 		try {
 			const png = await create10x10Png();
@@ -1590,6 +1594,8 @@ describe("cropImage (ImageScript)", () => {
 		} finally {
 			if (prevWorker === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER;
 			else process.env.PI_VISION_PROXY_DECODE_WORKER = prevWorker;
+			if (prevPool === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+			else process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = prevPool;
 			if (prevTimeout === undefined) delete process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
 			else process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = prevTimeout;
 		}

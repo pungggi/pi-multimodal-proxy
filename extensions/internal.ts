@@ -1625,11 +1625,24 @@ async function ensureWorkerInfra(): Promise<boolean> {
 
 /** Take an idle worker (detaching its health listeners) or spawn a fresh one. */
 function acquireWorker(): NodeWorker {
-	const pooled = _idleWorkers.pop();
-	if (pooled) {
-		pooled.detach();
-		pooled.worker.ref();
-		return pooled.worker;
+	const budget = maxIdleWorkers();
+	// Honor the *current* budget before reusing anything: terminate idle workers
+	// beyond it so a lowered PI_VISION_PROXY_DECODE_WORKER_POOL takes effect
+	// immediately rather than waiting for the pool to drain naturally. With
+	// budget 0 this empties the pool, making spawn-per-call truly spawn-per-call.
+	while (_idleWorkers.length > budget) {
+		const extra = _idleWorkers.pop()!;
+		extra.detach();
+		void extra.worker.terminate();
+	}
+	// Only reuse a pooled worker when pooling is enabled.
+	if (budget > 0) {
+		const pooled = _idleWorkers.pop();
+		if (pooled) {
+			pooled.detach();
+			pooled.worker.ref();
+			return pooled.worker;
+		}
 	}
 	// _workerCtor / _imagescriptPath are non-null here (ensureWorkerInfra succeeded).
 	return new _workerCtor!(CROP_WORKER_SRC, {
