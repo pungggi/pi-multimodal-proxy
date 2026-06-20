@@ -277,6 +277,9 @@ async function pickVisionModel(
 
 		const FILTER_OPTION = "🔍 Type to filter models...";
 		const CHANGE_PROVIDER_OPTION = "← Change provider";
+		// When a provider has more models than this, skip the raw list entirely
+		// and force the user through the filter path to keep the TUI usable.
+		const LARGE_LIST_THRESHOLD = 20;
 
 		// Build the base model list (without control options)
 		const buildModelItems = (): string[] =>
@@ -287,15 +290,17 @@ async function pickVisionModel(
 		// eslint-disable-next-line no-constant-condition
 		while (true) {
 			const baseItems = buildModelItems();
+			const tooManyToList = baseItems.length > LARGE_LIST_THRESHOLD;
 			const items: string[] = [];
 			if (providerSet.length > 1) items.push(CHANGE_PROVIDER_OPTION);
-			if (baseItems.length > 8) items.push(FILTER_OPTION);
-			items.push(...baseItems);
+			if (tooManyToList || baseItems.length > 8) items.push(FILTER_OPTION);
+			if (!tooManyToList) items.push(...baseItems);
 
-			const picked = await ctx.ui.select(
-				`Pick vision model (${providerPicked})`,
-				items,
-			);
+			const title = tooManyToList
+				? `Pick vision model (${providerPicked}) — ${baseItems.length} models, use filter to search`
+				: `Pick vision model (${providerPicked})`;
+
+			const picked = await ctx.ui.select(title, items);
 			if (!picked) return; // cancelled
 
 			// Handle control options
