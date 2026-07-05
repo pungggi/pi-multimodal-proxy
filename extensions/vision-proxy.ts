@@ -442,10 +442,15 @@ function shouldStripImages(config: VisionConfig, model: ExtensionContext["model"
 /**
  * Swap the untouched built-in default vision model for a fallback when the
  * running Pi's catalog doesn't know it (e.g. Claude Sonnet 5 on Pi < 0.80.3).
- * User-configured models are never rewritten.
+ * A model set via PI_VISION_PROXY_MODEL is an explicit user choice and is
+ * never rewritten, even when it equals the built-in default.
  */
 function withModelFallback(config: VisionConfig, ctx: ExtensionContext): VisionConfig {
-	return applyDefaultModelFallback(config, (p, m) => Boolean(ctx.modelRegistry.find(p, m)));
+	return applyDefaultModelFallback(
+		config,
+		(p, m) => Boolean(ctx.modelRegistry.find(p, m)),
+		envFlags().model,
+	);
 }
 
 function friendlyModelLabel(
@@ -1449,7 +1454,10 @@ export default function (pi: ExtensionAPI) {
 		state.compaction = undefined;
 
 		_fileConfig = await readPersistentFile();
-		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+		const config = withModelFallback(
+			resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig),
+			ctx,
+		);
 		ctx.ui.setStatus("multimodal-proxy", steadyStatusText(config, ctx.modelRegistry));
 
 		// Register tool if enabled

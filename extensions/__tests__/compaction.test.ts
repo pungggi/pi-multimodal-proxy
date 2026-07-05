@@ -7,6 +7,7 @@ import {
 	DIGEST_IMAGE_CHARS,
 	DIGEST_LEAN_IMAGE_CHARS,
 	DIGEST_MAX_IMAGES,
+	findDescriptions,
 	findVideoDescriptions,
 	truncateForDigest,
 	type VideoDescriptionEntry,
@@ -49,6 +50,43 @@ describe("findVideoDescriptions", () => {
 		];
 		assert.equal(findVideoDescriptions(entries).get("v1")?.description, "new");
 	});
+
+	it("moves a re-described hash to the end of the iteration order", () => {
+		const entries: Entry[] = [
+			customEntry(CUSTOM_TYPE_VIDEO_DESCRIPTION, video("v1", "first")),
+			customEntry(CUSTOM_TYPE_VIDEO_DESCRIPTION, video("v2", "second")),
+			customEntry(CUSTOM_TYPE_VIDEO_DESCRIPTION, video("v1", "updated")),
+		];
+		assert.deepEqual([...findVideoDescriptions(entries).keys()], ["v2", "v1"]);
+	});
+
+	it("backfills filename and mimeType on malformed entries instead of crashing later", () => {
+		const entries: Entry[] = [
+			customEntry(CUSTOM_TYPE_VIDEO_DESCRIPTION, { hash: "v1", description: "d" }),
+			customEntry(CUSTOM_TYPE_VIDEO_DESCRIPTION, { hash: "v2", description: "d", filename: 42, mimeType: null }),
+		];
+		const map = findVideoDescriptions(entries);
+		assert.equal(map.get("v1")?.filename, "unknown");
+		assert.equal(map.get("v1")?.mimeType, "application/octet-stream");
+		assert.equal(map.get("v2")?.filename, "unknown");
+		assert.equal(map.get("v2")?.mimeType, "application/octet-stream");
+		// The digest builder accepts the backfilled entries without throwing.
+		const digest = buildCompactionDigest([], [...map.values()]);
+		assert.ok(digest.includes('file="unknown"'));
+	});
+});
+
+describe("findDescriptions ordering", () => {
+	it("moves a re-described hash to the end of the iteration order", () => {
+		const entries: Entry[] = [
+			customEntry(CUSTOM_TYPE_DESCRIPTION, { hash: "a", description: "first" }),
+			customEntry(CUSTOM_TYPE_DESCRIPTION, { hash: "b", description: "second" }),
+			customEntry(CUSTOM_TYPE_DESCRIPTION, { hash: "a", description: "updated" }),
+		];
+		const map = findDescriptions(entries);
+		assert.deepEqual([...map.keys()], ["b", "a"]);
+		assert.equal(map.get("a"), "updated");
+	});
 });
 
 describe("truncateForDigest", () => {
@@ -61,10 +99,9 @@ describe("truncateForDigest", () => {
 	});
 
 	it("cuts long text at a word boundary and marks the truncation", () => {
+		// slice(0,20) is "alpha beta gamma del"; the boundary cut must drop "del".
 		const out = truncateForDigest("alpha beta gamma delta epsilon", 20);
-		assert.ok(out.length <= 20 + " … [truncated]".length);
-		assert.ok(out.endsWith("… [truncated]"));
-		assert.ok(!/\balph\b/.test(out), "should not cut mid-word");
+		assert.equal(out, "alpha beta gamma … [truncated]");
 	});
 
 	it("hard-cuts when there is no usable word boundary", () => {

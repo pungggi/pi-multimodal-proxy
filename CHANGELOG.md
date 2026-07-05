@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Default vision model bumped to Claude Sonnet 5** (`anthropic/claude-sonnet-5`, in Pi catalogs since 0.80.3). When the running Pi's registry doesn't know Sonnet 5, the *untouched built-in default* transparently falls back to `anthropic/claude-sonnet-4-5` (`applyDefaultModelFallback`, applied at the image-analysis, `analyze_image` tool, and `/multimodal-proxy describe` model lookups). Models the user configured explicitly are never rewritten — a missing user-chosen model still surfaces as "Model not found".
+- **Default vision model bumped to Claude Sonnet 5** (`anthropic/claude-sonnet-5`, in Pi catalogs since 0.80.3). When the running Pi's registry doesn't know Sonnet 5, the *untouched built-in default* transparently falls back to `anthropic/claude-sonnet-4-5` (`applyDefaultModelFallback`, applied at the image-analysis, `analyze_image` tool, and `/multimodal-proxy describe` model lookups). Models the user configured explicitly are never rewritten — any non-default value, and also the default pair when set via `PI_VISION_PROXY_MODEL` — a missing user-chosen model still surfaces as "Model not found".
 - The `context` handler no longer returns early when the active model supports images natively — the post-compaction digest is injected whenever the proxy is not `off` and orphaned descriptions exist, since natively-visioned models also lose compacted-away images. Image-block stripping behavior is unchanged.
 
 ## [1.7.0] - 2026-06-20

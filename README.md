@@ -12,7 +12,7 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 - **Overflow-aware sizing** (Pi ≥ 0.79.10) — using the new `reason`/`willRetry` metadata on Pi's compaction events, the digest switches to lean per-item budgets after an overflow-recovery compaction, so restoring descriptions never contributes to a second overflow. On older Pi versions the digest simply uses its normal budgets.
 - The digest caps at the 12 most recent images and 4 most recent video/audio files, restates the UNTRUSTED-content warning, and is injected directly after the compaction summary on every LLM call until the media becomes visible in context again.
 - **`#` image-recall autocomplete** — type `#` in the prompt editor to get a dropdown of images seen earlier in the session (newest first; keep typing to fuzzy-filter by filename or description). Picking one inserts the image's stable `image="..."` recall id, so you can write *"zoom into `#`⇥"* instead of copying ids out of fences. Requires Pi ≥ 0.79.1; silently unavailable in RPC/print modes.
-- **Default vision model is now Claude Sonnet 5** (`anthropic/claude-sonnet-5`, available since Pi 0.80.3). On older Pi versions whose catalog doesn't include Sonnet 5, the untouched default automatically falls back to `anthropic/claude-sonnet-4-5`; explicitly configured models are never rewritten.
+- **Default vision model is now Claude Sonnet 5** (`anthropic/claude-sonnet-5`, available since Pi 0.80.3). On older Pi versions whose catalog doesn't include Sonnet 5, the untouched default automatically falls back to `anthropic/claude-sonnet-4-5`; explicitly configured models (any non-default value, or any model set via `PI_VISION_PROXY_MODEL`) are never rewritten.
 
 ## What's new in 1.7.0
 

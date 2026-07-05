@@ -2404,6 +2404,12 @@ describe("applyDefaultModelFallback", () => {
 		assert.equal(out.modelId, "gpt-5.5");
 	});
 
+	it("never rewrites an explicit user choice that equals the built-in default (userConfigured)", () => {
+		const out = applyDefaultModelFallback(builtin, () => false, true);
+		assert.equal(out.provider, DEFAULT_CONFIG.provider);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
 	it("does not mutate the other config fields when substituting", () => {
 		const fb = DEFAULT_MODEL_FALLBACKS[0]!;
 		const cfg = { ...DEFAULT_CONFIG, mode: "always" as const, cacheSize: 7 };

@@ -876,15 +876,21 @@ export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId:
 /**
  * Substitute the built-in default vision model with the first available
  * fallback when the registry doesn't know it. Applies only while the model is
- * the untouched built-in default — a model the user explicitly configured is
- * never rewritten (its absence still surfaces as "Model not found").
+ * the untouched built-in default. Callers that know the model was configured
+ * explicitly (e.g. via PI_VISION_PROXY_MODEL) pass `userConfigured: true`,
+ * which disables the substitution even when the value happens to equal the
+ * built-in default — an explicit choice is never rewritten and its absence
+ * still surfaces as "Model not found".
  */
 export function applyDefaultModelFallback(
 	config: VisionConfig,
 	hasModel: (provider: string, modelId: string) => boolean,
+	userConfigured = false,
 ): VisionConfig {
 	const isBuiltinDefault =
-		config.provider === DEFAULT_CONFIG.provider && config.modelId === DEFAULT_CONFIG.modelId;
+		!userConfigured &&
+		config.provider === DEFAULT_CONFIG.provider &&
+		config.modelId === DEFAULT_CONFIG.modelId;
 	if (!isBuiltinDefault || hasModel(config.provider, config.modelId)) return config;
 	for (const fb of DEFAULT_MODEL_FALLBACKS) {
 		if (hasModel(fb.provider, fb.modelId)) {
@@ -901,7 +907,12 @@ export function findDescriptions(entries: readonly SessionEntry[]): Map<string, 
 	for (const entry of entries) {
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE_DESCRIPTION && entry.data) {
 			const d = entry.data as DescriptionEntry;
-			if (d.hash && d.description) map.set(d.hash, d.description);
+			if (d.hash && d.description) {
+				// Delete-before-set so a re-described hash moves to the end of the
+				// iteration order; consumers rely on iteration order == recency.
+				map.delete(d.hash);
+				map.set(d.hash, d.description);
+			}
 		}
 	}
 	return map;
@@ -911,8 +922,19 @@ export function findVideoDescriptions(entries: readonly SessionEntry[]): Map<str
 	const map = new Map<string, VideoDescriptionEntry>();
 	for (const entry of entries) {
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE_VIDEO_DESCRIPTION && entry.data) {
-			const d = entry.data as VideoDescriptionEntry;
-			if (d.hash && d.description) map.set(d.hash, d);
+			const d = entry.data as Partial<VideoDescriptionEntry>;
+			if (typeof d.hash !== "string" || !d.hash) continue;
+			if (typeof d.description !== "string" || !d.description) continue;
+			// Delete-before-set: iteration order == recency (see findDescriptions).
+			map.delete(d.hash);
+			// Backfill filename/mimeType so malformed or older persisted entries
+			// can't crash downstream fence builders.
+			map.set(d.hash, {
+				hash: d.hash,
+				description: d.description,
+				filename: typeof d.filename === "string" && d.filename ? d.filename : "unknown",
+				mimeType: typeof d.mimeType === "string" && d.mimeType ? d.mimeType : "application/octet-stream",
+			});
 		}
 	}
 	return map;
