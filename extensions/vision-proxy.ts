@@ -125,6 +125,7 @@ import {
 	LRUCache,
 	modeLabel,
 	modelLabel,
+	normalizeAllowedProviders,
 	parseModelString,
 	parseProviderList,
 	persistedBase,
@@ -1995,7 +1996,7 @@ export default function (pi: ExtensionAPI) {
 				// Persist to file so settings survive new sessions
 				const fileNext: Partial<VisionConfig> = { ...validated };
 				if (_fileConfig.allowedProviders !== undefined) {
-					fileNext.allowedProviders = _fileConfig.allowedProviders;
+					fileNext.allowedProviders = normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
 				}
 				writePersistentFile(fileNext);
 				_fileConfig = fileNext;
@@ -2017,6 +2018,11 @@ export default function (pi: ExtensionAPI) {
 				writePersistentFile(fileNext);
 				_fileConfig = fileNext;
 			};
+
+			// The file list is canonicalized on read, but normalize again before
+			// set operations so add/remove/revoke can never miss an alias
+			// (x-ai vs xai) regardless of how _fileConfig was populated.
+			const fileAllowedProviders = () => normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
 
 			// ── Set mode ────────────────────────────────────────
 			if (sub === "fallback" || sub === "always" || sub === "off") {
@@ -2104,7 +2110,7 @@ export default function (pi: ExtensionAPI) {
 						);
 						return;
 					}
-					const list = _fileConfig.allowedProviders ?? [];
+					const list = fileAllowedProviders();
 					if (!list.includes(effective.provider)) writeAllowedProviders([...list, effective.provider]);
 					pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted: true, provider: effective.provider });
 					ctx.ui.notify(
@@ -2123,7 +2129,7 @@ export default function (pi: ExtensionAPI) {
 					// Revoking consent also drops the provider from the persisted
 					// pre-consent list — otherwise the next session would silently
 					// re-allow what the user just refused.
-					const list = _fileConfig.allowedProviders ?? [];
+					const list = fileAllowedProviders();
 					if (list.includes(effective.provider)) {
 						writeAllowedProviders(list.filter((p) => p !== effective.provider));
 						ctx.ui.notify(
@@ -2165,7 +2171,7 @@ export default function (pi: ExtensionAPI) {
 						);
 						return;
 					}
-					const fileList = _fileConfig.allowedProviders ?? [];
+					const fileList = fileAllowedProviders();
 					const next =
 						action === "add"
 							? [...fileList, ...parsedList.filter((p) => !fileList.includes(p))]
@@ -2803,7 +2809,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const val = await ctx.ui.input(
 					"Allowed providers (comma-separated, pre-consented for data egress)",
-					(_fileConfig.allowedProviders ?? []).join(", "),
+					fileAllowedProviders().join(", "),
 				);
 				if (val === undefined || val === null) return;
 				const next = parseProviderList(val);

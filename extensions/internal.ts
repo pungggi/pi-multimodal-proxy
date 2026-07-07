@@ -718,6 +718,14 @@ export async function readPersistentFile(agentDir?: string): Promise<Partial<Vis
 				for (const [k, v] of Object.entries(parsed)) {
 					if (PERSISTED_CONFIG_KEYS.has(k)) filtered[k] = v;
 				}
+				// Canonicalize the pre-consent list at the file boundary so set
+				// operations downstream (add/remove/revoke) always work on
+				// canonical ids, even when the file was hand-edited (e.g. "x-ai").
+				if ("allowedProviders" in filtered) {
+					const normalized = normalizeAllowedProviders(filtered.allowedProviders);
+					if (normalized === undefined) delete filtered.allowedProviders;
+					else filtered.allowedProviders = normalized;
+				}
 				return filtered as Partial<VisionConfig>;
 			}
 		} catch {
@@ -846,6 +854,16 @@ export function parseProviderList(raw: string): string[] {
 	return out;
 }
 
+/**
+ * Normalize an untrusted allowedProviders value (persisted file, session
+ * entry, caller input) into canonical, validated, deduplicated provider ids.
+ * Returns undefined for non-arrays so absence stays absence.
+ */
+export function normalizeAllowedProviders(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return parseProviderList(value.filter((p): p is string => typeof p === "string").join(","));
+}
+
 export function parseModelString(s: string): { provider: string; modelId: string } | null {
 	const slash = s.indexOf("/");
 	if (slash <= 0 || slash >= s.length - 1) return null;
@@ -904,13 +922,9 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	// 1.9.0 field — normalize to canonical, validated provider ids. An empty
 	// array is kept (it means "explicitly none", e.g. an env override clearing
 	// a persisted list); a non-array is dropped so absence stays absence.
-	if (Array.isArray(safe.allowedProviders)) {
-		safe.allowedProviders = parseProviderList(
-			safe.allowedProviders.filter((p) => typeof p === "string").join(","),
-		);
-	} else {
-		delete safe.allowedProviders;
-	}
+	const allowed = normalizeAllowedProviders(safe.allowedProviders);
+	if (allowed === undefined) delete safe.allowedProviders;
+	else safe.allowedProviders = allowed;
 	return safe;
 }
 
@@ -1034,22 +1048,27 @@ export type ConsentState = "granted" | "revoked" | "none";
  * then fall back to the persisted pre-consent list (see hasConsent).
  */
 export function consentState(entries: readonly SessionEntry[], provider?: string): ConsentState {
+	// Canonicalize both sides of the comparison so provider aliases (x-ai vs
+	// xai — e.g. consent entries persisted by older package versions) can't
+	// dodge a revoke or miss a grant.
+	const wanted = provider ? canonicalProvider(provider) : undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i];
 		if (e?.type === "custom" && e.customType === CUSTOM_TYPE_CONSENT && e.data) {
 			const entry = e.data as ConsentEntry;
+			const entryProvider = entry.provider ? canonicalProvider(entry.provider) : undefined;
 			// A revoked entry only applies to its own provider (or globally if provider-less)
 			if (!entry.granted) {
-				if (provider) {
-					if (entry.provider && entry.provider !== provider) continue;
+				if (wanted) {
+					if (entryProvider && entryProvider !== wanted) continue;
 				}
 				return "revoked";
 			}
 			// Per-provider consent: both must match exactly.
 			// A provider-less entry is only valid when no specific provider is requested.
-			if (provider) {
-				if (entry.provider && entry.provider !== provider) continue;
-				if (!entry.provider) continue; // global consent doesn't satisfy per-provider check
+			if (wanted) {
+				if (entryProvider && entryProvider !== wanted) continue;
+				if (!entryProvider) continue; // global consent doesn't satisfy per-provider check
 			}
 			return "granted";
 		}
