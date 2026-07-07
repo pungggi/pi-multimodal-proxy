@@ -53,6 +53,12 @@ export interface VisionConfig {
 	// of changing unrelated settings; only implicit values may track the
 	// package default (see applyDefaultModelFallback).
 	modelExplicit?: boolean;
+	// 1.9.0 — providers pre-consented for data egress: consent prompts are
+	// skipped for providers in this list. An explicit in-session revoke
+	// (/multimodal-proxy consent no) still wins over the list. Lives in the
+	// persistent config file (or PI_VISION_PROXY_ALLOWED_PROVIDERS), never in
+	// session-entry configs, so per-session config churn can't shadow it.
+	allowedProviders?: string[];
 }
 
 export interface ImageMeta {
@@ -695,6 +701,7 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
 	"pHashSimilarityThreshold", "groundingModels",
 	"videoProvider", "videoModelId", "videoSystemPrompt",
+	"allowedProviders",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -710,6 +717,14 @@ export async function readPersistentFile(agentDir?: string): Promise<Partial<Vis
 				const filtered: Record<string, unknown> = {};
 				for (const [k, v] of Object.entries(parsed)) {
 					if (PERSISTED_CONFIG_KEYS.has(k)) filtered[k] = v;
+				}
+				// Canonicalize the pre-consent list at the file boundary so set
+				// operations downstream (add/remove/revoke) always work on
+				// canonical ids, even when the file was hand-edited (e.g. "x-ai").
+				if ("allowedProviders" in filtered) {
+					const normalized = normalizeAllowedProviders(filtered.allowedProviders);
+					if (normalized === undefined) delete filtered.allowedProviders;
+					else filtered.allowedProviders = normalized;
 				}
 				return filtered as Partial<VisionConfig>;
 			}
@@ -795,10 +810,16 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 			overrides.videoModelId = parsed.modelId;
 		}
 	}
+	// 1.9.0 pre-consented providers. A defined-but-empty value overrides a
+	// persisted list with "none", so it must produce [] rather than no key.
+	const allowedEnv = env.PI_VISION_PROXY_ALLOWED_PROVIDERS;
+	if (allowedEnv !== undefined) {
+		overrides.allowedProviders = parseProviderList(allowedEnv);
+	}
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -808,6 +829,7 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		maxBatch: env.PI_VISION_PROXY_MAX_BATCH !== undefined,
 		cacheSize: env.PI_VISION_PROXY_CACHE_SIZE !== undefined,
 		videoModel: env.PI_VISION_PROXY_VIDEO_MODEL !== undefined,
+		allowedProviders: env.PI_VISION_PROXY_ALLOWED_PROVIDERS !== undefined,
 	};
 }
 
@@ -816,6 +838,30 @@ export function canonicalProvider(provider: string): string {
 	// Normalize at config boundaries so registry lookup, auth hints, and status agree.
 	if (provider === "x-ai") return "xai";
 	return provider;
+}
+
+/**
+ * Parse a comma/whitespace-separated provider list into canonical, validated,
+ * deduplicated provider ids. Invalid entries are dropped silently.
+ */
+export function parseProviderList(raw: string): string[] {
+	const out: string[] = [];
+	for (const part of raw.split(/[,\s]+/)) {
+		const provider = canonicalProvider(part.trim());
+		if (!provider || !PROVIDER_PATTERN.test(provider)) continue;
+		if (!out.includes(provider)) out.push(provider);
+	}
+	return out;
+}
+
+/**
+ * Normalize an untrusted allowedProviders value (persisted file, session
+ * entry, caller input) into canonical, validated, deduplicated provider ids.
+ * Returns undefined for non-arrays so absence stays absence.
+ */
+export function normalizeAllowedProviders(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return parseProviderList(value.filter((p): p is string => typeof p === "string").join(","));
 }
 
 export function parseModelString(s: string): { provider: string; modelId: string } | null {
@@ -873,6 +919,12 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	if (typeof safe.videoSystemPrompt !== "string" || !safe.videoSystemPrompt) safe.videoSystemPrompt = DEFAULT_CONFIG.videoSystemPrompt;
 	// 1.8.0 field — keep only a real boolean; absence means "implicit model"
 	if (typeof safe.modelExplicit !== "boolean") delete safe.modelExplicit;
+	// 1.9.0 field — normalize to canonical, validated provider ids. An empty
+	// array is kept (it means "explicitly none", e.g. an env override clearing
+	// a persisted list); a non-array is dropped so absence stays absence.
+	const allowed = normalizeAllowedProviders(safe.allowedProviders);
+	if (allowed === undefined) delete safe.allowedProviders;
+	else safe.allowedProviders = allowed;
 	return safe;
 }
 
@@ -988,28 +1040,53 @@ export function findVideoDescriptions(entries: readonly SessionEntry[]): Map<str
 	return map;
 }
 
-export function hasConsent(entries: readonly SessionEntry[], provider?: string): boolean {
+export type ConsentState = "granted" | "revoked" | "none";
+
+/**
+ * State of the most recent applicable in-session consent entry.
+ * "none" means the session carries no verdict for this provider — callers may
+ * then fall back to the persisted pre-consent list (see hasConsent).
+ */
+export function consentState(entries: readonly SessionEntry[], provider?: string): ConsentState {
+	// Canonicalize both sides of the comparison so provider aliases (x-ai vs
+	// xai — e.g. consent entries persisted by older package versions) can't
+	// dodge a revoke or miss a grant.
+	const wanted = provider ? canonicalProvider(provider) : undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i];
 		if (e?.type === "custom" && e.customType === CUSTOM_TYPE_CONSENT && e.data) {
 			const entry = e.data as ConsentEntry;
+			const entryProvider = entry.provider ? canonicalProvider(entry.provider) : undefined;
 			// A revoked entry only applies to its own provider (or globally if provider-less)
 			if (!entry.granted) {
-				if (provider) {
-					if (entry.provider && entry.provider !== provider) continue;
+				if (wanted) {
+					if (entryProvider && entryProvider !== wanted) continue;
 				}
-				return false;
+				return "revoked";
 			}
 			// Per-provider consent: both must match exactly.
 			// A provider-less entry is only valid when no specific provider is requested.
-			if (provider) {
-				if (entry.provider && entry.provider !== provider) continue;
-				if (!entry.provider) continue; // global consent doesn't satisfy per-provider check
+			if (wanted) {
+				if (entryProvider && entryProvider !== wanted) continue;
+				if (!entryProvider) continue; // global consent doesn't satisfy per-provider check
 			}
-			return true;
+			return "granted";
 		}
 	}
-	return false;
+	return "none";
+}
+
+export function hasConsent(
+	entries: readonly SessionEntry[],
+	provider?: string,
+	allowedProviders?: readonly string[],
+): boolean {
+	const state = consentState(entries, provider);
+	if (state === "granted") return true;
+	if (state === "revoked") return false; // an explicit in-session revoke beats pre-consent
+	// No in-session verdict — the persisted pre-consent list applies, but only
+	// for a specific provider (never as a blanket grant).
+	return Boolean(provider && allowedProviders?.includes(canonicalProvider(provider)));
 }
 
 // ── Image helpers ──────────────────────────────────────────────────────────

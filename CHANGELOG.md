@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9.0] - 2026-07-07
+
+### Added
+
+- **Pre-consented providers** ([#14](https://github.com/pungggi/pi-multimodal-proxy/issues/14)) — a persisted `allowedProviders` list lets you consent to data egress for chosen providers once, instead of once per session. Providers on the list skip the first-use consent prompt everywhere (auto-proxy, video/audio, the `analyze_image` tool, and `/multimodal-proxy describe`). Manage it with `/multimodal-proxy allowed-providers add|remove <provider>|clear` (or the interactive config menu), or grant-and-persist in one step with `/multimodal-proxy consent always`. The list lives in `~/.pi/agent/multimodal-proxy.json` next to the other persisted settings and is kept out of session-entry configs so per-session config changes can never clobber it.
+- **New env var**: `PI_VISION_PROXY_ALLOWED_PROVIDERS` — comma-separated provider ids, overriding the persisted list (a defined-but-empty value disables the list for that shell/project, handy for sensitive repositories).
+- Safety semantics: an explicit in-session `/multimodal-proxy consent no` always beats the pre-consent list, and additionally removes the provider from the persisted list so the refusal sticks across sessions. The list only ever matches a specific provider — it is never a blanket grant. Provider ids are validated and canonicalized (`x-ai` → `xai`) on every boundary (file, env, commands).
+- New tested helpers in `internal.ts`: `parseProviderList` (comma/whitespace splitting, canonicalization, dedup) and `consentState` (distinguishes "revoked" from "no verdict" so pre-consent can't override a refusal); `hasConsent` gained an optional `allowedProviders` parameter.
+
 ## [1.8.0] - 2026-07-04
 
 ### Added
