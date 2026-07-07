@@ -20,6 +20,7 @@
  *                 /multimodal-proxy max-images-per-call <n>
  *                 /multimodal-proxy max-batch <n>
  *                 /multimodal-proxy cache-size <n>
+ *                 /multimodal-proxy status on|off   - show/hide the steady status line
  *
  *   Legacy alias: /vision-proxy <args> works identically.
  *
@@ -34,6 +35,7 @@
  *     PI_VISION_PROXY_VIDEO_MODEL      - "provider/model-id"
  *     PI_VISION_PROXY_MAX_VIDEO_BYTES  - positive integer
  *     PI_VISION_PROXY_ALLOWED_PROVIDERS - comma-separated pre-consented providers
+ *     PI_VISION_PROXY_STATUS_LINE      - "on" | "off"
  *
  * Install:
  *   pi install ./packages/pi-multimodal-proxy
@@ -475,11 +477,16 @@ function friendlyModelLabel(
 	return modelLabel(config);
 }
 
-/** Steady-state status-line text shown when no media call is in flight. */
+/**
+ * Steady-state status-line text shown when no media call is in flight.
+ * Returns undefined (which clears the status entry) when the user hid the
+ * status line via `/multimodal-proxy status off`.
+ */
 function steadyStatusText(
 	config: VisionConfig,
 	registry: ExtensionContext["modelRegistry"],
-): string {
+): string | undefined {
+	if (config.statusLine === "off") return undefined;
 	return (
 		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)} ` +
 		`| video: ${config.videoProvider}/${config.videoModelId}` +
@@ -496,7 +503,7 @@ function steadyStatusText(
 async function withProgress<T>(
 	ctx: ExtensionContext,
 	label: () => string,
-	steady: string,
+	steady: string | undefined,
 	task: () => Promise<T>,
 ): Promise<T> {
 	if (!ctx.hasUI) return task();
@@ -2010,8 +2017,8 @@ export default function (pi: ExtensionAPI) {
 				_fileConfig = fileNext;
 				const eff = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
 				ctx.ui.setStatus(
-					"vision-proxy",
-					`vision-proxy: ${eff.mode} → ${friendlyModelLabel(eff, ctx.modelRegistry)}${eff.tool === "on" && eff.mode !== "off" ? " [+tool]" : ""}`,
+					"multimodal-proxy",
+					steadyStatusText(withModelFallback(eff, ctx), ctx.modelRegistry),
 				);
 				return validated;
 			};
@@ -2261,6 +2268,32 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					`[multimodal-proxy] Tool: ${effective.tool}. Use /multimodal-proxy tool on|off.`,
+					"info",
+				);
+				return;
+			}
+
+			// ── Status line on/off ─────────────────────────────
+			if (sub === "status") {
+				if (env.statusLine) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_STATUS_LINE is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (isTrue(valueLower)) {
+					writePersisted({ ...persisted, statusLine: "on" });
+					ctx.ui.notify("[multimodal-proxy] Status line: ON", "info");
+					return;
+				}
+				if (isFalse(valueLower)) {
+					writePersisted({ ...persisted, statusLine: "off" });
+					ctx.ui.notify("[multimodal-proxy] Status line: OFF (progress spinner still shows during analysis)", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`[multimodal-proxy] Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}. Use /multimodal-proxy status on|off.`,
 					"info",
 				);
 				return;
@@ -2784,6 +2817,7 @@ export default function (pi: ExtensionAPI) {
 				env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize",
 				env.videoModel && "videoModel", env.allowedProviders && "allowedProviders",
 				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
+				env.statusLine && "statusLine",
 			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
@@ -2796,6 +2830,7 @@ export default function (pi: ExtensionAPI) {
 				`Cache size: ${effective.cacheSize}\n` +
 				`Allowed folders: ${effective.allowedFolders.length}\n` +
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
+				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
 				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
@@ -2803,7 +2838,7 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off`,
 					"info",
 				);
 				return;
@@ -2819,6 +2854,7 @@ export default function (pi: ExtensionAPI) {
 				`Cache size: ${effective.cacheSize}`,
 				`Allowed folders: ${effective.allowedFolders.length} configured`,
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
+				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 			]);
@@ -2967,6 +3003,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				const next = writePersisted({ ...persisted, allowHome: !effective.allowHome });
 				ctx.ui.notify(`Allow home: ${next.allowHome ? "ON" : "OFF"}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("Status line")) {
+				if (env.statusLine) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for status line.", "warning");
+					return;
+				}
+				const nextStatusLine = effective.statusLine === "on" ? "off" : "on";
+				writePersisted({ ...persisted, statusLine: nextStatusLine });
+				ctx.ui.notify(`Status line: ${nextStatusLine === "on" ? "ON" : "OFF"}`, "info");
 				return;
 			}
 

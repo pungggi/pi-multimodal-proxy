@@ -159,6 +159,12 @@ describe("sanitize", () => {
 		assert.equal(result.videoProvider, "xai");
 	});
 
+	it("defaults statusLine to on and preserves off", () => {
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: undefined as any }).statusLine, "on");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: "bogus" as any }).statusLine, "on");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: "off" }).statusLine, "off");
+	});
+
 	it("preserves valid values", () => {
 		const cfg: VisionConfig = {
 			mode: "always",
@@ -245,27 +251,38 @@ describe("readEnvOverrides", () => {
 		// Set-but-useless value still overrides (locks) the persisted list with an empty one
 		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_ALLOWED_FOLDERS: "relative" }).allowedFolders, []);
 	});
+
+	it("reads PI_VISION_PROXY_STATUS_LINE", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "on" }).statusLine, "on");
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "off" }).statusLine, "off");
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, undefined);
+	});
 });
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: "garbage" }).allowHome, false);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: " off " }).allowHome, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "off" }).statusLine, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "on" }).statusLine, true);
+		// An invalid value is not applied by readEnvOverrides, so it must not
+		// report (and thereby lock) the setting as env-overridden either.
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, false);
 	});
 });
 
@@ -1240,12 +1257,13 @@ describe("readPersistentFile / writePersistentFile", () => {
 	it("round-trips config through a file", async () => {
 		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
 		try {
-			const cfg: Partial<VisionConfig> = { mode: "always", provider: "openai", modelId: "gpt-4o" };
+			const cfg: Partial<VisionConfig> = { mode: "always", provider: "openai", modelId: "gpt-4o", statusLine: "off" };
 			await writePersistentFile(cfg, dir);
 			const read = await readPersistentFile(dir);
 			assert.equal(read.mode, "always");
 			assert.equal(read.provider, "openai");
 			assert.equal(read.modelId, "gpt-4o");
+			assert.equal(read.statusLine, "off");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

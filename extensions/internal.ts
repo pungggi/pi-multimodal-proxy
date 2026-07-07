@@ -18,6 +18,8 @@ export type ProxyMode = "fallback" | "always" | "off";
 
 export type ToolSetting = "on" | "off";
 
+export type StatusLineSetting = "on" | "off";
+
 export type GroundingFormat =
 	| "qwen_pixels"
 	| "molmo_points"
@@ -64,6 +66,9 @@ export interface VisionConfig {
 	// persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1.
 	allowedFolders: string[];
 	allowHome: boolean;
+	// 1.10.0 — "off" hides the steady-state footer status line (issue #16); the
+	// transient analysis progress spinner still shows while a call is in flight.
+	statusLine: StatusLineSetting;
 }
 
 export interface ImageMeta {
@@ -672,6 +677,7 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	videoSystemPrompt: DEFAULT_VIDEO_SYSTEM_PROMPT,
 	allowedFolders: [],
 	allowHome: false,
+	statusLine: "on",
 	groundingModels: {
 		"Qwen/Qwen2.5-VL-3B-Instruct": { format: "qwen_pixels" },
 		"Qwen/Qwen2.5-VL-7B-Instruct": { format: "qwen_pixels" },
@@ -710,6 +716,7 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"videoProvider", "videoModelId", "videoSystemPrompt",
 	"allowedProviders",
 	"allowedFolders", "allowHome",
+	"statusLine",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -821,6 +828,9 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 		const n = parseFloat(phashEnv);
 		if (Number.isFinite(n) && n >= 0 && n <= 1) overrides.pHashSimilarityThreshold = n;
 	}
+	// 1.9.0 status line override
+	const statusLineEnv = env.PI_VISION_PROXY_STATUS_LINE;
+	if (statusLineEnv === "on" || statusLineEnv === "off") overrides.statusLine = statusLineEnv;
 	// 1.5.0 video env overrides
 	const videoModelEnv = env.PI_VISION_PROXY_VIDEO_MODEL;
 	if (videoModelEnv) {
@@ -846,7 +856,7 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -861,6 +871,9 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		// value must not lock the command.
 		allowHome: parseAllowHomeEnv(env.PI_VISION_PROXY_ALLOW_HOME) !== undefined,
 		allowedFolders: env.PI_VISION_PROXY_ALLOWED_FOLDERS !== undefined,
+		// Only a value readEnvOverrides actually applies counts as an override;
+		// an invalid value must not lock /multimodal-proxy status.
+		statusLine: env.PI_VISION_PROXY_STATUS_LINE === "on" || env.PI_VISION_PROXY_STATUS_LINE === "off",
 	};
 }
 
@@ -1003,6 +1016,8 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	// 1.10.0 file-access fields
 	safe.allowedFolders = sanitizeAllowedFolders(safe.allowedFolders);
 	if (typeof safe.allowHome !== "boolean") safe.allowHome = DEFAULT_CONFIG.allowHome;
+	// 1.10.0 status-line field
+	if (safe.statusLine !== "on" && safe.statusLine !== "off") safe.statusLine = DEFAULT_CONFIG.statusLine;
 	return safe;
 }
 
