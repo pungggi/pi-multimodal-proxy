@@ -24,6 +24,7 @@ import {
 	formatXaiSttTranscript,
 	isTranscriptionRequest,
 	isXaiProvider,
+	consentState,
 	CUSTOM_TYPE_CONFIG,
 	CUSTOM_TYPE_CONSENT,
 	CUSTOM_TYPE_DESCRIPTION,
@@ -50,8 +51,10 @@ import {
 	pathAccessFromConfig,
 	MAX_ALLOWED_FOLDERS,
 	LRUCache,
+	normalizeAllowedProviders,
 	normalizedToPixels,
 	parseModelString,
+	parseProviderList,
 	pluralImages,
 	readEnvOverrides,
 	readImageFileWithReason,
@@ -246,19 +249,20 @@ describe("readEnvOverrides", () => {
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: false, allowedFolders: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: false, allowedFolders: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: true, allowedFolders: true },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true },
 		);
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 	});
 });
 
@@ -581,6 +585,182 @@ describe("hasConsent", () => {
 		// But it does NOT satisfy a per-provider consent check
 		assert.equal(hasConsent(entries, "anthropic"), false);
 		assert.equal(hasConsent(entries, "openai"), false);
+	});
+});
+
+describe("consentState", () => {
+	it("distinguishes none from revoked", () => {
+		assert.equal(consentState([], "anthropic"), "none");
+		const revoked: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" })];
+		assert.equal(consentState(revoked, "anthropic"), "revoked");
+		// Revoke for another provider does not apply
+		assert.equal(consentState(revoked, "openai"), "none");
+	});
+
+	it("reports granted for a matching per-provider grant", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "anthropic" })];
+		assert.equal(consentState(entries, "anthropic"), "granted");
+		assert.equal(consentState(entries, "openai"), "none");
+	});
+});
+
+describe("hasConsent with allowedProviders (pre-consent)", () => {
+	it("grants without any session entry when the provider is listed", () => {
+		assert.equal(hasConsent([], "anthropic", ["anthropic"]), true);
+		assert.equal(hasConsent([], "openai", ["anthropic"]), false);
+		assert.equal(hasConsent([], "anthropic", []), false);
+		assert.equal(hasConsent([], "anthropic", undefined), false);
+	});
+
+	it("never applies as a blanket grant without a specific provider", () => {
+		assert.equal(hasConsent([], undefined, ["anthropic", "openai"]), false);
+	});
+
+	it("an explicit in-session revoke beats the pre-consent list", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" })];
+		assert.equal(hasConsent(entries, "anthropic", ["anthropic"]), false);
+		// Revoking one provider leaves other listed providers pre-consented
+		assert.equal(hasConsent(entries, "openai", ["anthropic", "openai"]), true);
+	});
+
+	it("a provider-less in-session revoke blocks all pre-consented providers", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false })];
+		assert.equal(hasConsent(entries, "anthropic", ["anthropic"]), false);
+		assert.equal(hasConsent(entries, "openai", ["openai"]), false);
+	});
+
+	it("a grant after a revoke restores consent", () => {
+		const entries: Entry[] = [
+			customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" }),
+			customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "anthropic" }),
+		];
+		assert.equal(hasConsent(entries, "anthropic", []), true);
+	});
+
+	it("canonicalizes the provider before matching the list", () => {
+		assert.equal(hasConsent([], "x-ai", ["xai"]), true);
+	});
+});
+
+describe("consent provider alias canonicalization (PR #18 review)", () => {
+	it("a revoke stored under an alias still blocks the canonical provider", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "x-ai" })];
+		assert.equal(consentState(entries, "xai"), "revoked");
+		// pre-consent list must NOT override the aliased revoke
+		assert.equal(hasConsent(entries, "xai", ["xai"]), false);
+	});
+
+	it("a revoke stored canonically blocks an alias-form check", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "xai" })];
+		assert.equal(consentState(entries, "x-ai"), "revoked");
+		assert.equal(hasConsent(entries, "x-ai", ["xai"]), false);
+	});
+
+	it("a grant stored under an alias satisfies the canonical check and vice versa", () => {
+		const aliasGrant: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "x-ai" })];
+		assert.equal(hasConsent(aliasGrant, "xai"), true);
+		const canonicalGrant: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "xai" })];
+		assert.equal(hasConsent(canonicalGrant, "x-ai"), true);
+	});
+
+	it("aliased entries for a different provider still don't match", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "x-ai" })];
+		assert.equal(consentState(entries, "anthropic"), "none");
+	});
+});
+
+describe("normalizeAllowedProviders", () => {
+	it("canonicalizes, dedupes, and drops invalid or non-string entries", () => {
+		assert.deepEqual(normalizeAllowedProviders(["x-ai", "xai", "anthropic", "bad/id", 42]), ["xai", "anthropic"]);
+	});
+
+	it("keeps empty arrays and rejects non-arrays", () => {
+		assert.deepEqual(normalizeAllowedProviders([]), []);
+		assert.equal(normalizeAllowedProviders("anthropic"), undefined);
+		assert.equal(normalizeAllowedProviders(undefined), undefined);
+	});
+});
+
+describe("parseProviderList", () => {
+	it("splits on commas and whitespace, trims, dedupes", () => {
+		assert.deepEqual(parseProviderList("anthropic, openai anthropic"), ["anthropic", "openai"]);
+	});
+
+	it("canonicalizes x-ai to xai", () => {
+		assert.deepEqual(parseProviderList("x-ai,xai"), ["xai"]);
+	});
+
+	it("drops invalid provider ids", () => {
+		assert.deepEqual(parseProviderList("good, bad/slash, also:bad"), ["good"]);
+	});
+
+	it("returns [] for empty or all-invalid input", () => {
+		assert.deepEqual(parseProviderList(""), []);
+		assert.deepEqual(parseProviderList("a/b, c:d"), []);
+	});
+});
+
+describe("allowedProviders config plumbing", () => {
+	it("sanitize normalizes, canonicalizes, and dedupes the list", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, allowedProviders: ["x-ai", "anthropic", "anthropic", "bad/id", 42 as any] });
+		assert.deepEqual(cfg.allowedProviders, ["xai", "anthropic"]);
+	});
+
+	it("sanitize keeps an explicit empty list and drops non-arrays", () => {
+		assert.deepEqual(sanitize({ ...DEFAULT_CONFIG, allowedProviders: [] }).allowedProviders, []);
+		assert.equal("allowedProviders" in sanitize({ ...DEFAULT_CONFIG, allowedProviders: "anthropic" as any }), false);
+		assert.equal("allowedProviders" in sanitize({ ...DEFAULT_CONFIG }), false);
+	});
+
+	it("reads PI_VISION_PROXY_ALLOWED_PROVIDERS", () => {
+		assert.deepEqual(
+			readEnvOverrides({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "anthropic,openai" }).allowedProviders,
+			["anthropic", "openai"],
+		);
+		// defined-but-empty must override a persisted list with "none"
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, []);
+		assert.equal(readEnvOverrides({}).allowedProviders, undefined);
+	});
+
+	it("file config supplies the list; env override wins", () => {
+		const fileConfig = { allowedProviders: ["anthropic"] };
+		assert.deepEqual(resolveConfig([], {}, fileConfig).allowedProviders, ["anthropic"]);
+		// session-entry configs never carry the key, so they don't shadow the file
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONFIG, { mode: "always" })];
+		assert.deepEqual(resolveConfig(entries, {}, fileConfig).allowedProviders, ["anthropic"]);
+		assert.deepEqual(
+			resolveConfig(entries, { PI_VISION_PROXY_ALLOWED_PROVIDERS: "openai" }, fileConfig).allowedProviders,
+			["openai"],
+		);
+		assert.deepEqual(
+			resolveConfig(entries, { PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }, fileConfig).allowedProviders,
+			[],
+		);
+	});
+
+	it("round-trips through the persistent file", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vision-proxy-allowed-"));
+		try {
+			await writePersistentFile({ allowedProviders: ["anthropic", "openai"] }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedProviders, ["anthropic", "openai"]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("canonicalizes a hand-edited list at the file-read boundary", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vision-proxy-allowed-"));
+		try {
+			await writePersistentFile({ allowedProviders: ["x-ai", "anthropic", "bad/id", 7 as any] }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedProviders, ["xai", "anthropic"]);
+			// non-array value is dropped entirely
+			await writePersistentFile({ allowedProviders: "anthropic" as any }, dir);
+			assert.equal("allowedProviders" in (await readPersistentFile(dir)), false);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -1622,7 +1802,7 @@ describe("sanitize (1.4.0 fields)", () => {
 	});
 });
 
-describe("sanitize (1.9.0 file-access fields)", () => {
+describe("sanitize (1.10.0 file-access fields)", () => {
 	it("defaults allowedFolders and allowHome when missing or invalid", () => {
 		const result = sanitize({
 			mode: "fallback",
