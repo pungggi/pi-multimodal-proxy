@@ -42,7 +42,7 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { type ImageContent as PiAiImage, complete } from "@earendil-works/pi-ai";
 import type {
@@ -118,6 +118,10 @@ import {
 	type LegacyImage,
 	parseDescribeArgs,
 	parseGroundingFormat,
+	pathAccessFromConfig,
+	expandLeadingTilde,
+	isUncPath,
+	MAX_ALLOWED_FOLDERS,
 
 	readMediaFileWithReason,
 	type ReadMediaReason,
@@ -520,7 +524,7 @@ let _fileConfig: Partial<VisionConfig> = {};
 function describeReadReason(reason: ReadImageReason, bytes?: number): string {
 	switch (reason) {
 		case "denied":
-			return "path outside allowed directories (tmp / cwd / local Windows drives; set PI_VISION_PROXY_ALLOW_HOME=1 to include home on other volumes)";
+			return "path outside allowed directories (tmp / cwd / local Windows drives; grant more with /multimodal-proxy folders add <path> or /multimodal-proxy allow-home on)";
 		case "unreadable":
 			return "could not read file";
 		case "empty":
@@ -537,7 +541,7 @@ function describeReadReason(reason: ReadImageReason, bytes?: number): string {
 function describeReadMediaReason(reason: ReadMediaReason, bytes?: number): string {
 	switch (reason) {
 		case "denied":
-			return "path outside allowed directories (tmp / cwd / local Windows drives; set PI_VISION_PROXY_ALLOW_HOME=1 to include home on other volumes)";
+			return "path outside allowed directories (tmp / cwd / local Windows drives; grant more with /multimodal-proxy folders add <path> or /multimodal-proxy allow-home on)";
 		case "unreadable":
 			return "could not read file";
 		case "empty":
@@ -1144,7 +1148,7 @@ async function handleAnalyzeImage(
 		if (ref.includes("..")) {
 			return `Error: path contains disallowed ".." segments.`;
 		}
-		const r = await readImageFileWithReason(ref);
+		const r = await readImageFileWithReason(ref, pathAccessFromConfig(config));
 		if (!r.image) {
 			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
 		}
@@ -1495,13 +1499,19 @@ export default function (pi: ExtensionAPI) {
 			const imageMeta = sessionState.imageMeta;
 			const imageData = sessionState.imageData;
 
+			// Resolve config up front — file loading below honors the configurable
+			// folder allowlist (allowedFolders / allowHome).
+			const entries = ctx.sessionManager.getEntries();
+			const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
+			const pathAccess = pathAccessFromConfig(config);
+
 			// Collect images: structured attachments + file paths detected in prompt text
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
 			const filePaths = extractCandidateImagePaths(event.prompt);
 			const acceptedPaths: string[] = [];
 			for (const fp of filePaths) {
 				if (fp.includes("..")) continue; // defense-in-depth: reject traversal
-				const r = await readImageFileWithReason(fp);
+				const r = await readImageFileWithReason(fp, pathAccess);
 				if (r.image) {
 					images.push(r.image);
 					acceptedPaths.push(fp);
@@ -1527,7 +1537,7 @@ export default function (pi: ExtensionAPI) {
 			const mediaFiles: { file: { type: "image"; data: string; mimeType: string }; filename: string; path: string }[] = [];
 
 			for (const mp of mediaPaths) {
-				const r = await readMediaFileWithReason(mp);
+				const r = await readMediaFileWithReason(mp, pathAccess);
 				if (r.media) {
 					mediaFiles.push({ file: r.media, filename: r.filename ?? mp, path: mp });
 					acceptedMediaPaths.push(mp);
@@ -1554,8 +1564,6 @@ export default function (pi: ExtensionAPI) {
 
 			if (images.length === 0 && mediaFiles.length === 0) return;
 
-			const entries = ctx.sessionManager.getEntries();
-			const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
 			const conversationContext = config.includeContext
 				? buildConversationContext(ctx.sessionManager.getBranch())
 				: "";
@@ -2315,6 +2323,116 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ── folders list/add/remove/reset (file-access allowlist, #15) ──
+			if (sub === "folders") {
+				const { sub: fSub, value: fValue } = splitSubcommand(value);
+
+				if (fSub === "list" || fSub === "") {
+					const folders = effective.allowedFolders;
+					const lines =
+						folders.length === 0
+							? "  (none — tmp, cwd and local Windows drives are always allowed)"
+							: folders.map((f) => `  ${f}`).join("\n");
+					ctx.ui.notify(
+						`[multimodal-proxy] Allowed folders:\n${lines}\nAllow home: ${effective.allowHome ? "ON" : "OFF"}` +
+							(env.allowedFolders ? "\n(PI_VISION_PROXY_ALLOWED_FOLDERS is set - env overrides persisted list)" : ""),
+						"info",
+					);
+					return;
+				}
+
+				if (env.allowedFolders) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_ALLOWED_FOLDERS is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+
+				if (fSub === "reset") {
+					writePersisted({ ...persisted, allowedFolders: [] });
+					ctx.ui.notify("[multimodal-proxy] Allowed folders cleared.", "info");
+					return;
+				}
+
+				if (fSub === "add") {
+					const folder = expandLeadingTilde(fValue.trim());
+					if (!folder || !isAbsolute(folder)) {
+						ctx.ui.notify("Usage: /multimodal-proxy folders add <absolute-path>  (~ is expanded)", "warning");
+						return;
+					}
+					if (isUncPath(folder)) {
+						ctx.ui.notify("[multimodal-proxy] UNC/network paths cannot be allowlisted.", "warning");
+						return;
+					}
+					const current = effective.allowedFolders;
+					if (current.some((f) => f.toLowerCase() === folder.toLowerCase())) {
+						ctx.ui.notify(`[multimodal-proxy] ${folder} is already in the allowed folders list.`, "info");
+						return;
+					}
+					if (current.length >= MAX_ALLOWED_FOLDERS) {
+						ctx.ui.notify(`[multimodal-proxy] Allowed folders list is full (max ${MAX_ALLOWED_FOLDERS}).`, "warning");
+						return;
+					}
+					writePersisted({ ...persisted, allowedFolders: [...current, folder] });
+					ctx.ui.notify(`[multimodal-proxy] Added allowed folder: ${folder}`, "info");
+					return;
+				}
+
+				if (fSub === "remove") {
+					const folder = expandLeadingTilde(fValue.trim());
+					if (!folder) {
+						ctx.ui.notify("Usage: /multimodal-proxy folders remove <path>", "warning");
+						return;
+					}
+					const current = effective.allowedFolders;
+					const next = current.filter((f) => f.toLowerCase() !== folder.toLowerCase());
+					if (next.length === current.length) {
+						ctx.ui.notify(`[multimodal-proxy] ${folder} is not in the allowed folders list.`, "warning");
+						return;
+					}
+					writePersisted({ ...persisted, allowedFolders: next });
+					ctx.ui.notify(`[multimodal-proxy] Removed allowed folder: ${folder}`, "info");
+					return;
+				}
+
+				ctx.ui.notify(
+					"Usage: /multimodal-proxy folders <list|add|remove|reset>\n" +
+					"  list           - show allowed folders\n" +
+					"  add <path>     - allow an absolute folder path (~ is expanded)\n" +
+					"  remove <path>  - remove a folder from the list\n" +
+					"  reset          - clear the list",
+					"info",
+				);
+				return;
+			}
+
+			// ── allow-home on/off (persisted PI_VISION_PROXY_ALLOW_HOME) ──
+			if (sub === "allow-home") {
+				if (env.allowHome) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_ALLOW_HOME is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (isTrue(valueLower)) {
+					writePersisted({ ...persisted, allowHome: true });
+					ctx.ui.notify("[multimodal-proxy] Home folder access: ON", "info");
+					return;
+				}
+				if (isFalse(valueLower)) {
+					writePersisted({ ...persisted, allowHome: false });
+					ctx.ui.notify("[multimodal-proxy] Home folder access: OFF", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`[multimodal-proxy] Home folder access: ${effective.allowHome ? "ON" : "OFF"}. Use /multimodal-proxy allow-home on|off.`,
+					"info",
+				);
+				return;
+			}
+
 			// ── grounding-models add/remove/list/reset ─────────
 			if (sub === "grounding-models") {
 				const { sub: gmSub, value: gmValue } = splitSubcommand(value);
@@ -2479,7 +2597,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`[multimodal-proxy] Error: path contains disallowed \"..\" segments.`, "error");
 						return;
 					}
-					const r = await readImageFileWithReason(ref);
+					const r = await readImageFileWithReason(ref, pathAccessFromConfig(effective));
 					if (!r.image) {
 						ctx.ui.notify(`[multimodal-proxy] Could not read image: ${ref} (${describeReadReason(r.reason ?? "not-an-image", r.bytes)})`, "error");
 						return;
@@ -2661,6 +2779,12 @@ export default function (pi: ExtensionAPI) {
 			// ── Interactive config ──────────────────────────────
 			// Display the model requests will actually use (registry fallback applied)
 			const friendlyEffective = friendlyModelLabel(withModelFallback(effective, ctx), ctx.modelRegistry);
+			const activeEnvOverrides = [
+				env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool",
+				env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize",
+				env.videoModel && "videoModel", env.allowedProviders && "allowedProviders",
+				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
+			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
 				`Model: ${friendlyEffective}\n` +
@@ -2670,18 +2794,16 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}\n` +
 				`Max batch: ${effective.maxBatch}\n` +
 				`Cache size: ${effective.cacheSize}\n` +
+				`Allowed folders: ${effective.allowedFolders.length}\n` +
+				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
-				(env.mode || env.model || env.context || env.allowedProviders
-					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize", env.videoModel && "videoModel", env.allowedProviders && "allowedProviders"]
-							.filter(Boolean)
-							.join(", ")}\n`
-					: "");
+				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
 
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n>`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off`,
 					"info",
 				);
 				return;
@@ -2695,6 +2817,8 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}`,
 				`Max batch: ${effective.maxBatch}`,
 				`Cache size: ${effective.cacheSize}`,
+				`Allowed folders: ${effective.allowedFolders.length} configured`,
+				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 			]);
@@ -2795,6 +2919,57 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (choice.startsWith("Allowed folders")) {
+				if (env.allowedFolders) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for allowed folders.", "warning");
+					return;
+				}
+				const folders = effective.allowedFolders;
+				const folderChoice = await ctx.ui.select("Allowed folders", [
+					"Add a folder…",
+					...folders.map((f) => `Remove: ${f}`),
+				]);
+				if (!folderChoice) return;
+				if (folderChoice === "Add a folder…") {
+					const val = await ctx.ui.input("Folder path to allow (absolute, ~ is expanded)", "");
+					if (!val) return;
+					const folder = expandLeadingTilde(val.trim());
+					if (!folder || !isAbsolute(folder)) {
+						ctx.ui.notify("Path must be absolute (or start with ~).", "warning");
+						return;
+					}
+					if (isUncPath(folder)) {
+						ctx.ui.notify("UNC/network paths cannot be allowlisted.", "warning");
+						return;
+					}
+					if (folders.some((f) => f.toLowerCase() === folder.toLowerCase())) {
+						ctx.ui.notify(`${folder} is already allowed.`, "info");
+						return;
+					}
+					if (folders.length >= MAX_ALLOWED_FOLDERS) {
+						ctx.ui.notify(`Allowed folders list is full (max ${MAX_ALLOWED_FOLDERS}).`, "warning");
+						return;
+					}
+					writePersisted({ ...persisted, allowedFolders: [...folders, folder] });
+					ctx.ui.notify(`Added allowed folder: ${folder}`, "info");
+					return;
+				}
+				const toRemove = folderChoice.slice("Remove: ".length);
+				writePersisted({ ...persisted, allowedFolders: folders.filter((f) => f !== toRemove) });
+				ctx.ui.notify(`Removed allowed folder: ${toRemove}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("Allow home")) {
+				if (env.allowHome) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for allow-home.", "warning");
+					return;
+				}
+				const next = writePersisted({ ...persisted, allowHome: !effective.allowHome });
+				ctx.ui.notify(`Allow home: ${next.allowHome ? "ON" : "OFF"}`, "info");
+				return;
+			}
+
 			if (choice.startsWith("Consent")) {
 				const granted = !hasConsent(entries, effective.provider, effective.allowedProviders);
 				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
@@ -2824,7 +2999,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Register both command names
 	pi.registerCommand("multimodal-proxy", {
-		description: "Configure multimodal proxy (images, video, audio — mode, model, context, consent, tool)",
+		description: "Configure multimodal proxy (images, video, audio — mode, model, context, consent, tool, allowed folders)",
 		handler: commandHandler,
 	});
 	pi.registerCommand("vision-proxy", {
