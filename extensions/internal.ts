@@ -766,6 +766,18 @@ export function readPersistedConfig(entries: readonly SessionEntry[]): Partial<V
 	return {};
 }
 
+/**
+ * Parse PI_VISION_PROXY_ALLOW_HOME into an override. Only recognized
+ * truthy/falsy values count — anything else is no override, so it must not
+ * lock the /multimodal-proxy allow-home command either (see envFlags).
+ */
+export function parseAllowHomeEnv(raw: string | undefined): boolean | undefined {
+	const v = raw?.trim().toLowerCase();
+	if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+	if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+	return undefined;
+}
+
 export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<VisionConfig> {
 	const overrides: Partial<VisionConfig> = {};
 	const modeEnv = env.PI_VISION_PROXY_MODE;
@@ -825,11 +837,8 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 		overrides.allowedProviders = parseProviderList(allowedEnv);
 	}
 	// 1.10.0 file-access env overrides
-	const allowHomeEnv = env.PI_VISION_PROXY_ALLOW_HOME?.toLowerCase();
-	if (allowHomeEnv !== undefined) {
-		if (allowHomeEnv === "1" || allowHomeEnv === "true" || allowHomeEnv === "yes" || allowHomeEnv === "on") overrides.allowHome = true;
-		else if (allowHomeEnv === "0" || allowHomeEnv === "false" || allowHomeEnv === "no" || allowHomeEnv === "off") overrides.allowHome = false;
-	}
+	const allowHomeOverride = parseAllowHomeEnv(env.PI_VISION_PROXY_ALLOW_HOME);
+	if (allowHomeOverride !== undefined) overrides.allowHome = allowHomeOverride;
 	const foldersEnv = env.PI_VISION_PROXY_ALLOWED_FOLDERS;
 	if (foldersEnv !== undefined) {
 		overrides.allowedFolders = sanitizeAllowedFolders(foldersEnv.split(delimiter));
@@ -848,7 +857,9 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		cacheSize: env.PI_VISION_PROXY_CACHE_SIZE !== undefined,
 		videoModel: env.PI_VISION_PROXY_VIDEO_MODEL !== undefined,
 		allowedProviders: env.PI_VISION_PROXY_ALLOWED_PROVIDERS !== undefined,
-		allowHome: env.PI_VISION_PROXY_ALLOW_HOME !== undefined,
+		// Only a recognized value actually overrides allow-home; an unparseable
+		// value must not lock the command.
+		allowHome: parseAllowHomeEnv(env.PI_VISION_PROXY_ALLOW_HOME) !== undefined,
 		allowedFolders: env.PI_VISION_PROXY_ALLOWED_FOLDERS !== undefined,
 	};
 }
@@ -899,13 +910,26 @@ export const MAX_ALLOWED_FOLDERS = 100;
 /** Expand a leading `~` / `~/` to the user's home directory. `~` elsewhere is left untouched. */
 export function expandLeadingTilde(p: string): string {
 	if (p === "~") return os.homedir();
-	if (p.startsWith("~/") || p.startsWith("~\\")) return join(os.homedir(), p.slice(2));
+	if (p.startsWith("~/") || p.startsWith("~\\")) {
+		// Strip all leading separators after the tilde so inputs like "~//etc"
+		// resolve under home instead of join() discarding the home prefix.
+		return join(os.homedir(), p.slice(2).replace(/^[\\/]+/, ""));
+	}
 	return p;
 }
 
 /**
+ * UNC/network roots (`\\server\share`, `//server/share`) stay denied everywhere,
+ * including the configurable allowlist — matching the drive-path rules.
+ */
+export function isUncPath(p: string): boolean {
+	return /^[\\/]{2}/.test(p);
+}
+
+/**
  * Normalize a user-supplied allowed-folders list: strings only, trimmed,
- * leading `~` expanded, absolute paths only, case-insensitively deduped, capped.
+ * leading `~` expanded, absolute local paths only (UNC/network roots are
+ * rejected), case-insensitively deduped, capped.
  */
 export function sanitizeAllowedFolders(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
@@ -914,7 +938,7 @@ export function sanitizeAllowedFolders(value: unknown): string[] {
 	for (const entry of value) {
 		if (typeof entry !== "string") continue;
 		const expanded = expandLeadingTilde(entry.trim());
-		if (!expanded || !isAbsolute(expanded)) continue;
+		if (!expanded || !isAbsolute(expanded) || isUncPath(expanded)) continue;
 		const key = expanded.toLowerCase();
 		if (seen.has(key)) continue;
 		seen.add(key);
@@ -1475,7 +1499,7 @@ export async function isPathAllowed(filePath: string, access?: PathAccessOptions
 		if (root && isInsideOrSame(resolved, root)) return true;
 	}
 
-	if (access?.allowHome === true || process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
+	if (access?.allowHome === true || parseAllowHomeEnv(process.env.PI_VISION_PROXY_ALLOW_HOME) === true) {
 		const home = await canonical(os.homedir?.());
 		if (home && isInsideOrSame(resolved, home)) return true;
 	}

@@ -228,10 +228,10 @@ describe("readEnvOverrides", () => {
 	});
 
 	it("parses allowHome truthy/falsy values", () => {
-		for (const v of ["1", "true", "yes", "on", "TRUE"]) {
+		for (const v of ["1", "true", "yes", "on", "TRUE", " 1 "]) {
 			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, true, `truthy ${v}`);
 		}
-		for (const v of ["0", "false", "no", "off"]) {
+		for (const v of ["0", "false", "no", "off", " off "]) {
 			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, false, `falsy ${v}`);
 		}
 		assert.equal(readEnvOverrides({}).allowHome, undefined);
@@ -263,6 +263,9 @@ describe("envFlags", () => {
 			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
+		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: "garbage" }).allowHome, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: " off " }).allowHome, true);
 	});
 });
 
@@ -1081,6 +1084,11 @@ describe("expandLeadingTilde", () => {
 		assert.equal(expandLeadingTilde("~user/x"), "~user/x");
 		assert.equal(expandLeadingTilde("/plain"), "/plain");
 	});
+
+	it("keeps double-separator inputs under home", () => {
+		assert.equal(expandLeadingTilde("~//etc"), join(os.homedir(), "etc"));
+		assert.equal(expandLeadingTilde("~/\\\\pics"), join(os.homedir(), "pics"));
+	});
 });
 
 describe("sanitizeAllowedFolders", () => {
@@ -1099,6 +1107,10 @@ describe("sanitizeAllowedFolders", () => {
 	it("returns empty array for non-arrays", () => {
 		assert.deepEqual(sanitizeAllowedFolders("/a"), []);
 		assert.deepEqual(sanitizeAllowedFolders(undefined), []);
+	});
+
+	it("rejects UNC/network roots", () => {
+		assert.deepEqual(sanitizeAllowedFolders(["\\\\server\\share", "//server/share", "/ok"]), ["/ok"]);
 	});
 });
 

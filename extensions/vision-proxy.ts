@@ -120,6 +120,7 @@ import {
 	parseGroundingFormat,
 	pathAccessFromConfig,
 	expandLeadingTilde,
+	isUncPath,
 	MAX_ALLOWED_FOLDERS,
 
 	readMediaFileWithReason,
@@ -2360,6 +2361,10 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Usage: /multimodal-proxy folders add <absolute-path>  (~ is expanded)", "warning");
 						return;
 					}
+					if (isUncPath(folder)) {
+						ctx.ui.notify("[multimodal-proxy] UNC/network paths cannot be allowlisted.", "warning");
+						return;
+					}
 					const current = effective.allowedFolders;
 					if (current.some((f) => f.toLowerCase() === folder.toLowerCase())) {
 						ctx.ui.notify(`[multimodal-proxy] ${folder} is already in the allowed folders list.`, "info");
@@ -2774,6 +2779,12 @@ export default function (pi: ExtensionAPI) {
 			// ── Interactive config ──────────────────────────────
 			// Display the model requests will actually use (registry fallback applied)
 			const friendlyEffective = friendlyModelLabel(withModelFallback(effective, ctx), ctx.modelRegistry);
+			const activeEnvOverrides = [
+				env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool",
+				env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize",
+				env.videoModel && "videoModel", env.allowedProviders && "allowedProviders",
+				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
+			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
 				`Model: ${friendlyEffective}\n` +
@@ -2787,11 +2798,7 @@ export default function (pi: ExtensionAPI) {
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
-				(env.mode || env.model || env.context || env.allowedProviders || env.allowHome || env.allowedFolders
-					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize", env.videoModel && "videoModel", env.allowedProviders && "allowedProviders", env.allowHome && "allowHome", env.allowedFolders && "allowedFolders"]
-							.filter(Boolean)
-							.join(", ")}\n`
-					: "");
+				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
 
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
@@ -2929,6 +2936,10 @@ export default function (pi: ExtensionAPI) {
 					const folder = expandLeadingTilde(val.trim());
 					if (!folder || !isAbsolute(folder)) {
 						ctx.ui.notify("Path must be absolute (or start with ~).", "warning");
+						return;
+					}
+					if (isUncPath(folder)) {
+						ctx.ui.notify("UNC/network paths cannot be allowlisted.", "warning");
 						return;
 					}
 					if (folders.some((f) => f.toLowerCase() === folder.toLowerCase())) {
