@@ -93,6 +93,7 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
 /multimodal-proxy folders remove <path>                → remove a folder from the allowlist
 /multimodal-proxy folders reset                        → clear the folder allowlist
 /multimodal-proxy allow-home on | off                  → allow reading media anywhere under your home folder
+/multimodal-proxy path-detection on | off              → auto-load media file paths found in prompt text (off = attachments only)
 /multimodal-proxy describe <path>... [--question "<text>"] [--crop <i>:<form>] [--model <provider/id>] [--save]
 
 Legacy alias: /vision-proxy <args> works identically.
@@ -118,6 +119,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_MAX_VIDEO_BYTES` | positive integer | `209715200` (200 MB) |
 | `PI_VISION_PROXY_ALLOWED_PROVIDERS` | comma-separated provider ids pre-consented for data egress (e.g. `anthropic,openai`); set empty to disable a persisted list for this shell/project | not set |
 | `PI_VISION_PROXY_STATUS_LINE` | `on`, `off` | `on` |
+| `PI_VISION_PROXY_PATH_DETECTION` | `on`, `off` — `off` disables scanning prompt text for media file paths; structured attachments are always processed | `on` |
 
 When an env var is set, the matching `/multimodal-proxy` subcommand is locked.
 
