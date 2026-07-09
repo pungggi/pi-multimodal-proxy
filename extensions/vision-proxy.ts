@@ -1512,9 +1512,13 @@ export default function (pi: ExtensionAPI) {
 			const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
 			const pathAccess = pathAccessFromConfig(config);
 
-			// Collect images: structured attachments + file paths detected in prompt text
+			// Collect images: structured attachments + file paths detected in prompt
+			// text. The prompt-text scan is a convenience feature gated by the
+			// path-detection setting (security audit issue #2, finding 1); structured
+			// attachments are always processed.
+			const pathDetectionOn = config.pathDetection === "on";
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
-			const filePaths = extractCandidateImagePaths(event.prompt);
+			const filePaths = pathDetectionOn ? extractCandidateImagePaths(event.prompt) : [];
 			const acceptedPaths: string[] = [];
 			for (const fp of filePaths) {
 				if (fp.includes("..")) continue; // defense-in-depth: reject traversal
@@ -1535,8 +1539,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// ── Detect video/audio files ───────────────────────────────────────
-			const videoPaths = extractCandidateVideoPaths(event.prompt);
-			const audioPaths = extractCandidateAudioPaths(event.prompt);
+			const videoPaths = pathDetectionOn ? extractCandidateVideoPaths(event.prompt) : [];
+			const audioPaths = pathDetectionOn ? extractCandidateAudioPaths(event.prompt) : [];
 			const mediaPaths = [...videoPaths, ...audioPaths].filter(
 				(p, i, arr) => p && !p.includes("..") && arr.indexOf(p) === i,
 			);
@@ -2299,6 +2303,32 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ── Path detection on/off ──────────────────────────
+			if (sub === "path-detection") {
+				if (env.pathDetection) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_PATH_DETECTION is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (isTrue(valueLower)) {
+					writePersisted({ ...persisted, pathDetection: "on" });
+					ctx.ui.notify("[multimodal-proxy] Path detection: ON (media file paths in prompt text are auto-loaded)", "info");
+					return;
+				}
+				if (isFalse(valueLower)) {
+					writePersisted({ ...persisted, pathDetection: "off" });
+					ctx.ui.notify("[multimodal-proxy] Path detection: OFF (only attached images are processed; use /multimodal-proxy describe for files)", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`[multimodal-proxy] Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}. Use /multimodal-proxy path-detection on|off.`,
+					"info",
+				);
+				return;
+			}
+
 			// ── max-images-per-call ────────────────────────────
 			if (sub === "max-images-per-call") {
 				if (env.maxImagesPerCall) {
@@ -2817,7 +2847,7 @@ export default function (pi: ExtensionAPI) {
 				env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize",
 				env.videoModel && "videoModel", env.allowedProviders && "allowedProviders",
 				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
-				env.statusLine && "statusLine",
+				env.statusLine && "statusLine", env.pathDetection && "pathDetection",
 			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
@@ -2831,6 +2861,7 @@ export default function (pi: ExtensionAPI) {
 				`Allowed folders: ${effective.allowedFolders.length}\n` +
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
+				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
 				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
@@ -2838,7 +2869,7 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off`,
 					"info",
 				);
 				return;
@@ -2855,6 +2886,7 @@ export default function (pi: ExtensionAPI) {
 				`Allowed folders: ${effective.allowedFolders.length} configured`,
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
+				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}`,
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 			]);
@@ -3014,6 +3046,17 @@ export default function (pi: ExtensionAPI) {
 				const nextStatusLine = effective.statusLine === "on" ? "off" : "on";
 				writePersisted({ ...persisted, statusLine: nextStatusLine });
 				ctx.ui.notify(`Status line: ${nextStatusLine === "on" ? "ON" : "OFF"}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("Path detection")) {
+				if (env.pathDetection) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for path detection.", "warning");
+					return;
+				}
+				const nextPathDetection = effective.pathDetection === "on" ? "off" : "on";
+				writePersisted({ ...persisted, pathDetection: nextPathDetection });
+				ctx.ui.notify(`Path detection: ${nextPathDetection === "on" ? "ON" : "OFF"}`, "info");
 				return;
 			}
 
