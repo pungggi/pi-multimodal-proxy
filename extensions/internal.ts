@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { basename, dirname, extname, join, parse, relative } from "node:path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, parse, relative } from "node:path";
 import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import imageSize from "image-size";
@@ -17,6 +17,8 @@ import { Image } from "imagescript";
 export type ProxyMode = "fallback" | "always" | "off";
 
 export type ToolSetting = "on" | "off";
+
+export type StatusLineSetting = "on" | "off";
 
 export type GroundingFormat =
 	| "qwen_pixels"
@@ -53,6 +55,20 @@ export interface VisionConfig {
 	// of changing unrelated settings; only implicit values may track the
 	// package default (see applyDefaultModelFallback).
 	modelExplicit?: boolean;
+	// 1.9.0 — providers pre-consented for data egress: consent prompts are
+	// skipped for providers in this list. An explicit in-session revoke
+	// (/multimodal-proxy consent no) still wins over the list. Lives in the
+	// persistent config file (or PI_VISION_PROXY_ALLOWED_PROVIDERS), never in
+	// session-entry configs, so per-session config churn can't shadow it.
+	allowedProviders?: string[];
+	// 1.10.0 — configurable file-access allowlist (issue #15). Absolute folder
+	// paths granted in addition to the built-in tmp/cwd/drive rules, and a
+	// persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1.
+	allowedFolders: string[];
+	allowHome: boolean;
+	// 1.10.0 — "off" hides the steady-state footer status line (issue #16); the
+	// transient analysis progress spinner still shows while a call is in flight.
+	statusLine: StatusLineSetting;
 }
 
 export interface ImageMeta {
@@ -659,6 +675,9 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	videoProvider: "xai",
 	videoModelId: "grok-4.3",
 	videoSystemPrompt: DEFAULT_VIDEO_SYSTEM_PROMPT,
+	allowedFolders: [],
+	allowHome: false,
+	statusLine: "on",
 	groundingModels: {
 		"Qwen/Qwen2.5-VL-3B-Instruct": { format: "qwen_pixels" },
 		"Qwen/Qwen2.5-VL-7B-Instruct": { format: "qwen_pixels" },
@@ -695,6 +714,9 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
 	"pHashSimilarityThreshold", "groundingModels",
 	"videoProvider", "videoModelId", "videoSystemPrompt",
+	"allowedProviders",
+	"allowedFolders", "allowHome",
+	"statusLine",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -710,6 +732,14 @@ export async function readPersistentFile(agentDir?: string): Promise<Partial<Vis
 				const filtered: Record<string, unknown> = {};
 				for (const [k, v] of Object.entries(parsed)) {
 					if (PERSISTED_CONFIG_KEYS.has(k)) filtered[k] = v;
+				}
+				// Canonicalize the pre-consent list at the file boundary so set
+				// operations downstream (add/remove/revoke) always work on
+				// canonical ids, even when the file was hand-edited (e.g. "x-ai").
+				if ("allowedProviders" in filtered) {
+					const normalized = normalizeAllowedProviders(filtered.allowedProviders);
+					if (normalized === undefined) delete filtered.allowedProviders;
+					else filtered.allowedProviders = normalized;
 				}
 				return filtered as Partial<VisionConfig>;
 			}
@@ -741,6 +771,18 @@ export function readPersistedConfig(entries: readonly SessionEntry[]): Partial<V
 		}
 	}
 	return {};
+}
+
+/**
+ * Parse PI_VISION_PROXY_ALLOW_HOME into an override. Only recognized
+ * truthy/falsy values count — anything else is no override, so it must not
+ * lock the /multimodal-proxy allow-home command either (see envFlags).
+ */
+export function parseAllowHomeEnv(raw: string | undefined): boolean | undefined {
+	const v = raw?.trim().toLowerCase();
+	if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+	if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+	return undefined;
 }
 
 export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<VisionConfig> {
@@ -786,6 +828,9 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 		const n = parseFloat(phashEnv);
 		if (Number.isFinite(n) && n >= 0 && n <= 1) overrides.pHashSimilarityThreshold = n;
 	}
+	// 1.9.0 status line override
+	const statusLineEnv = env.PI_VISION_PROXY_STATUS_LINE;
+	if (statusLineEnv === "on" || statusLineEnv === "off") overrides.statusLine = statusLineEnv;
 	// 1.5.0 video env overrides
 	const videoModelEnv = env.PI_VISION_PROXY_VIDEO_MODEL;
 	if (videoModelEnv) {
@@ -795,10 +840,23 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 			overrides.videoModelId = parsed.modelId;
 		}
 	}
+	// 1.9.0 pre-consented providers. A defined-but-empty value overrides a
+	// persisted list with "none", so it must produce [] rather than no key.
+	const allowedEnv = env.PI_VISION_PROXY_ALLOWED_PROVIDERS;
+	if (allowedEnv !== undefined) {
+		overrides.allowedProviders = parseProviderList(allowedEnv);
+	}
+	// 1.10.0 file-access env overrides
+	const allowHomeOverride = parseAllowHomeEnv(env.PI_VISION_PROXY_ALLOW_HOME);
+	if (allowHomeOverride !== undefined) overrides.allowHome = allowHomeOverride;
+	const foldersEnv = env.PI_VISION_PROXY_ALLOWED_FOLDERS;
+	if (foldersEnv !== undefined) {
+		overrides.allowedFolders = sanitizeAllowedFolders(foldersEnv.split(delimiter));
+	}
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -808,6 +866,14 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		maxBatch: env.PI_VISION_PROXY_MAX_BATCH !== undefined,
 		cacheSize: env.PI_VISION_PROXY_CACHE_SIZE !== undefined,
 		videoModel: env.PI_VISION_PROXY_VIDEO_MODEL !== undefined,
+		allowedProviders: env.PI_VISION_PROXY_ALLOWED_PROVIDERS !== undefined,
+		// Only a recognized value actually overrides allow-home; an unparseable
+		// value must not lock the command.
+		allowHome: parseAllowHomeEnv(env.PI_VISION_PROXY_ALLOW_HOME) !== undefined,
+		allowedFolders: env.PI_VISION_PROXY_ALLOWED_FOLDERS !== undefined,
+		// Only a value readEnvOverrides actually applies counts as an override;
+		// an invalid value must not lock /multimodal-proxy status.
+		statusLine: env.PI_VISION_PROXY_STATUS_LINE === "on" || env.PI_VISION_PROXY_STATUS_LINE === "off",
 	};
 }
 
@@ -818,6 +884,30 @@ export function canonicalProvider(provider: string): string {
 	return provider;
 }
 
+/**
+ * Parse a comma/whitespace-separated provider list into canonical, validated,
+ * deduplicated provider ids. Invalid entries are dropped silently.
+ */
+export function parseProviderList(raw: string): string[] {
+	const out: string[] = [];
+	for (const part of raw.split(/[,\s]+/)) {
+		const provider = canonicalProvider(part.trim());
+		if (!provider || !PROVIDER_PATTERN.test(provider)) continue;
+		if (!out.includes(provider)) out.push(provider);
+	}
+	return out;
+}
+
+/**
+ * Normalize an untrusted allowedProviders value (persisted file, session
+ * entry, caller input) into canonical, validated, deduplicated provider ids.
+ * Returns undefined for non-arrays so absence stays absence.
+ */
+export function normalizeAllowedProviders(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return parseProviderList(value.filter((p): p is string => typeof p === "string").join(","));
+}
+
 export function parseModelString(s: string): { provider: string; modelId: string } | null {
 	const slash = s.indexOf("/");
 	if (slash <= 0 || slash >= s.length - 1) return null;
@@ -825,6 +915,50 @@ export function parseModelString(s: string): { provider: string; modelId: string
 	const modelId = s.slice(slash + 1);
 	if (!PROVIDER_PATTERN.test(provider) || !MODEL_ID_PATTERN.test(modelId)) return null;
 	return { provider, modelId };
+}
+
+/** Upper bound on configurable allowed folders — keeps the persisted file and per-check work small. */
+export const MAX_ALLOWED_FOLDERS = 100;
+
+/** Expand a leading `~` / `~/` to the user's home directory. `~` elsewhere is left untouched. */
+export function expandLeadingTilde(p: string): string {
+	if (p === "~") return os.homedir();
+	if (p.startsWith("~/") || p.startsWith("~\\")) {
+		// Strip all leading separators after the tilde so inputs like "~//etc"
+		// resolve under home instead of join() discarding the home prefix.
+		return join(os.homedir(), p.slice(2).replace(/^[\\/]+/, ""));
+	}
+	return p;
+}
+
+/**
+ * UNC/network roots (`\\server\share`, `//server/share`) stay denied everywhere,
+ * including the configurable allowlist — matching the drive-path rules.
+ */
+export function isUncPath(p: string): boolean {
+	return /^[\\/]{2}/.test(p);
+}
+
+/**
+ * Normalize a user-supplied allowed-folders list: strings only, trimmed,
+ * leading `~` expanded, absolute local paths only (UNC/network roots are
+ * rejected), case-insensitively deduped, capped.
+ */
+export function sanitizeAllowedFolders(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "string") continue;
+		const expanded = expandLeadingTilde(entry.trim());
+		if (!expanded || !isAbsolute(expanded) || isUncPath(expanded)) continue;
+		const key = expanded.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(expanded);
+		if (out.length >= MAX_ALLOWED_FOLDERS) break;
+	}
+	return out;
 }
 
 export function sanitize(config: VisionConfig): VisionConfig {
@@ -873,6 +1007,17 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	if (typeof safe.videoSystemPrompt !== "string" || !safe.videoSystemPrompt) safe.videoSystemPrompt = DEFAULT_CONFIG.videoSystemPrompt;
 	// 1.8.0 field — keep only a real boolean; absence means "implicit model"
 	if (typeof safe.modelExplicit !== "boolean") delete safe.modelExplicit;
+	// 1.9.0 field — normalize to canonical, validated provider ids. An empty
+	// array is kept (it means "explicitly none", e.g. an env override clearing
+	// a persisted list); a non-array is dropped so absence stays absence.
+	const allowed = normalizeAllowedProviders(safe.allowedProviders);
+	if (allowed === undefined) delete safe.allowedProviders;
+	else safe.allowedProviders = allowed;
+	// 1.10.0 file-access fields
+	safe.allowedFolders = sanitizeAllowedFolders(safe.allowedFolders);
+	if (typeof safe.allowHome !== "boolean") safe.allowHome = DEFAULT_CONFIG.allowHome;
+	// 1.10.0 status-line field
+	if (safe.statusLine !== "on" && safe.statusLine !== "off") safe.statusLine = DEFAULT_CONFIG.statusLine;
 	return safe;
 }
 
@@ -988,28 +1133,53 @@ export function findVideoDescriptions(entries: readonly SessionEntry[]): Map<str
 	return map;
 }
 
-export function hasConsent(entries: readonly SessionEntry[], provider?: string): boolean {
+export type ConsentState = "granted" | "revoked" | "none";
+
+/**
+ * State of the most recent applicable in-session consent entry.
+ * "none" means the session carries no verdict for this provider — callers may
+ * then fall back to the persisted pre-consent list (see hasConsent).
+ */
+export function consentState(entries: readonly SessionEntry[], provider?: string): ConsentState {
+	// Canonicalize both sides of the comparison so provider aliases (x-ai vs
+	// xai — e.g. consent entries persisted by older package versions) can't
+	// dodge a revoke or miss a grant.
+	const wanted = provider ? canonicalProvider(provider) : undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i];
 		if (e?.type === "custom" && e.customType === CUSTOM_TYPE_CONSENT && e.data) {
 			const entry = e.data as ConsentEntry;
+			const entryProvider = entry.provider ? canonicalProvider(entry.provider) : undefined;
 			// A revoked entry only applies to its own provider (or globally if provider-less)
 			if (!entry.granted) {
-				if (provider) {
-					if (entry.provider && entry.provider !== provider) continue;
+				if (wanted) {
+					if (entryProvider && entryProvider !== wanted) continue;
 				}
-				return false;
+				return "revoked";
 			}
 			// Per-provider consent: both must match exactly.
 			// A provider-less entry is only valid when no specific provider is requested.
-			if (provider) {
-				if (entry.provider && entry.provider !== provider) continue;
-				if (!entry.provider) continue; // global consent doesn't satisfy per-provider check
+			if (wanted) {
+				if (entryProvider && entryProvider !== wanted) continue;
+				if (!entryProvider) continue; // global consent doesn't satisfy per-provider check
 			}
-			return true;
+			return "granted";
 		}
 	}
-	return false;
+	return "none";
+}
+
+export function hasConsent(
+	entries: readonly SessionEntry[],
+	provider?: string,
+	allowedProviders?: readonly string[],
+): boolean {
+	const state = consentState(entries, provider);
+	if (state === "granted") return true;
+	if (state === "revoked") return false; // an explicit in-session revoke beats pre-consent
+	// No in-session verdict — the persisted pre-consent list applies, but only
+	// for a specific provider (never as a blanket grant).
+	return Boolean(provider && allowedProviders?.includes(canonicalProvider(provider)));
 }
 
 // ── Image helpers ──────────────────────────────────────────────────────────
@@ -1276,14 +1446,33 @@ function driveAccessDisabled(): boolean {
 }
 
 /**
+ * User-configurable extension of the file-access allowlist, derived from the
+ * resolved VisionConfig (persisted settings and/or env overrides).
+ */
+export interface PathAccessOptions {
+	/** Extra absolute folder roots granted in addition to the built-in rules. */
+	allowedFolders?: readonly string[];
+	/** Allow the user's home directory (persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1). */
+	allowHome?: boolean;
+}
+
+/** Extract the file-access options from a resolved config. */
+export function pathAccessFromConfig(config: VisionConfig): PathAccessOptions {
+	return { allowedFolders: config.allowedFolders, allowHome: config.allowHome };
+}
+
+/**
  * Check that a resolved file path is within a safe directory.
- * By default allows tmpdir, /tmp (system-wide Unix temp), cwd, and local Windows drive paths;
- * opt into homedir on non-drive platforms via PI_VISION_PROXY_ALLOW_HOME=1.
+ * By default allows tmpdir, /tmp (system-wide Unix temp), cwd, and local Windows drive paths.
+ * Additional roots come from `access`: a configurable folder allowlist and an
+ * allow-home flag (persisted via /multimodal-proxy folders / allow-home, or the
+ * PI_VISION_PROXY_ALLOWED_FOLDERS / PI_VISION_PROXY_ALLOW_HOME env overrides).
+ * PI_VISION_PROXY_ALLOW_HOME=1 also works when no `access` is passed.
  * Both sides are canonicalized via realpath to handle symlinks and Windows 8.3 short names.
  * If the target file does not exist, the parent directory is resolved so callers can
  * distinguish "allowed dir but missing file" (→ "unreadable") from a genuinely denied path.
  */
-export async function isPathAllowed(filePath: string): Promise<boolean> {
+export async function isPathAllowed(filePath: string, access?: PathAccessOptions): Promise<boolean> {
 	let resolved: string;
 	try {
 		resolved = (await realpath(filePath)).toLowerCase();
@@ -1320,7 +1509,12 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
 		if (unixTmp && unixTmp !== tmp && isInsideOrSame(resolved, unixTmp)) return true;
 	}
 
-	if (process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
+	for (const folder of access?.allowedFolders ?? []) {
+		const root = await canonical(folder);
+		if (root && isInsideOrSame(resolved, root)) return true;
+	}
+
+	if (access?.allowHome === true || parseAllowHomeEnv(process.env.PI_VISION_PROXY_ALLOW_HOME) === true) {
 		const home = await canonical(os.homedir?.());
 		if (home && isInsideOrSame(resolved, home)) return true;
 	}
@@ -1333,10 +1527,10 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
 /**
  * Read an image file and return as base64 ImageContent with a structured reason on failure.
  */
-export async function readImageFileWithReason(filePath: string): Promise<ReadImageResult> {
+export async function readImageFileWithReason(filePath: string, access?: PathAccessOptions): Promise<ReadImageResult> {
 	const mimeType = mimeTypeForExt(filePath);
 	if (!mimeType) return { image: null, reason: "not-an-image" };
-	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { image: null, reason: "denied" };
 	let content: Buffer;
 	try {
 		content = await readFile(filePath);
@@ -1347,7 +1541,7 @@ export async function readImageFileWithReason(filePath: string): Promise<ReadIma
 	// parent-dir fallback when the file did not yet exist. A symlink could have been
 	// swapped in during that window. Now that the file exists, realpath() resolves it
 	// fully — catching any symlink pointing outside the allow-list (TOCTOU mitigation).
-	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { image: null, reason: "denied" };
 	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
 	const limit = maxImageFileBytes();
 	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
@@ -1384,17 +1578,56 @@ function maxVideoFileBytes(): number {
 }
 
 /**
+ * MPEG Transport Stream packet size (bytes). Real .ts/.mts/.m2ts video streams
+ * carry a 0x47 sync byte at the start of every 188-byte packet.
+ */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+
+/**
+ * Validate that a buffer plausibly contains an MPEG-TS video stream by checking
+ * that the 0x47 sync byte appears at the start of the first few 188-byte
+ * packets. This distinguishes genuine TS video from source-code files (e.g.
+ * TypeScript `.ts`) that merely share the extension.
+ *
+ * Returns true for a valid (or too-short-to-check) stream, false when the sync
+ * byte is missing — i.e. the file is almost certainly not MPEG-TS video.
+ */
+function looksLikeMpegTs(content: Buffer): boolean {
+	// Need at least one full packet to verify the pattern reliably.
+	if (content.length < MPEG_TS_PACKET_SIZE) return true; // ambiguous — don't reject
+	const packetsToCheck = Math.min(4, Math.floor(content.length / MPEG_TS_PACKET_SIZE));
+	for (let i = 0; i < packetsToCheck; i++) {
+		if (content[i * MPEG_TS_PACKET_SIZE] !== MPEG_TS_SYNC_BYTE) return false;
+	}
+	return true;
+}
+
+/**
+ * Extensions whose primary real-world meaning is *source code* rather than the
+ * video container they happen to map to in the MIME registry. These require
+ * content sniffing before being accepted as media.
+ */
+const SOURCE_CODE_VIDEO_EXTS = new Set([".ts", ".mts", ".m2ts"]);
+
+/**
  * Read a video or audio file and return as base64 with structured reason on failure.
  * Uses the PiAiImage shape ({ type: "image", data, mimeType }) as a carrier —
  * the onPayload hook rewrites the wire format to the correct video_url / audio type.
+ *
+ * For extensions that are overloaded with a source-code meaning (notably `.ts`,
+ * which is both TypeScript and MPEG-TS video), the file contents are sniffed
+ * against the expected media signature before being accepted. This prevents a
+ * TypeScript file such as `store.ts` from being shipped to a video model just
+ * because its extension matches the MPEG-TS MIME mapping.
  */
-export async function readMediaFileWithReason(filePath: string): Promise<ReadMediaResult> {
+export async function readMediaFileWithReason(filePath: string, access?: PathAccessOptions): Promise<ReadMediaResult> {
 	const ext = extname(filePath).toLowerCase();
 	const videoMime = VIDEO_EXT_TO_MIME[ext];
 	const audioMime = AUDIO_EXT_TO_MIME[ext];
 	const mimeType = videoMime ?? audioMime;
 	if (!mimeType) return { media: null, reason: "not-a-media" };
-	if (!(await isPathAllowed(filePath))) return { media: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { media: null, reason: "denied" };
 	let content: Buffer;
 	try {
 		content = await readFile(filePath);
@@ -1404,6 +1637,12 @@ export async function readMediaFileWithReason(filePath: string): Promise<ReadMed
 	if (content.length === 0) return { media: null, reason: "empty", bytes: 0 };
 	const limit = maxVideoFileBytes();
 	if (content.length > limit) return { media: null, reason: "too-large", bytes: content.length };
+
+	// Sniff content for extensions overloaded with a source-code meaning.
+	if (SOURCE_CODE_VIDEO_EXTS.has(ext) && !looksLikeMpegTs(content)) {
+		return { media: null, reason: "not-a-media" };
+	}
+
 	return {
 		media: { type: "image", data: content.toString("base64"), mimeType },
 		bytes: content.length,
@@ -1414,8 +1653,8 @@ export async function readMediaFileWithReason(filePath: string): Promise<ReadMed
 /**
  * Read an image file. Returns null on any failure. Prefer readImageFileWithReason for diagnostics.
  */
-export async function readImageFile(filePath: string): Promise<PiAiImage | null> {
-	return (await readImageFileWithReason(filePath)).image;
+export async function readImageFile(filePath: string, access?: PathAccessOptions): Promise<PiAiImage | null> {
+	return (await readImageFileWithReason(filePath, access)).image;
 }
 
 /**

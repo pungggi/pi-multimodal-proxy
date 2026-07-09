@@ -11,7 +11,7 @@ import { strict as assert } from "node:assert";
 import { after, describe, it } from "node:test";
 import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join, parse } from "node:path";
+import { delimiter, join, parse } from "node:path";
 import {
 	buildConversationContext,
 	buildDescriptionFence,
@@ -24,6 +24,7 @@ import {
 	formatXaiSttTranscript,
 	isTranscriptionRequest,
 	isXaiProvider,
+	consentState,
 	CUSTOM_TYPE_CONFIG,
 	CUSTOM_TYPE_CONSENT,
 	CUSTOM_TYPE_DESCRIPTION,
@@ -45,12 +46,19 @@ import {
 	VIDEO_PATH_PLACEHOLDER,
 	isPathAllowed,
 	isValidNamedRegion,
+	expandLeadingTilde,
+	sanitizeAllowedFolders,
+	pathAccessFromConfig,
+	MAX_ALLOWED_FOLDERS,
 	LRUCache,
+	normalizeAllowedProviders,
 	normalizedToPixels,
 	parseModelString,
+	parseProviderList,
 	pluralImages,
 	readEnvOverrides,
 	readImageFileWithReason,
+	readMediaFileWithReason,
 	readPersistentFile,
 	resolveConfig,
 	resolveCropEntry,
@@ -152,6 +160,12 @@ describe("sanitize", () => {
 		assert.equal(result.videoProvider, "xai");
 	});
 
+	it("defaults statusLine to on and preserves off", () => {
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: undefined as any }).statusLine, "on");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: "bogus" as any }).statusLine, "on");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, statusLine: "off" }).statusLine, "off");
+	});
+
 	it("preserves valid values", () => {
 		const cfg: VisionConfig = {
 			mode: "always",
@@ -219,19 +233,57 @@ describe("readEnvOverrides", () => {
 		}
 		assert.equal(readEnvOverrides({ PI_VISION_PROXY_INCLUDE_CONTEXT: "garbage" }).includeContext, undefined);
 	});
+
+	it("parses allowHome truthy/falsy values", () => {
+		for (const v of ["1", "true", "yes", "on", "TRUE", " 1 "]) {
+			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, true, `truthy ${v}`);
+		}
+		for (const v of ["0", "false", "no", "off", " off "]) {
+			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, false, `falsy ${v}`);
+		}
+		assert.equal(readEnvOverrides({}).allowHome, undefined);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: "garbage" }).allowHome, undefined);
+	});
+
+	it("parses allowedFolders as a delimiter-separated list of absolute paths", () => {
+		const out = readEnvOverrides({ PI_VISION_PROXY_ALLOWED_FOLDERS: ["/a/b", "relative", "/c"].join(delimiter) });
+		assert.deepEqual(out.allowedFolders, ["/a/b", "/c"]);
+		assert.equal(readEnvOverrides({}).allowedFolders, undefined);
+		// Set-but-useless value still overrides (locks) the persisted list with an empty one
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_ALLOWED_FOLDERS: "relative" }).allowedFolders, []);
+	});
+
+	it("reads PI_VISION_PROXY_STATUS_LINE", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "on" }).statusLine, "on");
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "off" }).statusLine, "off");
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, undefined);
+	});
 });
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false },
 		);
+		assert.deepEqual(
+			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false },
+		);
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
+		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: "garbage" }).allowHome, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_ALLOW_HOME: " off " }).allowHome, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "off" }).statusLine, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "on" }).statusLine, true);
+		// An invalid value is not applied by readEnvOverrides, so it must not
+		// report (and thereby lock) the setting as env-overridden either.
+		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, false);
 	});
 });
 
@@ -557,6 +609,182 @@ describe("hasConsent", () => {
 	});
 });
 
+describe("consentState", () => {
+	it("distinguishes none from revoked", () => {
+		assert.equal(consentState([], "anthropic"), "none");
+		const revoked: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" })];
+		assert.equal(consentState(revoked, "anthropic"), "revoked");
+		// Revoke for another provider does not apply
+		assert.equal(consentState(revoked, "openai"), "none");
+	});
+
+	it("reports granted for a matching per-provider grant", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "anthropic" })];
+		assert.equal(consentState(entries, "anthropic"), "granted");
+		assert.equal(consentState(entries, "openai"), "none");
+	});
+});
+
+describe("hasConsent with allowedProviders (pre-consent)", () => {
+	it("grants without any session entry when the provider is listed", () => {
+		assert.equal(hasConsent([], "anthropic", ["anthropic"]), true);
+		assert.equal(hasConsent([], "openai", ["anthropic"]), false);
+		assert.equal(hasConsent([], "anthropic", []), false);
+		assert.equal(hasConsent([], "anthropic", undefined), false);
+	});
+
+	it("never applies as a blanket grant without a specific provider", () => {
+		assert.equal(hasConsent([], undefined, ["anthropic", "openai"]), false);
+	});
+
+	it("an explicit in-session revoke beats the pre-consent list", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" })];
+		assert.equal(hasConsent(entries, "anthropic", ["anthropic"]), false);
+		// Revoking one provider leaves other listed providers pre-consented
+		assert.equal(hasConsent(entries, "openai", ["anthropic", "openai"]), true);
+	});
+
+	it("a provider-less in-session revoke blocks all pre-consented providers", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false })];
+		assert.equal(hasConsent(entries, "anthropic", ["anthropic"]), false);
+		assert.equal(hasConsent(entries, "openai", ["openai"]), false);
+	});
+
+	it("a grant after a revoke restores consent", () => {
+		const entries: Entry[] = [
+			customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" }),
+			customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "anthropic" }),
+		];
+		assert.equal(hasConsent(entries, "anthropic", []), true);
+	});
+
+	it("canonicalizes the provider before matching the list", () => {
+		assert.equal(hasConsent([], "x-ai", ["xai"]), true);
+	});
+});
+
+describe("consent provider alias canonicalization (PR #18 review)", () => {
+	it("a revoke stored under an alias still blocks the canonical provider", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "x-ai" })];
+		assert.equal(consentState(entries, "xai"), "revoked");
+		// pre-consent list must NOT override the aliased revoke
+		assert.equal(hasConsent(entries, "xai", ["xai"]), false);
+	});
+
+	it("a revoke stored canonically blocks an alias-form check", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "xai" })];
+		assert.equal(consentState(entries, "x-ai"), "revoked");
+		assert.equal(hasConsent(entries, "x-ai", ["xai"]), false);
+	});
+
+	it("a grant stored under an alias satisfies the canonical check and vice versa", () => {
+		const aliasGrant: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "x-ai" })];
+		assert.equal(hasConsent(aliasGrant, "xai"), true);
+		const canonicalGrant: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: true, provider: "xai" })];
+		assert.equal(hasConsent(canonicalGrant, "x-ai"), true);
+	});
+
+	it("aliased entries for a different provider still don't match", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "x-ai" })];
+		assert.equal(consentState(entries, "anthropic"), "none");
+	});
+});
+
+describe("normalizeAllowedProviders", () => {
+	it("canonicalizes, dedupes, and drops invalid or non-string entries", () => {
+		assert.deepEqual(normalizeAllowedProviders(["x-ai", "xai", "anthropic", "bad/id", 42]), ["xai", "anthropic"]);
+	});
+
+	it("keeps empty arrays and rejects non-arrays", () => {
+		assert.deepEqual(normalizeAllowedProviders([]), []);
+		assert.equal(normalizeAllowedProviders("anthropic"), undefined);
+		assert.equal(normalizeAllowedProviders(undefined), undefined);
+	});
+});
+
+describe("parseProviderList", () => {
+	it("splits on commas and whitespace, trims, dedupes", () => {
+		assert.deepEqual(parseProviderList("anthropic, openai anthropic"), ["anthropic", "openai"]);
+	});
+
+	it("canonicalizes x-ai to xai", () => {
+		assert.deepEqual(parseProviderList("x-ai,xai"), ["xai"]);
+	});
+
+	it("drops invalid provider ids", () => {
+		assert.deepEqual(parseProviderList("good, bad/slash, also:bad"), ["good"]);
+	});
+
+	it("returns [] for empty or all-invalid input", () => {
+		assert.deepEqual(parseProviderList(""), []);
+		assert.deepEqual(parseProviderList("a/b, c:d"), []);
+	});
+});
+
+describe("allowedProviders config plumbing", () => {
+	it("sanitize normalizes, canonicalizes, and dedupes the list", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, allowedProviders: ["x-ai", "anthropic", "anthropic", "bad/id", 42 as any] });
+		assert.deepEqual(cfg.allowedProviders, ["xai", "anthropic"]);
+	});
+
+	it("sanitize keeps an explicit empty list and drops non-arrays", () => {
+		assert.deepEqual(sanitize({ ...DEFAULT_CONFIG, allowedProviders: [] }).allowedProviders, []);
+		assert.equal("allowedProviders" in sanitize({ ...DEFAULT_CONFIG, allowedProviders: "anthropic" as any }), false);
+		assert.equal("allowedProviders" in sanitize({ ...DEFAULT_CONFIG }), false);
+	});
+
+	it("reads PI_VISION_PROXY_ALLOWED_PROVIDERS", () => {
+		assert.deepEqual(
+			readEnvOverrides({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "anthropic,openai" }).allowedProviders,
+			["anthropic", "openai"],
+		);
+		// defined-but-empty must override a persisted list with "none"
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, []);
+		assert.equal(readEnvOverrides({}).allowedProviders, undefined);
+	});
+
+	it("file config supplies the list; env override wins", () => {
+		const fileConfig = { allowedProviders: ["anthropic"] };
+		assert.deepEqual(resolveConfig([], {}, fileConfig).allowedProviders, ["anthropic"]);
+		// session-entry configs never carry the key, so they don't shadow the file
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONFIG, { mode: "always" })];
+		assert.deepEqual(resolveConfig(entries, {}, fileConfig).allowedProviders, ["anthropic"]);
+		assert.deepEqual(
+			resolveConfig(entries, { PI_VISION_PROXY_ALLOWED_PROVIDERS: "openai" }, fileConfig).allowedProviders,
+			["openai"],
+		);
+		assert.deepEqual(
+			resolveConfig(entries, { PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }, fileConfig).allowedProviders,
+			[],
+		);
+	});
+
+	it("round-trips through the persistent file", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vision-proxy-allowed-"));
+		try {
+			await writePersistentFile({ allowedProviders: ["anthropic", "openai"] }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedProviders, ["anthropic", "openai"]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("canonicalizes a hand-edited list at the file-read boundary", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vision-proxy-allowed-"));
+		try {
+			await writePersistentFile({ allowedProviders: ["x-ai", "anthropic", "bad/id", 7 as any] }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedProviders, ["xai", "anthropic"]);
+			// non-array value is dropped entirely
+			await writePersistentFile({ allowedProviders: "anthropic" as any }, dir);
+			assert.equal("allowedProviders" in (await readPersistentFile(dir)), false);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("toPiAiImage", () => {
 	it("passes through new shape", () => {
 		const img = { type: "image", data: "AAAA", mimeType: "image/png" } as any;
@@ -821,6 +1049,94 @@ describe("isPathAllowed", () => {
 			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
 		}
 	});
+
+	it("allows homedir via the allowHome config option (no env var)", async () => {
+		const home = os.homedir();
+		const prevHome = process.env.PI_VISION_PROXY_ALLOW_HOME;
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
+			delete process.env.PI_VISION_PROXY_ALLOW_HOME;
+			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
+				assert.equal(await isPathAllowed(home, { allowHome: false }), false);
+			}
+			assert.equal(await isPathAllowed(home, { allowHome: true }), true);
+		} finally {
+			if (prevHome === undefined) delete process.env.PI_VISION_PROXY_ALLOW_HOME;
+			else process.env.PI_VISION_PROXY_ALLOW_HOME = prevHome;
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+
+	it("allows paths under a configured allowed folder", async () => {
+		const home = os.homedir();
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
+			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
+				assert.equal(await isPathAllowed(home, { allowedFolders: [] }), false);
+				assert.equal(await isPathAllowed(home, { allowedFolders: ["/nonexistent-root-vp-xyz"] }), false);
+			}
+			assert.equal(await isPathAllowed(home, { allowedFolders: [home] }), true);
+			// Non-existent file directly under an allowed folder passes via parent resolution
+			assert.equal(
+				await isPathAllowed(join(home, "does-not-exist-vp-xyz.png"), { allowedFolders: [home] }),
+				true,
+			);
+		} finally {
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+});
+
+describe("expandLeadingTilde", () => {
+	it("expands ~ and ~/sub to the home directory", () => {
+		assert.equal(expandLeadingTilde("~"), os.homedir());
+		assert.equal(expandLeadingTilde("~/pics"), join(os.homedir(), "pics"));
+	});
+
+	it("leaves other paths untouched", () => {
+		assert.equal(expandLeadingTilde("/a/~/b"), "/a/~/b");
+		assert.equal(expandLeadingTilde("~user/x"), "~user/x");
+		assert.equal(expandLeadingTilde("/plain"), "/plain");
+	});
+
+	it("keeps double-separator inputs under home", () => {
+		assert.equal(expandLeadingTilde("~//etc"), join(os.homedir(), "etc"));
+		assert.equal(expandLeadingTilde("~/\\\\pics"), join(os.homedir(), "pics"));
+	});
+});
+
+describe("sanitizeAllowedFolders", () => {
+	it("keeps absolute paths, expands ~, drops relative and non-string entries", () => {
+		const home = os.homedir();
+		const out = sanitizeAllowedFolders(["/a/b", "relative/x", 42, "~/pics", "  /c  ", ""]);
+		assert.deepEqual(out, ["/a/b", join(home, "pics"), "/c"]);
+	});
+
+	it("dedupes case-insensitively and caps at MAX_ALLOWED_FOLDERS", () => {
+		assert.deepEqual(sanitizeAllowedFolders(["/A/B", "/a/b"]), ["/A/B"]);
+		const many = Array.from({ length: MAX_ALLOWED_FOLDERS + 10 }, (_, i) => `/folder-${i}`);
+		assert.equal(sanitizeAllowedFolders(many).length, MAX_ALLOWED_FOLDERS);
+	});
+
+	it("returns empty array for non-arrays", () => {
+		assert.deepEqual(sanitizeAllowedFolders("/a"), []);
+		assert.deepEqual(sanitizeAllowedFolders(undefined), []);
+	});
+
+	it("rejects UNC/network roots", () => {
+		assert.deepEqual(sanitizeAllowedFolders(["\\\\server\\share", "//server/share", "/ok"]), ["/ok"]);
+	});
+});
+
+describe("pathAccessFromConfig", () => {
+	it("extracts allowedFolders and allowHome", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, allowedFolders: ["/media"], allowHome: true });
+		assert.deepEqual(pathAccessFromConfig(cfg), { allowedFolders: ["/media"], allowHome: true });
+	});
 });
 
 describe("readImageFileWithReason", () => {
@@ -938,16 +1254,82 @@ describe("readImageFileWithReason", () => {
 	});
 });
 
+describe("readMediaFileWithReason", () => {
+	it("returns reason=not-a-media for unsupported extension", async () => {
+		const r = await readMediaFileWithReason("/tmp/foo.xyzunknown");
+		assert.equal(r.media, null);
+		assert.equal(r.reason, "not-a-media");
+	});
+
+	it("rejects a TypeScript .ts file as not-a-media (extension collision with MPEG-TS)", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "store.ts");
+		// Larger than one MPEG-TS packet (188 bytes) so the sniff check runs.
+		await writeFile(file, "// TypeScript source file, not video\n".repeat(20));
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.equal(r.media, null);
+			assert.equal(r.reason, "not-a-media");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a real MPEG-TS .ts file with valid sync bytes", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "clip.ts");
+		// Build a buffer of 8 packets, each starting with the 0x47 sync byte.
+		const packet = Buffer.alloc(188);
+		packet[0] = 0x47;
+		const content = Buffer.concat(Array.from({ length: 8 }, () => packet));
+		await writeFile(file, content);
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.ok(r.media, "media should be returned for valid MPEG-TS");
+			assert.equal(r.media?.mimeType, "video/mp2t");
+			assert.equal(r.media?.type, "image");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns reason=empty for zero-byte .ts file", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "empty.ts");
+		await writeFile(file, "");
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.equal(r.media, null);
+			assert.equal(r.reason, "empty");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("readPersistentFile / writePersistentFile", () => {
 	it("round-trips config through a file", async () => {
 		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
 		try {
-			const cfg: Partial<VisionConfig> = { mode: "always", provider: "openai", modelId: "gpt-4o" };
+			const cfg: Partial<VisionConfig> = { mode: "always", provider: "openai", modelId: "gpt-4o", statusLine: "off" };
 			await writePersistentFile(cfg, dir);
 			const read = await readPersistentFile(dir);
 			assert.equal(read.mode, "always");
 			assert.equal(read.provider, "openai");
 			assert.equal(read.modelId, "gpt-4o");
+			assert.equal(read.statusLine, "off");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("round-trips allowedFolders and allowHome", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		try {
+			await writePersistentFile({ allowedFolders: ["/media/photos"], allowHome: true }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedFolders, ["/media/photos"]);
+			assert.equal(read.allowHome, true);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
@@ -1501,6 +1883,29 @@ describe("sanitize (1.4.0 fields)", () => {
 		assert.equal(bad.maxImagesPerCall, 10); // reset to default
 		const good = sanitize({ ...DEFAULT_CONFIG, maxImagesPerCall: 15 });
 		assert.equal(good.maxImagesPerCall, 15);
+	});
+});
+
+describe("sanitize (1.10.0 file-access fields)", () => {
+	it("defaults allowedFolders and allowHome when missing or invalid", () => {
+		const result = sanitize({
+			mode: "fallback",
+			provider: "anthropic",
+			modelId: "claude-sonnet-5",
+			systemPrompt: "test",
+			includeContext: true,
+		} as VisionConfig);
+		assert.deepEqual(result.allowedFolders, []);
+		assert.equal(result.allowHome, false);
+		const bad = sanitize({ ...DEFAULT_CONFIG, allowedFolders: "nope" as unknown as string[], allowHome: "yes" as unknown as boolean });
+		assert.deepEqual(bad.allowedFolders, []);
+		assert.equal(bad.allowHome, false);
+	});
+
+	it("filters allowedFolders to absolute paths", () => {
+		const result = sanitize({ ...DEFAULT_CONFIG, allowedFolders: ["/media", "relative/x"], allowHome: true });
+		assert.deepEqual(result.allowedFolders, ["/media"]);
+		assert.equal(result.allowHome, true);
 	});
 });
 

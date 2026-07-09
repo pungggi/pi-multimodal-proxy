@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.10.1] - 2026-07-08
+
+### Fixed
+
+- **Source-code files with overloaded media extensions are no longer sent to video models.** The `.ts` extension is mapped to both TypeScript (source code) and MPEG-TS (`video/mp2t`) video. Previously, a file like `store.ts` mentioned in a prompt was matched by the video-path extractor, read as a 200 MB media file, and shipped to the configured video provider (e.g. "Analyzing store.ts via Grok 4.3…"). `readMediaFileWithReason` now sniffs the file contents for extensions whose primary meaning is source code (`.ts`, `.mts`, `.m2ts`): it validates the MPEG-TS sync byte (`0x47`) at the start of the first few 188-byte packets and rejects the file as `not-a-media` when the signature is absent. Genuine MPEG-TS streams continue to work; TypeScript files no longer leak source code to a video model. The `not-a-media` skip message in `vision-proxy.ts` was updated to describe the new content-sniffing behavior.
+
+## [1.10.0] - 2026-07-07
+
+### Added
+
+- **Configurable allowed folders** ([#15](https://github.com/pungggi/pi-multimodal-proxy/issues/15)) — the file-access allowlist is now a persisted config setting instead of env-var-only. `/multimodal-proxy folders add <path>` (also `remove`, `list`, `reset`) grants media reads from custom absolute folders (`~` is expanded), and `/multimodal-proxy allow-home on|off` is the persisted equivalent of `PI_VISION_PROXY_ALLOW_HOME=1`. Both are stored in `~/.pi/agent/multimodal-proxy.json` alongside the other settings and survive new sessions. Also manageable from the interactive `/multimodal-proxy` menu.
+- **New env var**: `PI_VISION_PROXY_ALLOWED_FOLDERS` — platform-delimiter-separated list of absolute folders (`:` on Unix, `;` on Windows); like other env vars it overrides and locks the persisted setting. `PI_VISION_PROXY_ALLOW_HOME` keeps working and now also accepts `0`/`false` to override a persisted `allow-home on`.
+- The allowlist applies uniformly to auto-proxied prompt paths (images, video, audio), the `analyze_image` tool, and `/multimodal-proxy describe`. Allowlisted folders are canonicalized via `realpath` before comparison; relative entries are rejected and the list is capped at 100 folders. New tested helpers: `expandLeadingTilde`, `sanitizeAllowedFolders`, `pathAccessFromConfig`, and the `access` parameter on `isPathAllowed` / `readImageFileWithReason` / `readMediaFileWithReason`.
+- **Hide-able status line** ([#16](https://github.com/pungggi/pi-multimodal-proxy/issues/16)) — new persisted `statusLine` setting. `/multimodal-proxy status off` hides the steady-state footer status (`multimodal-proxy: fallback → … | video: …`), `/multimodal-proxy status on` restores it, and the interactive config menu gets a matching toggle. The transient analysis progress spinner still shows while a call is in flight and clears when it finishes. New env override: `PI_VISION_PROXY_STATUS_LINE=on|off`.
+
+### Fixed
+
+- Changing any setting via `/multimodal-proxy` refreshed the status line under the stale `vision-proxy` key with an outdated text format, leaving a second, never-updated status entry alongside the real one. The refresh now uses the same `multimodal-proxy` key and steady-state text (including the video model and registry fallback) as session start.
+- The interactive `/multimodal-proxy` summary now lists every active env override (previously only shown when mode/model/context was set, hiding overrides like `tool`, `cacheSize`, or `statusLine`), and an invalid env value (e.g. `PI_VISION_PROXY_STATUS_LINE=hidden`) no longer locks the matching subcommand without actually overriding anything.
+
+## [1.9.0] - 2026-07-07
+
+### Added
+
+- **Pre-consented providers** ([#14](https://github.com/pungggi/pi-multimodal-proxy/issues/14)) — a persisted `allowedProviders` list lets you consent to data egress for chosen providers once, instead of once per session. Providers on the list skip the first-use consent prompt everywhere (auto-proxy, video/audio, the `analyze_image` tool, and `/multimodal-proxy describe`). Manage it with `/multimodal-proxy allowed-providers add|remove <provider>|clear` (or the interactive config menu), or grant-and-persist in one step with `/multimodal-proxy consent always`. The list lives in `~/.pi/agent/multimodal-proxy.json` next to the other persisted settings and is kept out of session-entry configs so per-session config changes can never clobber it.
+- **New env var**: `PI_VISION_PROXY_ALLOWED_PROVIDERS` — comma-separated provider ids, overriding the persisted list (a defined-but-empty value disables the list for that shell/project, handy for sensitive repositories).
+- Safety semantics: an explicit in-session `/multimodal-proxy consent no` always beats the pre-consent list, and additionally removes the provider from the persisted list so the refusal sticks across sessions. The list only ever matches a specific provider — it is never a blanket grant. Provider ids are validated and canonicalized (`x-ai` → `xai`) on every boundary (file, env, commands).
+- New tested helpers in `internal.ts`: `parseProviderList` (comma/whitespace splitting, canonicalization, dedup) and `consentState` (distinguishes "revoked" from "no verdict" so pre-consent can't override a refusal); `hasConsent` gained an optional `allowedProviders` parameter.
+
 ## [1.8.0] - 2026-07-04
 
 ### Added
