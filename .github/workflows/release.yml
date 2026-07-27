@@ -1,0 +1,77 @@
+name: Release
+
+# Tag-driven publish with OIDC trusted publishing (preferred) or NPM_TOKEN.
+# See docs/PUBLISHING.md.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without leading v)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Ensure npm supports OIDC trusted publishing
+        run: |
+          npm install -g npm@latest
+          node -v
+          npm -v
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify package.json version matches tag
+        run: |
+          TAG="${{ steps.ver.outputs.version }}"
+          PKG=$(node -p "require('./package.json').version")
+          echo "tag version:    $TAG"
+          echo "package.json:   $PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "✖ version drift: tag '$TAG' != package.json '$PKG'"
+            exit 1
+          fi
+          echo "✓ versions in sync"
+
+      - name: Publish to npm (with provenance)
+        env:
+          NPM_TOKEN_SECRET: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NPM_TOKEN_SECRET:-}" ]; then
+            echo "Auth mode: NPM_TOKEN"
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN_SECRET}" > "${RUNNER_TEMP}/.npmrc"
+            export NPM_CONFIG_USERCONFIG="${RUNNER_TEMP}/.npmrc"
+          else
+            echo "Auth mode: OIDC trusted publishing"
+            echo "  repository: pungggi/pi-multimodal-proxy"
+            echo "  workflow:   release.yml"
+            unset NODE_AUTH_TOKEN || true
+            unset NPM_TOKEN || true
+          fi
+          npm publish --access public --provenance

@@ -13,7 +13,8 @@
   "homepage": "https://github.com/pungggi/pi-multimodal-proxy#readme",
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types --no-warnings --test extensions/__tests__/*.test.ts"
+    "test": "node --experimental-strip-types --no-warnings --test extensions/__tests__/*.test.ts",
+    "prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked.')\""
   },
   "pi": {
     "extensions": [
@@ -29,5 +30,16 @@
     "@earendil-works/pi-ai": ">=0.74.0",
     "@earendil-works/pi-coding-agent": ">=0.74.0",
     "typebox": "*"
-  }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "files": [
+    "extensions",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY-REVIEW.md"
+  ]
 }
