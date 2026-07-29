@@ -6,6 +6,10 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+## What's new in 1.11.0
+
+- **Global consent wildcard** — `/multimodal-proxy allowed-providers add *` (or `all`) grants consent for **all providers** globally, so you can consent once and never be prompted again. The wildcard (`*`) appears in the pre-consented list as "* (all providers)" and can be removed with `/multimodal-proxy allowed-providers remove *`. An explicit in-session `consent no` still beats the wildcard.
+
 ## What's new in 1.10.0
 
 - **Configurable allowed folders** — the file-access allowlist is now a persisted setting: `/multimodal-proxy folders add <path>` (also `remove`, `list`, `reset`) grants media reads from custom absolute folders, and `/multimodal-proxy allow-home on|off` is the persisted equivalent of `PI_VISION_PROXY_ALLOW_HOME=1`. Env override: `PI_VISION_PROXY_ALLOWED_FOLDERS`.
