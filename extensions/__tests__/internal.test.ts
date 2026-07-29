@@ -661,6 +661,52 @@ describe("hasConsent with allowedProviders (pre-consent)", () => {
 	it("canonicalizes the provider before matching the list", () => {
 		assert.equal(hasConsent([], "x-ai", ["xai"]), true);
 	});
+
+	it("wildcard (*) grants consent for all providers", () => {
+		assert.equal(hasConsent([], "anthropic", ["*"]), true);
+		assert.equal(hasConsent([], "openai", ["*"]), true);
+		assert.equal(hasConsent([], "xai", ["*"]), true);
+		assert.equal(hasConsent([], "anthropic", ["anthropic", "*"]), true);
+		assert.equal(hasConsent([], "openai", ["anthropic", "*"]), true);
+	});
+
+	it("explicit in-session revoke beats wildcard pre-consent", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false, provider: "anthropic" })];
+		assert.equal(hasConsent(entries, "anthropic", ["*"]), false);
+		// Wildcard still applies to other providers
+		assert.equal(hasConsent(entries, "openai", ["*"]), true);
+	});
+
+	it("provider-less in-session revoke blocks wildcard pre-consent", () => {
+		const entries: Entry[] = [customEntry(CUSTOM_TYPE_CONSENT, { granted: false })];
+		assert.equal(hasConsent(entries, "anthropic", ["*"]), false);
+		assert.equal(hasConsent(entries, "openai", ["*"]), false);
+	});
+
+	it("deniedProviders blocks wildcard consent for specific providers", () => {
+		// Wildcard allows all, but deniedProviders blocks specific ones
+		assert.equal(hasConsent([], "anthropic", ["*"], ["anthropic"]), false);
+		assert.equal(hasConsent([], "openai", ["*"], ["anthropic"]), true);
+		assert.equal(hasConsent([], "xai", ["*"], ["anthropic", "openai"]), true);
+		assert.equal(hasConsent([], "xai", ["*"], ["xai"]), false); // explicitly denied
+	});
+
+	it("deniedProviders blocks specific provider even when explicitly allowed", () => {
+		// Denied wins over explicit allow
+		assert.equal(hasConsent([], "anthropic", ["anthropic", "openai"], ["anthropic"]), false);
+		assert.equal(hasConsent([], "openai", ["anthropic", "openai"], ["anthropic"]), true);
+	});
+
+	it("deniedProviders without wildcard just blocks consent", () => {
+		// When no wildcard, deniedProviders has no effect (providers not in allowed are already denied)
+		assert.equal(hasConsent([], "anthropic", ["openai"], ["anthropic"]), false);
+		assert.equal(hasConsent([], "anthropic", ["anthropic"], ["openai"]), true);
+	});
+
+	it("empty deniedProviders list has no effect", () => {
+		assert.equal(hasConsent([], "anthropic", ["*"], []), true);
+		assert.equal(hasConsent([], "anthropic", [], []), false);
+	});
 });
 
 describe("consent provider alias canonicalization (PR #18 review)", () => {

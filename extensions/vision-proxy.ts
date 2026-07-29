@@ -14,8 +14,9 @@
  *                 /multimodal-proxy video-model provider/model-id
  *                 /multimodal-proxy context on|off  - include conversation context in proxy prompt
  *                 /multimodal-proxy consent yes|no|always - first-use data-egress consent
- *                 /multimodal-proxy allowed-providers [add|remove <provider>|clear]
+ *                 /multimodal-proxy allowed-providers [add|remove <provider>|clear|*]
  *                                                    - persisted pre-consented providers
+ *                                                    - use "*" or "all" to consent globally for all providers
  *                 /multimodal-proxy tool on|off     - enable/disable analyze_image tool
  *                 /multimodal-proxy max-images-per-call <n>
  *                 /multimodal-proxy max-batch <n>
@@ -570,7 +571,7 @@ async function ensureConsent(
 	entries: readonly SessionEntry[],
 	pi: ExtensionAPI,
 ): Promise<boolean> {
-	if (hasConsent(entries, config.provider, config.allowedProviders)) return true;
+	if (hasConsent(entries, config.provider, config.allowedProviders, config.deniedProviders)) return true;
 	const message =
 		`Send image data${config.includeContext ? " and recent conversation context" : ""} ` +
 		`to ${modelLabel(config)}? (one-time consent for this session)`;
@@ -1128,7 +1129,7 @@ async function handleAnalyzeImage(
 
 	// Check consent for the resolved vision provider
 	const entries = ctx.sessionManager.getEntries();
-	if (!hasConsent(entries, visionProvider, config.allowedProviders)) {
+	if (!hasConsent(entries, visionProvider, config.allowedProviders, config.deniedProviders)) {
 		return `Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes\n\n(To pre-consent this provider permanently: /multimodal-proxy allowed-providers add ${visionProvider})`
 	}
 
@@ -2162,7 +2163,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					`[multimodal-proxy] Consent: ${
-						hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"
+						hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"
 					}. Use /multimodal-proxy consent yes|no|always.`,
 					"info",
 				);
@@ -2182,10 +2183,28 @@ export default function (pi: ExtensionAPI) {
 						envOverrideWarning();
 						return;
 					}
+					// Check for special wildcard value
+					const trimmed = rest.trim();
+					if (trimmed === "*" || trimmed === "all") {
+						// Wildcard: add/remove the special "*" marker
+						const fileList = fileAllowedProviders();
+						const hasWildcard = fileList.includes("*");
+						const next = action === "add"
+							? hasWildcard ? fileList : [...fileList, "*"]
+							: fileList.filter((p) => p !== "*");
+						writeAllowedProviders(next);
+						ctx.ui.notify(
+							`[multimodal-proxy] Allowed providers: ${next.includes("*") ? "* (all providers)" : (next.length > 0 ? next.join(", ") : "none")} (persisted globally)`,
+							"info",
+						);
+						return;
+					}
 					const parsedList = parseProviderList(rest);
 					if (parsedList.length === 0) {
 						ctx.ui.notify(
-							`Usage: /multimodal-proxy allowed-providers ${action} <provider>[,<provider>...]\nExample: /multimodal-proxy allowed-providers ${action} anthropic`,
+							`Usage: /multimodal-proxy allowed-providers ${action} <provider>[,<provider>...]
+Example: /multimodal-proxy allowed-providers ${action} anthropic
+Use "*" or "all" to grant consent for all providers globally.`,
 							"warning",
 						);
 						return;
@@ -2214,9 +2233,11 @@ export default function (pi: ExtensionAPI) {
 				const current = effective.allowedProviders ?? [];
 				ctx.ui.notify(
 					`[multimodal-proxy] Allowed providers (pre-consented data egress): ${
-						current.length > 0 ? current.join(", ") : "none"
-					}${env.allowedProviders ? " (from PI_VISION_PROXY_ALLOWED_PROVIDERS)" : ""}\n` +
-						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear",
+						current.includes("*") ? "* (all providers)" : (current.length > 0 ? current.join(", ") : "none")
+					}${env.allowedProviders ? " (from PI_VISION_PROXY_ALLOWED_PROVIDERS)" : ""}
+` +
+						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear\n" +
+						'Use "*" or "all" to grant consent for all providers globally.',
 					"info",
 				);
 				return;
@@ -2634,7 +2655,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`[multimodal-proxy] Model \"${modelLabel(descConfig)}\" not found. Use /multimodal-proxy pick to choose one.`, "error");
 					return;
 				}
-				if (!hasConsent(entries, descConfig.provider, descConfig.allowedProviders)) {
+				if (!hasConsent(entries, descConfig.provider, descConfig.allowedProviders, descConfig.deniedProviders)) {
 					ctx.ui.notify(`[multimodal-proxy] Consent not granted for ${descConfig.provider}. Use /multimodal-proxy consent yes.`, "warning");
 					return;
 				}
@@ -2862,7 +2883,7 @@ export default function (pi: ExtensionAPI) {
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}\n` +
-				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
+				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
 				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
 
@@ -2887,7 +2908,7 @@ export default function (pi: ExtensionAPI) {
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}`,
-				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}`,
+				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 			]);
 
@@ -3061,7 +3082,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (choice.startsWith("Consent")) {
-				const granted = !hasConsent(entries, effective.provider, effective.allowedProviders);
+				const granted = !hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders);
 				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
 				ctx.ui.notify(`Consent: ${granted ? "granted" : "revoked"}`, granted ? "info" : "warning");
 				return;
