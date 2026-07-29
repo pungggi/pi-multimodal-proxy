@@ -571,7 +571,7 @@ async function ensureConsent(
 	entries: readonly SessionEntry[],
 	pi: ExtensionAPI,
 ): Promise<boolean> {
-	if (hasConsent(entries, config.provider, config.allowedProviders)) return true;
+	if (hasConsent(entries, config.provider, config.allowedProviders, config.deniedProviders)) return true;
 	const message =
 		`Send image data${config.includeContext ? " and recent conversation context" : ""} ` +
 		`to ${modelLabel(config)}? (one-time consent for this session)`;
@@ -1129,7 +1129,7 @@ async function handleAnalyzeImage(
 
 	// Check consent for the resolved vision provider
 	const entries = ctx.sessionManager.getEntries();
-	if (!hasConsent(entries, visionProvider, config.allowedProviders)) {
+	if (!hasConsent(entries, visionProvider, config.allowedProviders, config.deniedProviders)) {
 		return `Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes\n\n(To pre-consent this provider permanently: /multimodal-proxy allowed-providers add ${visionProvider})`
 	}
 
@@ -2163,7 +2163,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					`[multimodal-proxy] Consent: ${
-						hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"
+						hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"
 					}. Use /multimodal-proxy consent yes|no|always.`,
 					"info",
 				);
@@ -2236,8 +2236,8 @@ Use "*" or "all" to grant consent for all providers globally.`,
 						current.includes("*") ? "* (all providers)" : (current.length > 0 ? current.join(", ") : "none")
 					}${env.allowedProviders ? " (from PI_VISION_PROXY_ALLOWED_PROVIDERS)" : ""}
 ` +
-						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear
-Use "*" or "all" to grant consent for all providers globally.",
+						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear\n" +
+						'Use "*" or "all" to grant consent for all providers globally.',
 					"info",
 				);
 				return;
@@ -2655,7 +2655,7 @@ Use "*" or "all" to grant consent for all providers globally.",
 					ctx.ui.notify(`[multimodal-proxy] Model \"${modelLabel(descConfig)}\" not found. Use /multimodal-proxy pick to choose one.`, "error");
 					return;
 				}
-				if (!hasConsent(entries, descConfig.provider, descConfig.allowedProviders)) {
+				if (!hasConsent(entries, descConfig.provider, descConfig.allowedProviders, descConfig.deniedProviders)) {
 					ctx.ui.notify(`[multimodal-proxy] Consent not granted for ${descConfig.provider}. Use /multimodal-proxy consent yes.`, "warning");
 					return;
 				}
@@ -2883,7 +2883,7 @@ Use "*" or "all" to grant consent for all providers globally.",
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}\n` +
-				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}\n` +
+				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
 				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
 
@@ -2908,7 +2908,7 @@ Use "*" or "all" to grant consent for all providers globally.",
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}`,
-				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders) ? "granted" : "not granted"}`,
+				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 			]);
 
@@ -3082,7 +3082,7 @@ Use "*" or "all" to grant consent for all providers globally.",
 			}
 
 			if (choice.startsWith("Consent")) {
-				const granted = !hasConsent(entries, effective.provider, effective.allowedProviders);
+				const granted = !hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders);
 				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
 				ctx.ui.notify(`Consent: ${granted ? "granted" : "revoked"}`, granted ? "info" : "warning");
 				return;

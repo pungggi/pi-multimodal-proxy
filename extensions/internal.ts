@@ -61,6 +61,11 @@ export interface VisionConfig {
 	// persistent config file (or PI_VISION_PROXY_ALLOWED_PROVIDERS), never in
 	// session-entry configs, so per-session config churn can't shadow it.
 	allowedProviders?: string[];
+	// 1.11.0 — providers explicitly denied consent despite wildcard ("*"):
+	// when allowedProviders contains "*", a provider in this list is still
+	// blocked. This allows users to globally consent to all providers except
+	// specific ones they don't trust. Lives in the persistent config file.
+	deniedProviders?: string[];
 	// 1.10.0 — configurable file-access allowlist (issue #15). Absolute folder
 	// paths granted in addition to the built-in tmp/cwd/drive rules, and a
 	// persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1.
@@ -720,7 +725,7 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
 	"pHashSimilarityThreshold", "groundingModels",
 	"videoProvider", "videoModelId", "videoSystemPrompt",
-	"allowedProviders",
+	"allowedProviders", "deniedProviders",
 	"allowedFolders", "allowHome",
 	"statusLine",
 	"pathDetection",
@@ -903,7 +908,13 @@ export function canonicalProvider(provider: string): string {
 export function parseProviderList(raw: string): string[] {
 	const out: string[] = [];
 	for (const part of raw.split(/[,\s]+/)) {
-		const provider = canonicalProvider(part.trim());
+		const trimmed = part.trim();
+		// Allow "*" as a special wildcard value
+		if (trimmed === "*") {
+			if (!out.includes("*")) out.push("*");
+			continue;
+		}
+		const provider = canonicalProvider(trimmed);
 		if (!provider || !PROVIDER_PATTERN.test(provider)) continue;
 		if (!out.includes(provider)) out.push(provider);
 	}
@@ -1025,6 +1036,15 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	const allowed = normalizeAllowedProviders(safe.allowedProviders);
 	if (allowed === undefined) delete safe.allowedProviders;
 	else safe.allowedProviders = allowed;
+	// 1.11.0 field — normalize denied providers the same way, but "*" is
+	// not valid here (only for allowedProviders wildcard). A non-array is dropped.
+	const denied = normalizeAllowedProviders(safe.deniedProviders);
+	if (denied === undefined) delete safe.deniedProviders;
+	else {
+		// Remove "*" if somehow present in deniedProviders (doesn't make sense)
+		safe.deniedProviders = denied.filter((p) => p !== "*");
+		if (safe.deniedProviders.length === 0) delete safe.deniedProviders;
+	}
 	// 1.10.0 file-access fields
 	safe.allowedFolders = sanitizeAllowedFolders(safe.allowedFolders);
 	if (typeof safe.allowHome !== "boolean") safe.allowHome = DEFAULT_CONFIG.allowHome;
@@ -1187,12 +1207,15 @@ export function hasConsent(
 	entries: readonly SessionEntry[],
 	provider?: string,
 	allowedProviders?: readonly string[],
+	deniedProviders?: readonly string[],
 ): boolean {
 	const state = consentState(entries, provider);
 	if (state === "granted") return true;
 	if (state === "revoked") return false; // an explicit in-session revoke beats pre-consent
 	// No in-session verdict — the persisted pre-consent list applies.
-	// A wildcard ("*") grants consent for all providers.
+	// First check if the provider is explicitly denied (wildcard exception)
+	if (provider && deniedProviders?.includes(canonicalProvider(provider))) return false;
+	// A wildcard ("*") grants consent for all providers (unless denied).
 	if (allowedProviders?.includes("*")) return true;
 	// Otherwise, check if the specific provider is listed.
 	return Boolean(provider && allowedProviders?.includes(canonicalProvider(provider)));
