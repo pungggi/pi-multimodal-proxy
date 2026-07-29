@@ -1191,8 +1191,10 @@ export function hasConsent(
 	const state = consentState(entries, provider);
 	if (state === "granted") return true;
 	if (state === "revoked") return false; // an explicit in-session revoke beats pre-consent
-	// No in-session verdict — the persisted pre-consent list applies, but only
-	// for a specific provider (never as a blanket grant).
+	// No in-session verdict — the persisted pre-consent list applies.
+	// A wildcard ("*") grants consent for all providers.
+	if (allowedProviders?.includes("*")) return true;
+	// Otherwise, check if the specific provider is listed.
 	return Boolean(provider && allowedProviders?.includes(canonicalProvider(provider)));
 }
 

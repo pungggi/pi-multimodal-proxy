@@ -14,8 +14,9 @@
  *                 /multimodal-proxy video-model provider/model-id
  *                 /multimodal-proxy context on|off  - include conversation context in proxy prompt
  *                 /multimodal-proxy consent yes|no|always - first-use data-egress consent
- *                 /multimodal-proxy allowed-providers [add|remove <provider>|clear]
+ *                 /multimodal-proxy allowed-providers [add|remove <provider>|clear|*]
  *                                                    - persisted pre-consented providers
+ *                                                    - use "*" or "all" to consent globally for all providers
  *                 /multimodal-proxy tool on|off     - enable/disable analyze_image tool
  *                 /multimodal-proxy max-images-per-call <n>
  *                 /multimodal-proxy max-batch <n>
@@ -2182,10 +2183,28 @@ export default function (pi: ExtensionAPI) {
 						envOverrideWarning();
 						return;
 					}
+					// Check for special wildcard value
+					const trimmed = rest.trim();
+					if (trimmed === "*" || trimmed === "all") {
+						// Wildcard: add/remove the special "*" marker
+						const fileList = fileAllowedProviders();
+						const hasWildcard = fileList.includes("*");
+						const next = action === "add"
+							? hasWildcard ? fileList : [...fileList, "*"]
+							: fileList.filter((p) => p !== "*");
+						writeAllowedProviders(next);
+						ctx.ui.notify(
+							`[multimodal-proxy] Allowed providers: ${next.includes("*") ? "* (all providers)" : (next.length > 0 ? next.join(", ") : "none")} (persisted globally)`,
+							"info",
+						);
+						return;
+					}
 					const parsedList = parseProviderList(rest);
 					if (parsedList.length === 0) {
 						ctx.ui.notify(
-							`Usage: /multimodal-proxy allowed-providers ${action} <provider>[,<provider>...]\nExample: /multimodal-proxy allowed-providers ${action} anthropic`,
+							`Usage: /multimodal-proxy allowed-providers ${action} <provider>[,<provider>...]
+Example: /multimodal-proxy allowed-providers ${action} anthropic
+Use "*" or "all" to grant consent for all providers globally.`,
 							"warning",
 						);
 						return;
@@ -2214,9 +2233,11 @@ export default function (pi: ExtensionAPI) {
 				const current = effective.allowedProviders ?? [];
 				ctx.ui.notify(
 					`[multimodal-proxy] Allowed providers (pre-consented data egress): ${
-						current.length > 0 ? current.join(", ") : "none"
-					}${env.allowedProviders ? " (from PI_VISION_PROXY_ALLOWED_PROVIDERS)" : ""}\n` +
-						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear",
+						current.includes("*") ? "* (all providers)" : (current.length > 0 ? current.join(", ") : "none")
+					}${env.allowedProviders ? " (from PI_VISION_PROXY_ALLOWED_PROVIDERS)" : ""}
+` +
+						"Usage: /multimodal-proxy allowed-providers add|remove <provider> | clear
+Use "*" or "all" to grant consent for all providers globally.",
 					"info",
 				);
 				return;

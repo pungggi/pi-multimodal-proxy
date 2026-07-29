@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.0] - 2025-01-XX
+
+### Added
+
+- **Global consent wildcard** — `/multimodal-proxy allowed-providers add *` (or `all`) now grants consent for **all providers** globally, so you can consent once and never be prompted again. The wildcard (`*`) appears in the pre-consented list as "* (all providers)" and can be removed with `/multimodal-proxy allowed-providers remove *`. An explicit in-session `consent no` still beats the wildcard and applies only to the revoked provider.
+
 ## [1.10.1] - 2026-07-08
 
 ### Fixed
