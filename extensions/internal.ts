@@ -1382,6 +1382,64 @@ export function extractCandidateAudioPaths(text: string): string[] {
 	return extractCandidateMediaPaths(text, AUDIO_EXT_ALT);
 }
 
+// ── Media URL detection (YouTube) ──────────────────────────────────────────
+
+/**
+ * Match a YouTube video URL and capture its video id (group 1).
+ *
+ * Supports youtu.be/<id>, youtube.com/watch?v=<id> (with optional leading
+ * query params such as `app=desktop`), and the /shorts/, /embed/, /live/,
+ * and /v/ path forms, on www., m., and music. subdomains. The scheme is
+ * optional (a bare `youtu.be/<id>` is accepted). An optional trailing
+ * query/fragment is consumed so the full matched text can be stripped from
+ * the prompt. Build a `gi` instance from `.source` when scanning text.
+ */
+const YOUTUBE_URL_RE =
+	/(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*?&)?v=|shorts\/|embed\/|live\/|v\/))([A-Za-z0-9_-]{6,})(?:[?&][^\s"'<>()\[\]]*)?/i;
+
+/**
+ * Extract the YouTube video id from a string. Returns null when the string
+ * does not contain a YouTube video URL.
+ */
+export function youTubeVideoId(s: string): string | null {
+	const m = s.match(YOUTUBE_URL_RE);
+	return m?.[1] ?? null;
+}
+
+/**
+ * Return the canonical `https://www.youtube.com/watch?v=<id>` form for a
+ * YouTube URL. Returns null when the input is not a YouTube video URL.
+ * yt-dlp only needs the canonical watch URL — timestamp/playlist params are
+ * not required to fetch the video.
+ */
+export function canonicalYouTubeUrl(s: string): string | null {
+	const id = youTubeVideoId(s);
+	return id ? `https://www.youtube.com/watch?v=${id}` : null;
+}
+
+/**
+ * Extract candidate YouTube video URLs from prompt text.
+ *
+ * Returns the matched substrings exactly as they appear so they can be
+ * stripped from the prompt, de-duplicated by video id. Pass each result to
+ * `canonicalYouTubeUrl()` to obtain the yt-dlp input. Non-YouTube URLs are
+ * ignored (other providers can be added later by extending the regex).
+ */
+export function extractCandidateMediaUrls(text: string): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	const re = new RegExp(YOUTUBE_URL_RE.source, "gi");
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(text)) !== null) {
+		const id = m[1];
+		if (id && !seen.has(id)) {
+			seen.add(id);
+			out.push(m[0]);
+		}
+	}
+	return out;
+}
+
 /**
  * Extract candidate image file paths from prompt text.
  * Matches `pi-clipboard-*` temp files and general paths ending with image extensions.

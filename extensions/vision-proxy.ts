@@ -43,7 +43,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -96,6 +96,9 @@ import {
 	extractCandidateImagePaths,
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
+	extractCandidateMediaUrls,
+	canonicalYouTubeUrl,
+	youTubeVideoId,
 	applyDefaultModelFallback,
 	applyRecallCompletion,
 	buildRecallItems,
@@ -929,6 +932,106 @@ async function extractAudioChunkToMp3(inputPath: string, outputPath: string, sta
 	], { windowsHide: true, timeout: 120_000 });
 }
 
+// ── yt-dlp: download media URLs (YouTube) ───────────────────────────────────
+
+/**
+ * Cache yt-dlp availability so a missing binary is reported once per session
+ * rather than every turn.
+ */
+let ytDlpAvailable: boolean | null = null;
+
+async function checkYtDlp(): Promise<boolean> {
+	if (ytDlpAvailable !== null) return ytDlpAvailable;
+	try {
+		await execFileAsync("yt-dlp", ["--version"], { windowsHide: true, timeout: 15_000 });
+		ytDlpAvailable = true;
+	} catch {
+		ytDlpAvailable = false;
+	}
+	return ytDlpAvailable;
+}
+
+interface DownloadedMedia {
+	/** Final on-disk path of the downloaded file. */
+	path: string;
+	/** Temp dir holding the file; the caller must remove it. */
+	tempDir: string;
+	/** Human-readable label (video title) for notifications / fences. */
+	title: string;
+}
+
+/**
+ * Download a media URL via yt-dlp into a fresh temp dir.
+ *
+ * Prefers an already-muxed mp4 at <=720p to keep the payload small for the
+ * video model; falls back to the best available stream merged to mp4. The
+ * post-read size guard (maxVideoFileBytes) still applies, so oversized
+ * downloads are rejected downstream with a clear "too-large" reason.
+ *
+ * Returns null (with a user-facing notification) when yt-dlp is missing or
+ * the download fails. The caller owns tempDir cleanup.
+ */
+async function downloadMediaUrl(
+	url: string,
+	signal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+): Promise<DownloadedMedia | null> {
+	if (!(await checkYtDlp())) {
+		ctx.ui.notify(
+			"[multimodal-proxy] YouTube download skipped — yt-dlp not found. Install it (e.g. `winget install yt-dlp.yt-dlp` or `choco install yt-dlp`) and retry.",
+			"warning",
+		);
+		return null;
+	}
+
+	const tempDir = await mkdtemp(join(os.tmpdir(), "multimodal-proxy-ytdl-"));
+	try {
+		// NOTE on `--print after_move:filepath`: when every --print field is a
+		// pre-download metadata field (e.g. only "%(title)s"), yt-dlp skips the
+		// actual download — it can satisfy the print from metadata alone. Adding
+		// an after_move field forces the download (it is only known once the file
+		// is in its final location) and also hands us the exact output path.
+		const { stdout } = await execFileAsync(
+			"yt-dlp",
+			[
+				"--no-playlist",
+				"--no-warnings",
+				"--no-progress",
+				"-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
+				"--merge-output-format", "mp4",
+				"-o", join(tempDir, "%(id)s.%(ext)s"),
+				"--print", "%(title)s",
+				"--print", "after_move:filepath",
+				url,
+			],
+			{ windowsHide: true, timeout: 240_000, maxBuffer: 4 * 1024 * 1024, signal },
+		);
+
+		const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+		// The filepath line is the one that looks like an absolute path.
+		const pathLine = lines.find((l) => /^([a-zA-Z]:[\\/]|[\\/])/.test(l));
+		const title = (lines.find((l) => l !== pathLine) ?? "").trim() || url;
+
+		// Prefer the path yt-dlp reported; fall back to scanning the temp dir.
+		let path = pathLine ?? "";
+		if (!path) {
+			const entries = await readdir(tempDir);
+			const file = entries.find((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
+			path = file ? join(tempDir, file) : "";
+		}
+		if (!path) {
+			ctx.ui.notify(`[multimodal-proxy] YouTube download produced no file for ${url}`, "warning");
+			return null;
+		}
+		return { path, tempDir, title };
+	} catch (err) {
+		if (signal?.aborted) return null;
+		const msg = err instanceof Error ? err.message : String(err);
+		ctx.ui.notify(`[multimodal-proxy] YouTube download failed for ${url}: ${msg}`, "warning");
+		return null;
+	}
+}
+
 async function analyzeVideoViaXaiStt(
 	mediaFile: { type: "image"; data: string; mimeType: string },
 	filename: string,
@@ -1566,6 +1669,52 @@ export default function (pi: ExtensionAPI) {
 				event.prompt = stripMediaPaths(event.prompt, acceptedMediaPaths);
 			}
 
+			// ── Detect & download media URLs (YouTube, etc.) ─────────────────
+			// Reuses the local-file pipeline: download to a temp dir, then read it
+			// like any other media file. Gated by path detection (on by default) —
+			// no separate switch. Requires yt-dlp on PATH (ffmpeg is already used
+			// elsewhere by this extension).
+			const downloadedTempDirs: string[] = [];
+			const downloadedFiles = new Map<string, { title: string; tempDir: string; filename: string; size: number }>();
+			const cleanupDownloads = async () => {
+				for (const d of downloadedTempDirs) {
+					try { await rm(d, { recursive: true, force: true }); } catch { /* ignore */ }
+				}
+				downloadedTempDirs.length = 0;
+			};
+			if (pathDetectionOn) {
+				const mediaUrls = extractCandidateMediaUrls(event.prompt);
+				const acceptedMediaUrls: string[] = [];
+				for (const url of mediaUrls) {
+					const watch = canonicalYouTubeUrl(url);
+					if (!watch) continue;
+					const id = youTubeVideoId(url) ?? "";
+					const dl = await withProgress(
+						ctx,
+						() => `Downloading YouTube ${id}…`,
+						`Downloading YouTube ${id}…`,
+						() => downloadMediaUrl(watch, ctx.signal, ctx),
+					);
+					if (!dl) continue;
+					downloadedTempDirs.push(dl.tempDir);
+					const r = await readMediaFileWithReason(dl.path, pathAccess);
+					if (r.media) {
+						const fname = r.filename ?? dl.title;
+						downloadedFiles.set(dl.path, { title: dl.title, tempDir: dl.tempDir, filename: fname, size: r.bytes ?? 0 });
+						mediaFiles.push({ file: r.media, filename: fname, path: dl.path });
+						acceptedMediaUrls.push(url);
+					} else if (r.reason && r.reason !== "not-a-media") {
+						ctx.ui.notify(
+							`[multimodal-proxy] Skipped YouTube ${id}: ${describeReadMediaReason(r.reason, r.bytes)}`,
+							"warning",
+						);
+					}
+				}
+				if (acceptedMediaUrls.length > 0) {
+					event.prompt = stripMediaPaths(event.prompt, acceptedMediaUrls);
+				}
+			}
+
 			// Inject loaded file-path images into the event so they reach the model
 			// regardless of whether vision-proxy stripping runs. Strip paths from the
 			// prompt text to avoid duplicate references.
@@ -1582,10 +1731,12 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Handle video/audio files ─────────────────────────────────────
 			let videoDescriptionFence = "";
+			const videoResults: VideoAnalysisResult[] = [];
 			if (mediaFiles.length > 0 && config.mode !== "off") {
 				// Check consent for video provider
 				if (!(await ensureConsent({ ...config, provider: config.videoProvider }, ctx, entries, pi))) {
 					ctx.ui.notify("[multimodal-proxy] Video analysis skipped - no consent.", "warning");
+					await cleanupDownloads();
 					// Inject actionable message so the agent tells the user what to do
 					return {
 						systemPrompt:
@@ -1597,8 +1748,7 @@ export default function (pi: ExtensionAPI) {
 							")",
 					};
 				} else {
-					const videoResults: VideoAnalysisResult[] = [];
-					for (const [mi, mf] of mediaFiles.entries()) {
+				for (const [mi, mf] of mediaFiles.entries()) {
 						const label = () =>
 							mediaFiles.length > 1
 								? `Analyzing ${mf.filename} (${mi + 1}/${mediaFiles.length})…`
@@ -1653,6 +1803,28 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
+			// Offer to save successfully analyzed downloaded videos
+			for (const [path, info] of downloadedFiles) {
+				const result = videoResults.find(r => r.filename === info.filename && r.description);
+				if (!result) continue;
+				const sizeMB = (info.size / (1024 * 1024)).toFixed(1);
+				try {
+					const save = await ctx.ui.confirm(
+						"Save downloaded video?",
+						`"${info.title}"\n\n${sizeMB} MB — save to your Downloads folder?`,
+					);
+					if (save) {
+						const safeTitle = info.title.replace(/[<>:"\/\\|?*]/g, "_").replace(/\s+/g, " ").trim().slice(0, 200);
+						const dest = join(os.homedir(), "Downloads", `${safeTitle}.mp4`);
+						await copyFile(path, dest);
+						ctx.ui.notify(`[multimodal-proxy] ✓ Saved "${safeTitle}.mp4" to Downloads`, "info");
+					}
+				} catch {
+					// Don't block the agent on save errors — temp files are
+					// cleaned below regardless.
+				}
+			}
+			await cleanupDownloads();
 
 			// ── Handle images (existing flow) ──────────────────────────────────
 			if (images.length === 0) {

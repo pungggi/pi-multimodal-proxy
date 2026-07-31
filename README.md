@@ -6,6 +6,13 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+**YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
+
+## What's new in 1.12.0
+
+- **YouTube video download** — paste a YouTube URL in your prompt and the extension downloads it via `yt-dlp` and analyzes it like any local video file. Gated by path detection (on by default); requires `yt-dlp` on your PATH. See [YouTube videos](#youtube-videos). After successful analysis you are prompted to optionally keep the downloaded file in your Downloads folder.
+- **Save downloaded videos** — after analysis completes, the extension asks whether to save a copy to `~/Downloads` (sanitised filename, opt-in per file).
+
 ## What's new in 1.11.0
 
 - **Global consent wildcard** — `/multimodal-proxy allowed-providers add *` (or `all`) grants consent for **all providers** globally, so you can consent once and never be prompted again. The wildcard (`*`) appears in the pre-consented list as "* (all providers)" and can be removed with `/multimodal-proxy allowed-providers remove *`. An explicit in-session `consent no` still beats the wildcard.
@@ -55,6 +62,19 @@ pi install npm:pi-multimodal-proxy
 ```
 
 > **Upgrading from pi-vision-proxy?** Just install the new package. Your existing config is automatically migrated from `~/.pi/agent/vision-proxy.json`. The `/vision-proxy` command still works.
+
+### YouTube videos
+
+Pasting a YouTube URL downloads the video with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzes it through the normal video pipeline. Install yt-dlp once:
+
+```bash
+winget install yt-dlp.yt-dlp        # Windows
+# or:  choco install yt-dlp
+# or:  brew install yt-dlp           # macOS
+# or:  pipx install yt-dlp           # any OS with Python
+```
+
+`ffmpeg` is also used (for duration probing and stream merging) — it usually ships alongside yt-dlp. Downloads are capped to ≤720p and rejected past the configured size limit (`PI_VISION_PROXY_MAX_VIDEO_BYTES`, default 200 MB). To disable URL auto-download, turn off path detection: `/multimodal-proxy path-detection off`.
 
 ## Modes
 

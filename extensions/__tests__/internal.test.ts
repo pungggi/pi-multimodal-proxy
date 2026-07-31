@@ -35,6 +35,9 @@ import {
 	extractCandidateImagePaths,
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
+	extractCandidateMediaUrls,
+	canonicalYouTubeUrl,
+	youTubeVideoId,
 	extractDimensions,
 	fenceUntrusted,
 	findDescriptions,
@@ -961,6 +964,80 @@ describe("extractCandidateMediaPaths", () => {
 
 	it("does not treat unquoted paths with spaces as a single path", () => {
 		assert.deepEqual(extractCandidateVideoPaths("see ./my video.mp4 now"), []);
+	});
+});
+
+describe("extractCandidateMediaUrls (YouTube)", () => {
+	it("extracts the video id from common URL forms", () => {
+		assert.equal(youTubeVideoId("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://www.youtube.com/shorts/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://www.youtube.com/embed/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://www.youtube.com/live/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://m.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("https://music.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+	});
+
+	it("accepts scheme-less / bare URLs", () => {
+		assert.equal(youTubeVideoId("youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+		assert.equal(youTubeVideoId("www.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+	});
+
+	it("handles leading query params before v=", () => {
+		assert.equal(
+			youTubeVideoId("https://www.youtube.com/watch?app=desktop&v=dQw4w9WgXcQ&list=xyz"),
+			"dQw4w9WgXcQ",
+		);
+	});
+
+	it("returns null for non-YouTube URLs", () => {
+		assert.equal(youTubeVideoId("https://vimeo.com/123456"), null);
+		assert.equal(youTubeVideoId("https://example.com/watch?v=abc"), null);
+		assert.equal(youTubeVideoId("not a url at all"), null);
+	});
+
+	it("builds a canonical watch URL", () => {
+		assert.equal(
+			canonicalYouTubeUrl("https://youtu.be/dQw4w9WgXcQ?t=42"),
+			"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		);
+		assert.equal(canonicalYouTubeUrl("https://vimeo.com/123"), null);
+	});
+
+	it("detects YouTube URLs embedded in prompt text", () => {
+		assert.deepEqual(
+			extractCandidateMediaUrls("check this out https://www.youtube.com/watch?v=dQw4w9WgXcQ thanks"),
+			["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+		);
+		assert.deepEqual(
+			extractCandidateMediaUrls("see youtu.be/abcdefghij and a shorts https://youtube.com/shorts/123456789ab"),
+			["youtu.be/abcdefghij", "https://youtube.com/shorts/123456789ab"],
+		);
+	});
+
+	it("captures trailing query/fragment so the whole URL can be stripped", () => {
+		assert.deepEqual(
+			extractCandidateMediaUrls("https://youtu.be/dQw4w9WgXcQ?t=42&feature=shared"),
+			["https://youtu.be/dQw4w9WgXcQ?t=42&feature=shared"],
+		);
+	});
+
+	it("does not swallow a trailing markdown link closer", () => {
+		assert.deepEqual(
+			extractCandidateMediaUrls("[video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)"),
+			["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+		);
+	});
+
+	it("deduplicates by video id across URL forms", () => {
+		const out = extractCandidateMediaUrls(
+			"https://youtu.be/dQw4w9WgXcQ and https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		);
+		assert.deepEqual(out, ["https://youtu.be/dQw4w9WgXcQ"]);
+	});
+
+	it("ignores non-YouTube URLs", () => {
+		assert.deepEqual(extractCandidateMediaUrls("see https://vimeo.com/123456 and https://example.com"), []);
 	});
 });
 
