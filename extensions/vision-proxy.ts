@@ -47,13 +47,26 @@ import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { type ImageContent as PiAiImage, complete } from "@earendil-works/pi-ai";
+import { type ImageContent as PiAiImage, complete as legacyComplete, type Model, type Context, type ModelsApiStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+
+/** Compatibility wrapper: uses new ModelRegistry.complete when available, otherwise falls back to legacyComplete. */
+function hasComplete(mr: ModelRegistry): mr is ModelRegistry & { complete: typeof legacyComplete } {
+    return typeof (mr as any).complete === "function";
+}
+
+function completeCompat<TApi>(ctx: ExtensionContext, model: Model<TApi>, request: Context, options?: ModelsApiStreamOptions<TApi>) {
+    if (hasComplete(ctx.modelRegistry)) {
+        return ctx.modelRegistry.complete(model, request, options);
+    }
+    return legacyComplete(model as any, request as any, options as any);
+}
+
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	ContextEvent,
 	ExtensionAPI,
-	ExtensionContext,
+	ExtensionContext, ModelRegistry,
 	SessionCompactEvent,
 	SessionEntry,
 	SessionStartEvent,
@@ -613,7 +626,9 @@ async function analyzeImages(
 	config: VisionConfig,
 	ctx: ExtensionContext,
 ): Promise<AnalysisResult[] | null> {
+
 	const visionModel = ctx.modelRegistry.find(config.provider, config.modelId);
+
 	if (!visionModel) {
 		ctx.ui.notify(
 			`[multimodal-proxy] Model "${modelLabel(config)}" not found. Use /multimodal-proxy pick to choose one.`,
@@ -663,7 +678,7 @@ async function analyzeImages(
 		storeImageData(imageData, hash, piAiImage.data, piAiImage.mimeType);
 
 		try {
-			const response = await complete(
+			const response = await completeCompat(ctx,
 				visionModel,
 				{
 					systemPrompt: config.systemPrompt,
@@ -786,7 +801,7 @@ async function analyzeVideo(
 		: "";
 
 	try {
-		const response = await complete(
+		const response = await completeCompat(ctx,
 			videoModel,
 			{
 				systemPrompt: config.videoSystemPrompt,
@@ -1384,7 +1399,7 @@ async function handleAnalyzeImage(
 
 	try {
 		const startTime = Date.now();
-		const response = await complete(
+		const response = await completeCompat(ctx,
 			visionModel,
 			{
 				systemPrompt,
@@ -1939,7 +1954,7 @@ export default function (pi: ExtensionAPI) {
 								...jointImages,
 							];
 
-							const jointResponse = await complete(
+							const jointResponse = await completeCompat(ctx,
 								jointVisionModel,
 								{
 									systemPrompt: jointSystemPrompt,
@@ -2963,7 +2978,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 
 				try {
 					const startTime = Date.now();
-					const response = await complete(
+					const response = await completeCompat(ctx,
 						descVisionModel,
 						{
 							systemPrompt,
