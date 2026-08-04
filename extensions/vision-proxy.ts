@@ -47,17 +47,34 @@ import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { type ImageContent as PiAiImage, complete as legacyComplete, type Model, type Context, type ModelsApiStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+
+type LegacyComplete = <TApi extends Api>(model: Model<TApi>, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>;
+
+// move `complete` to @earendil-works/pi-ai/compat 
+let legacyCompletePromise: Promise<LegacyComplete> | undefined;
+function loadLegacyComplete(): Promise<LegacyComplete> {
+    if (!legacyCompletePromise) {
+        const compatSpecifier: string = "@earendil-works/pi-ai/compat";
+        legacyCompletePromise = import("@earendil-works/pi-ai").then((mod: any) =>
+            typeof mod.complete === "function"
+                ? mod.complete
+                : import(compatSpecifier).then((compat: any) => compat.complete),
+        );
+    }
+    return legacyCompletePromise;
+}
 
 /** Compatibility wrapper: uses new ModelRegistry.complete when available, otherwise falls back to legacyComplete. */
-function hasComplete(mr: ModelRegistry): mr is ModelRegistry & { complete: typeof legacyComplete } {
+function hasComplete(mr: ModelRegistry): mr is ModelRegistry & { complete: LegacyComplete } {
     return typeof (mr as any).complete === "function";
 }
 
-function completeCompat<TApi>(ctx: ExtensionContext, model: Model<TApi>, request: Context, options?: ModelsApiStreamOptions<TApi>) {
+async function completeCompat<TApi extends Api>(ctx: ExtensionContext, model: Model<TApi>, request: Context, options?: ProviderStreamOptions) {
     if (hasComplete(ctx.modelRegistry)) {
         return ctx.modelRegistry.complete(model, request, options);
     }
+    const legacyComplete = await loadLegacyComplete();
     return legacyComplete(model as any, request as any, options as any);
 }
 
