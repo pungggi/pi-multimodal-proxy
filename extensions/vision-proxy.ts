@@ -75,7 +75,7 @@ async function completeCompat<TApi extends Api>(ctx: ExtensionContext, model: Mo
         return ctx.modelRegistry.complete(model, request, options);
     }
     const legacyComplete = await loadLegacyComplete();
-    return legacyComplete(model as any, request as any, options as any);
+    return legacyComplete(model, request, options);
 }
 
 import type {
