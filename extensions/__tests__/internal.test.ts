@@ -51,6 +51,9 @@ import {
 	isValidNamedRegion,
 	expandLeadingTilde,
 	sanitizeAllowedFolders,
+	sanitizeYtdlpCookiesFromBrowser,
+	sanitizeYtdlpExtractorArgs,
+	YTDLP_COOKIES_BROWSERS,
 	pathAccessFromConfig,
 	MAX_ALLOWED_FOLDERS,
 	LRUCache,
@@ -265,18 +268,18 @@ describe("readEnvOverrides", () => {
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
@@ -287,6 +290,32 @@ describe("envFlags", () => {
 		// An invalid value is not applied by readEnvOverrides, so it must not
 		// report (and thereby lock) the setting as env-overridden either.
 		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER: "chrome" }).ytdlpCookies, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS: "youtube:player_client=web" }).ytdlpExtractorArgs, true);
+	});
+});
+
+describe("yt-dlp config sanitizers", () => {
+	it("accepts known browsers case-insensitively, rejects others", () => {
+		assert.equal(sanitizeYtdlpCookiesFromBrowser("Chrome"), "chrome");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser("FIREFOX"), "firefox");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser("edge"), "edge");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser("internet explorer"), "");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser(""), "");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser(undefined), "");
+		assert.equal(sanitizeYtdlpCookiesFromBrowser(123 as any), "");
+	});
+	it("exposes the supported browser set", () => {
+		assert.ok(YTDLP_COOKIES_BROWSERS.has("chrome"));
+		assert.ok(YTDLP_COOKIES_BROWSERS.has("brave"));
+	});
+	it("strips control chars and caps extractor-args length", () => {
+		assert.equal(sanitizeYtdlpExtractorArgs("youtube:player_client=web"), "youtube:player_client=web");
+		assert.equal(sanitizeYtdlpExtractorArgs("  trim me  "), "trim me");
+		assert.equal(sanitizeYtdlpExtractorArgs("a\x00b\x07c"), "abc");
+		assert.equal(sanitizeYtdlpExtractorArgs(""), "");
+		const long = "x".repeat(600);
+		assert.equal(sanitizeYtdlpExtractorArgs(long).length, 500);
 	});
 });
 

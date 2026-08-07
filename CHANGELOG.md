@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.12.1] - 2026-08-07
+
+### Fixed
+
+- **Downloaded videos now save to the real Downloads folder.** The post-analysis "Save downloaded video?" prompt hardcoded `join(os.homedir(), "Downloads")` and wrapped `copyFile` in a silent `catch {}`. On machines where the Windows Downloads folder is relocated (e.g. `D:\Downloads`) or OneDrive-redirected, the default path doesn't exist, so `copyFile` threw `ENOENT`, the error was swallowed, and the user saw no file and no message after clicking **Yes**. `vision-proxy.ts` now resolves the real Downloads folder via the Windows Shell known-folder API (`FOLDERID_Downloads` / `shell:Downloads`, which respects relocation and OneDrive redirection), creates it on demand (`mkdir -p`), and surfaces any save failure with the target path. The success notification now includes the full saved path. New helpers: `resolveDownloadsDir`, `pathExists`.
+
+### Added
+
+- **yt-dlp auth knobs to defeat YouTube 403s.** YouTube increasingly returns `HTTP Error 403: Forbidden` on the media fetch even with the latest `yt-dlp`; the proxy previously passed no credentials. Two opt-in, persisted settings now forward to yt-dlp: `ytdlpCookiesFromBrowser` (`/multimodal-proxy ytdlp cookies <browser|off>`, validated against `chrome|firefox|edge|brave|opera|safari|vivaldi|chromium|whale`) reuses a logged-in browser session, and `ytdlpExtractorArgs` (`/multimodal-proxy ytdlp extractor-args "<text>|off>`) forwards arbitrary `--extractor-args` (e.g. `youtube:player_client=web_safari,web`). A 403 download failure now appends a hint pointing at the cookies knob. Env overrides: `PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER`, `PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS`. New sanitizers + tests: `sanitizeYtdlpCookiesFromBrowser`, `sanitizeYtdlpExtractorArgs`, `YTDLP_COOKIES_BROWSERS`.
+
 ## [1.11.0] - 2026-07-29
 
 ### Added

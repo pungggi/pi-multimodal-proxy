@@ -37,13 +37,15 @@
  *     PI_VISION_PROXY_MAX_VIDEO_BYTES  - positive integer
  *     PI_VISION_PROXY_ALLOWED_PROVIDERS - comma-separated pre-consented providers
  *     PI_VISION_PROXY_STATUS_LINE      - "on" | "off"
+ *     PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER - chrome|firefox|edge|brave|opera|safari|vivaldi|chromium|whale (defeats YouTube 403s)
+ *     PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS - e.g. "youtube:player_client=web_safari,web"
  *
  * Install:
  *   pi install ./packages/pi-multimodal-proxy
  */
 
 import { execFile } from "node:child_process";
-import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -128,6 +130,8 @@ import {
 	expandLeadingTilde,
 	isUncPath,
 	MAX_ALLOWED_FOLDERS,
+	sanitizeYtdlpExtractorArgs,
+	YTDLP_COOKIES_BROWSERS,
 
 	readMediaFileWithReason,
 	type ReadMediaReason,
@@ -975,6 +979,7 @@ async function downloadMediaUrl(
 	url: string,
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	ytdlp?: { cookiesFromBrowser?: string; extractorArgs?: string },
 ): Promise<DownloadedMedia | null> {
 	if (!(await checkYtDlp())) {
 		ctx.ui.notify(
@@ -991,19 +996,27 @@ async function downloadMediaUrl(
 		// actual download — it can satisfy the print from metadata alone. Adding
 		// an after_move field forces the download (it is only known once the file
 		// is in its final location) and also hands us the exact output path.
+		const args = [
+			"--no-playlist",
+			"--no-warnings",
+			"--no-progress",
+			"-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
+			"--merge-output-format", "mp4",
+			"-o", join(tempDir, "%(id)s.%(ext)s"),
+		];
+		// Optional auth / player-client knobs (1.12.1) — defeat YouTube 403s on
+		// the media fetch by reusing a logged-in browser session and/or alternate
+		// player clients. Both opt-in; absent by default.
+		if (ytdlp?.cookiesFromBrowser) {
+			args.push("--cookies-from-browser", ytdlp.cookiesFromBrowser);
+		}
+		if (ytdlp?.extractorArgs) {
+			args.push("--extractor-args", ytdlp.extractorArgs);
+		}
+		args.push("--print", "%(title)s", "--print", "after_move:filepath", url);
 		const { stdout } = await execFileAsync(
 			"yt-dlp",
-			[
-				"--no-playlist",
-				"--no-warnings",
-				"--no-progress",
-				"-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
-				"--merge-output-format", "mp4",
-				"-o", join(tempDir, "%(id)s.%(ext)s"),
-				"--print", "%(title)s",
-				"--print", "after_move:filepath",
-				url,
-			],
+			args,
 			{ windowsHide: true, timeout: 240_000, maxBuffer: 4 * 1024 * 1024, signal },
 		);
 
@@ -1027,9 +1040,75 @@ async function downloadMediaUrl(
 	} catch (err) {
 		if (signal?.aborted) return null;
 		const msg = err instanceof Error ? err.message : String(err);
-		ctx.ui.notify(`[multimodal-proxy] YouTube download failed for ${url}: ${msg}`, "warning");
+		// A 403 on the media fetch usually means YouTube wants a logged-in
+		// session; point the user at the cookies knob if it isn't already set.
+		const hint = /403|forbidden/i.test(msg) && !ytdlp?.cookiesFromBrowser
+			? " (a 403 often means YouTube wants a logged-in session — try /multimodal-proxy ytdlp cookies <browser>)"
+			: "";
+		ctx.ui.notify(`[multimodal-proxy] YouTube download failed for ${url}: ${msg}${hint}`, "warning");
 		return null;
 	}
+}
+
+// ── Downloads folder resolution ─────────────────────────────────────────────
+//
+// The Windows default `C:\Users\<user>\Downloads` is frequently NOT the folder
+// File Explorer shows: OneDrive redirection or a custom relocation (e.g.
+// `D:\Downloads`) moves it elsewhere. Hardcoding the default then makes
+// `copyFile` throw ENOENT — and pre-fix that error was swallowed silently, so
+// the user clicked "Save", nothing appeared, and no error was surfaced.
+//
+// We resolve the real folder via the Shell known-folder (FOLDERID_Downloads)
+// on Windows, cache the result, and fall back to `~/Downloads` elsewhere.
+
+let downloadsDirCache: string | null = null;
+
+async function pathExists(p: string): Promise<boolean> {
+	try {
+		await access(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Resolve the user's real Downloads folder, respecting Windows relocation /
+ * OneDrive redirection. Falls back to the default `~/Downloads` (which the
+ * caller creates on demand). Result is cached for the process lifetime.
+ */
+async function resolveDownloadsDir(): Promise<string> {
+	if (downloadsDirCache) return downloadsDirCache;
+	const defaultDir = join(os.homedir(), "Downloads");
+	if (await pathExists(defaultDir)) {
+		downloadsDirCache = defaultDir;
+		return defaultDir;
+	}
+	// Default is missing (relocated / OneDrive-redirected). On Windows, ask the
+	// Shell for the real Downloads known-folder path; this respects redirection.
+	if (process.platform === "win32") {
+		try {
+			const { stdout } = await execFileAsync(
+				"powershell.exe",
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"(New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Path",
+				],
+				{ windowsHide: true, timeout: 10_000 },
+			);
+			const resolved = stdout.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+			if (resolved && (await pathExists(resolved))) {
+				downloadsDirCache = resolved;
+				return resolved;
+			}
+		} catch {
+			// PowerShell unavailable or failed — fall back to default (created below).
+		}
+	}
+	downloadsDirCache = defaultDir;
+	return defaultDir;
 }
 
 async function analyzeVideoViaXaiStt(
@@ -1693,7 +1772,10 @@ export default function (pi: ExtensionAPI) {
 						ctx,
 						() => `Downloading YouTube ${id}…`,
 						`Downloading YouTube ${id}…`,
-						() => downloadMediaUrl(watch, ctx.signal, ctx),
+						() => downloadMediaUrl(watch, ctx.signal, ctx, {
+							cookiesFromBrowser: config.ytdlpCookiesFromBrowser,
+							extractorArgs: config.ytdlpExtractorArgs,
+						}),
 					);
 					if (!dl) continue;
 					downloadedTempDirs.push(dl.tempDir);
@@ -1813,15 +1895,23 @@ export default function (pi: ExtensionAPI) {
 						"Save downloaded video?",
 						`"${info.title}"\n\n${sizeMB} MB — save to your Downloads folder?`,
 					);
-					if (save) {
-						const safeTitle = info.title.replace(/[<>:"\/\\|?*]/g, "_").replace(/\s+/g, " ").trim().slice(0, 200);
-						const dest = join(os.homedir(), "Downloads", `${safeTitle}.mp4`);
+					if (!save) continue;
+					const safeTitle = info.title.replace(/[<>:"\/\\|?*]/g, "_").replace(/\s+/g, " ").trim().slice(0, 200);
+					const destDir = await resolveDownloadsDir();
+					const dest = join(destDir, `${safeTitle}.mp4`);
+					try {
+						await mkdir(destDir, { recursive: true });
 						await copyFile(path, dest);
-						ctx.ui.notify(`[multimodal-proxy] ✓ Saved "${safeTitle}.mp4" to Downloads`, "info");
+						ctx.ui.notify(`[multimodal-proxy] ✓ Saved "${safeTitle}.mp4" to ${dest}`, "info");
+					} catch (saveErr) {
+						// Surface save failures (missing dir, permissions, disk) — the
+					// previous silent catch hid them and the video just vanished.
+						const reason = saveErr instanceof Error ? saveErr.message : String(saveErr);
+						ctx.ui.notify(`[multimodal-proxy] ✗ Could not save video to ${dest}: ${reason}`, "warning");
 					}
 				} catch {
-					// Don't block the agent on save errors — temp files are
-					// cleaned below regardless.
+					// confirm() dialog itself failed — don't block the agent. Temp
+					// files are cleaned below regardless.
 				}
 			}
 			await cleanupDownloads();
@@ -2517,6 +2607,73 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				}
 				ctx.ui.notify(
 					`[multimodal-proxy] Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}. Use /multimodal-proxy path-detection on|off.`,
+					"info",
+				);
+				return;
+			}
+
+			// ── yt-dlp cookies / extractor-args (defeat YouTube 403s) ───────
+			if (sub === "ytdlp") {
+				const { sub: ySub, value: yValue } = splitSubcommand(value);
+
+				if (ySub === "cookies") {
+					if (env.ytdlpCookies) {
+						ctx.ui.notify(
+							"[multimodal-proxy] PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER is set - env overrides commands. Unset to change.",
+							"warning",
+						);
+						return;
+					}
+					const trimmed = yValue.trim().toLowerCase();
+					if (!trimmed || trimmed === "off") {
+						writePersisted({ ...persisted, ytdlpCookiesFromBrowser: "" });
+						ctx.ui.notify("[multimodal-proxy] yt-dlp cookies-from-browser: off", "info");
+						return;
+					}
+					if (!YTDLP_COOKIES_BROWSERS.has(trimmed)) {
+						ctx.ui.notify(
+							`[multimodal-proxy] Unknown browser "${trimmed}". Supported: ${[...YTDLP_COOKIES_BROWSERS].join(", ")}`,
+							"warning",
+						);
+						return;
+					}
+					writePersisted({ ...persisted, ytdlpCookiesFromBrowser: trimmed });
+					ctx.ui.notify(
+						`[multimodal-proxy] yt-dlp cookies-from-browser: ${trimmed} (applied on next YouTube download)`,
+						"info",
+					);
+					return;
+				}
+
+				if (ySub === "extractor-args") {
+					if (env.ytdlpExtractorArgs) {
+						ctx.ui.notify(
+							"[multimodal-proxy] PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS is set - env overrides commands. Unset to change.",
+							"warning",
+						);
+						return;
+					}
+					const trimmed = yValue.trim();
+					if (!trimmed || trimmed.toLowerCase() === "off") {
+						writePersisted({ ...persisted, ytdlpExtractorArgs: "" });
+						ctx.ui.notify("[multimodal-proxy] yt-dlp extractor-args: off", "info");
+						return;
+					}
+					const cleaned = sanitizeYtdlpExtractorArgs(trimmed);
+					writePersisted({ ...persisted, ytdlpExtractorArgs: cleaned });
+					ctx.ui.notify(`[multimodal-proxy] yt-dlp extractor-args: ${cleaned}`, "info");
+					return;
+				}
+
+				ctx.ui.notify(
+					"[multimodal-proxy] yt-dlp options:\n" +
+						`  cookies-from-browser: ${effective.ytdlpCookiesFromBrowser || "(off)"}\n` +
+						`  extractor-args: ${effective.ytdlpExtractorArgs || "(off)"}\n` +
+						(env.ytdlpCookies || env.ytdlpExtractorArgs ? "  (env override active)\n" : "") +
+						"Usage:\n" +
+						"  /multimodal-proxy ytdlp cookies <browser|off>      reuse a logged-in YouTube session (fixes most 403s)\n" +
+						'  /multimodal-proxy ytdlp extractor-args <text|off>  e.g. youtube:player_client=web_safari,web\n' +
+						`Browsers: ${[...YTDLP_COOKIES_BROWSERS].join(", ")}`,
 					"info",
 				);
 				return;
