@@ -2170,10 +2170,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Mirror before_agent_start: only forward recent conversation when the
+		// user opted in (includeContext) — consent already covers it in that case.
+		const conversationContext = config.includeContext
+			? buildConversationContext(ctx.sessionManager.getBranch())
+			: "";
+
 		const results = await analyzeImages(
 			images,
 			`A tool (${event.toolName}) returned this image. Describe it in detail per your system instructions.`,
-			"",
+			conversationContext,
 			config,
 			ctx,
 		);
