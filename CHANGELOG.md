@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.0] - 2026-08-09
+
+### Added
+
+- **Tool-result images are now described via the vision model.** When a tool returns an image content block (e.g. `read` on a PNG, or a screenshot tool), non-vision models previously lost it entirely — pi-core strips image blocks they can't consume — and vision models received it as raw base64. A new `tool_result` handler describes those images through the configured vision model and replaces the block with the same `[Image - vision-proxy description (UNTRUSTED…)]` fence text the `context` hook emits, so the description reaches the active model and is cached for `analyze_image` recall. The flow mirrors `before_agent_start`: it fast-paths tool results with no image, respects `shouldStripImages` (vision models and `off` mode pass the block through unchanged), gates on data-egress consent (no consent leaves the block untouched, preserving prior stripping behaviour), and stores image metadata + bytes for later session recall. New tested pure helpers in `internal.ts`: `collectToolImageBlocks`, `replaceToolImageBlocks`, `AnalysisResult`, `ToolContentBlock`.
+
 ## [1.13.0] - 2026-08-09
 
 ### Fixed
