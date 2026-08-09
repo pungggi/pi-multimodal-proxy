@@ -49,13 +49,43 @@ import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { type ImageContent as PiAiImage, complete } from "@earendil-works/pi-ai";
+import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+
+type LegacyComplete = <TApi extends Api>(model: Model<TApi>, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>;
+
+// move `complete` to @earendil-works/pi-ai/compat 
+let legacyCompletePromise: Promise<LegacyComplete> | undefined;
+function loadLegacyComplete(): Promise<LegacyComplete> {
+    if (!legacyCompletePromise) {
+        const compatSpecifier: string = "@earendil-works/pi-ai/compat";
+        legacyCompletePromise = import("@earendil-works/pi-ai").then((mod: any) =>
+            typeof mod.complete === "function"
+                ? mod.complete
+                : import(compatSpecifier).then((compat: any) => compat.complete),
+        );
+    }
+    return legacyCompletePromise;
+}
+
+/** Compatibility wrapper: uses new ModelRegistry.complete when available, otherwise falls back to legacyComplete. */
+function hasComplete(mr: ModelRegistry): mr is ModelRegistry & { complete: LegacyComplete } {
+    return typeof (mr as any).complete === "function";
+}
+
+async function completeCompat<TApi extends Api>(ctx: ExtensionContext, model: Model<TApi>, request: Context, options?: ProviderStreamOptions) {
+    if (hasComplete(ctx.modelRegistry)) {
+        return ctx.modelRegistry.complete(model, request, options);
+    }
+    const legacyComplete = await loadLegacyComplete();
+    return legacyComplete(model, request, options);
+}
+
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	ContextEvent,
 	ExtensionAPI,
-	ExtensionContext,
+	ExtensionContext, ModelRegistry,
 	SessionCompactEvent,
 	SessionEntry,
 	SessionStartEvent,
@@ -617,7 +647,9 @@ async function analyzeImages(
 	config: VisionConfig,
 	ctx: ExtensionContext,
 ): Promise<AnalysisResult[] | null> {
+
 	const visionModel = ctx.modelRegistry.find(config.provider, config.modelId);
+
 	if (!visionModel) {
 		ctx.ui.notify(
 			`[multimodal-proxy] Model "${modelLabel(config)}" not found. Use /multimodal-proxy pick to choose one.`,
@@ -667,7 +699,7 @@ async function analyzeImages(
 		storeImageData(imageData, hash, piAiImage.data, piAiImage.mimeType);
 
 		try {
-			const response = await complete(
+			const response = await completeCompat(ctx,
 				visionModel,
 				{
 					systemPrompt: config.systemPrompt,
@@ -790,7 +822,7 @@ async function analyzeVideo(
 		: "";
 
 	try {
-		const response = await complete(
+		const response = await completeCompat(ctx,
 			videoModel,
 			{
 				systemPrompt: config.videoSystemPrompt,
@@ -1463,7 +1495,7 @@ async function handleAnalyzeImage(
 
 	try {
 		const startTime = Date.now();
-		const response = await complete(
+		const response = await completeCompat(ctx,
 			visionModel,
 			{
 				systemPrompt,
@@ -2029,7 +2061,7 @@ export default function (pi: ExtensionAPI) {
 								...jointImages,
 							];
 
-							const jointResponse = await complete(
+							const jointResponse = await completeCompat(ctx,
 								jointVisionModel,
 								{
 									systemPrompt: jointSystemPrompt,
@@ -3120,7 +3152,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 
 				try {
 					const startTime = Date.now();
-					const response = await complete(
+					const response = await completeCompat(ctx,
 						descVisionModel,
 						{
 							systemPrompt,
