@@ -8,6 +8,11 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+## What's new in 1.12.1
+
+- **Fix: downloaded videos now save to your real Downloads folder.** The "Save downloaded video?" prompt hardcoded `~/Downloads` and wrapped the copy in a silent `catch`. If you relocated Downloads (e.g. to `D:\Downloads`) or use OneDrive redirection, that path doesn't exist — so clicking **Yes** silently failed with no file and no error. The proxy now resolves the real Downloads folder via the Windows Shell known-folder API (`FOLDERID_Downloads`, respects relocation + OneDrive), creates it if missing, and surfaces any save error with the target path. The success toast now shows the full saved path.
+- **Configurable yt-dlp auth (defeats YouTube 403s).** YouTube increasingly rejects unauthenticated media fetches with `HTTP 403`, even on the latest `yt-dlp`. Two opt-in knobs satisfy the check: `/multimodal-proxy ytdlp cookies <browser>` reuses a logged-in browser session (`chrome`, `firefox`, `edge`, `brave`, …), and `/multimodal-proxy ytdlp extractor-args "<args>"` forwards arbitrary `--extractor-args` (e.g. `youtube:player_client=web_safari,web`). A 403 failure now also hints at the cookies knob. Env overrides: `PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER`, `PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS`.
+
 ## What's new in 1.12.0
 
 - **YouTube video download** — paste a YouTube URL in your prompt and the extension downloads it via `yt-dlp` and analyzes it like any local video file. Gated by path detection (on by default); requires `yt-dlp` on your PATH. See [YouTube videos](#youtube-videos). After successful analysis you are prompted to optionally keep the downloaded file in your Downloads folder.
@@ -75,6 +80,16 @@ winget install yt-dlp.yt-dlp        # Windows
 ```
 
 `ffmpeg` is also used (for duration probing and stream merging) — it usually ships alongside yt-dlp. Downloads are capped to ≤720p and rejected past the configured size limit (`PI_VISION_PROXY_MAX_VIDEO_BYTES`, default 200 MB). To disable URL auto-download, turn off path detection: `/multimodal-proxy path-detection off`.
+
+#### 403 Forbidden / download failures
+
+YouTube periodically rejects unauthenticated media fetches with `HTTP Error 403: Forbidden`, even on the latest `yt-dlp`. The proxy can't fix YouTube's backend, but you can satisfy the auth check:
+
+- **Reuse a logged-in browser session** — `/multimodal-proxy ytdlp cookies chrome` (also `firefox`, `edge`, `brave`, `opera`, `safari`, `vivaldi`, `chromium`, `whale`). yt-dlp reads that browser's YouTube cookies. This fixes most 403s.
+- **Try alternate player clients** — `/multimodal-proxy ytdlp extractor-args "youtube:player_client=web_safari,web"`.
+- Show current settings with `/multimodal-proxy ytdlp`; turn either off with `... off`.
+
+Both are persisted in `~/.pi/agent/multimodal-proxy.json` and can be set via env (`PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER`, `PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS`), which override and lock the command.
 
 ## Modes
 

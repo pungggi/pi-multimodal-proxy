@@ -79,6 +79,12 @@ export interface VisionConfig {
 	// (event.images) are always processed; only the convenience path-scan is
 	// gated. Explicit references via /multimodal-proxy describe still work.
 	pathDetection: ToolSetting;
+	// 1.12.1 — yt-dlp tuning to defeat YouTube 403s on the media fetch. Both
+	// empty by default. cookiesFromBrowser reuses a logged-in browser session
+	// (e.g. "chrome"); extractorArgs forwards arbitrary --extractor-args (e.g.
+	// "youtube:player_client=web_safari,web").
+	ytdlpCookiesFromBrowser: string;
+	ytdlpExtractorArgs: string;
 }
 
 export interface ImageMeta {
@@ -704,6 +710,8 @@ export const DEFAULT_CONFIG: VisionConfig = {
 		"google/gemini-2.5-pro": { format: "gemini_normalized_1000" },
 		"google/gemini-3-pro": { format: "gemini_normalized_1000" },
 	},
+	ytdlpCookiesFromBrowser: "",
+	ytdlpExtractorArgs: "",
 };
 
 // ── Persistent file storage ────────────────────────────────────────────────
@@ -729,6 +737,8 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"allowedFolders", "allowHome",
 	"statusLine",
 	"pathDetection",
+	"ytdlpCookiesFromBrowser",
+	"ytdlpExtractorArgs",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -868,10 +878,15 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 	if (foldersEnv !== undefined) {
 		overrides.allowedFolders = sanitizeAllowedFolders(foldersEnv.split(delimiter));
 	}
+	// 1.12.1 yt-dlp env overrides
+	const cookiesEnv = env.PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER;
+	if (cookiesEnv !== undefined) overrides.ytdlpCookiesFromBrowser = sanitizeYtdlpCookiesFromBrowser(cookiesEnv);
+	const extractorArgsEnv = env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS;
+	if (extractorArgsEnv !== undefined) overrides.ytdlpExtractorArgs = sanitizeYtdlpExtractorArgs(extractorArgsEnv);
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -891,6 +906,8 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		statusLine: env.PI_VISION_PROXY_STATUS_LINE === "on" || env.PI_VISION_PROXY_STATUS_LINE === "off",
 		// Same rule: only a recognized value overrides path detection.
 		pathDetection: env.PI_VISION_PROXY_PATH_DETECTION === "on" || env.PI_VISION_PROXY_PATH_DETECTION === "off",
+		ytdlpCookies: env.PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER !== undefined,
+		ytdlpExtractorArgs: env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS !== undefined,
 	};
 }
 
@@ -984,6 +1001,33 @@ export function sanitizeAllowedFolders(value: unknown): string[] {
 	return out;
 }
 
+/** Browsers accepted by yt-dlp's --cookies-from-browser (1.12.1). */
+export const YTDLP_COOKIES_BROWSERS = new Set([
+	"chrome", "firefox", "edge", "brave", "opera", "safari", "vivaldi", "chromium", "whale",
+]);
+
+/** Max length of the freeform --extractor-args value (1.12.1). */
+export const YTDLP_EXTRACTOR_ARGS_MAX = 500;
+
+/**
+ * Validate a yt-dlp --cookies-from-browser value (1.12.1). Lowercases and
+ * accepts only known browser names; anything else collapses to "" (off).
+ */
+export function sanitizeYtdlpCookiesFromBrowser(value: unknown): string {
+	if (typeof value !== "string") return "";
+	const v = value.trim().toLowerCase();
+	return YTDLP_COOKIES_BROWSERS.has(v) ? v : "";
+}
+
+/**
+ * Validate a yt-dlp --extractor-args value (1.12.1). Strips control/null bytes
+ * and caps length; returned verbatim (yt-dlp parses the single arg value).
+ */
+export function sanitizeYtdlpExtractorArgs(value: unknown): string {
+	if (typeof value !== "string") return "";
+	return value.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, YTDLP_EXTRACTOR_ARGS_MAX);
+}
+
 export function sanitize(config: VisionConfig): VisionConfig {
 	const safe: VisionConfig = { ...config };
 	if (typeof safe.provider === "string") safe.provider = canonicalProvider(safe.provider);
@@ -1052,6 +1096,9 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	if (safe.statusLine !== "on" && safe.statusLine !== "off") safe.statusLine = DEFAULT_CONFIG.statusLine;
 	// 1.11.0 path-detection field
 	if (safe.pathDetection !== "on" && safe.pathDetection !== "off") safe.pathDetection = DEFAULT_CONFIG.pathDetection;
+	// 1.12.1 yt-dlp tuning fields
+	safe.ytdlpCookiesFromBrowser = sanitizeYtdlpCookiesFromBrowser(safe.ytdlpCookiesFromBrowser);
+	safe.ytdlpExtractorArgs = sanitizeYtdlpExtractorArgs(safe.ytdlpExtractorArgs);
 	return safe;
 }
 
