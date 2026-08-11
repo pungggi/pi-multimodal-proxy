@@ -382,9 +382,11 @@ async function pickVisionModel(
 	if (providerSet.length === 1) {
 		providerPicked = providerSet[0];
 	} else {
-		// Start directly at the model list for the current (★) provider
-		// User can navigate back to pick a different provider
-		providerPicked = currentProvider;
+		// Start at the current (★) provider's model list when it's still in the
+		// scoped set; otherwise fall back to the first available scoped provider
+		// so the picker never opens on a provider with zero models (e.g. when a
+		// model scope excludes the persisted provider).
+		providerPicked = providerSet.includes(currentProvider) ? currentProvider : providerSet[0];
 	}
 
 	// Provider selection loop - re-enters when user picks "← Change provider"
@@ -909,11 +911,14 @@ function xaiHeaders(apiKey: string, extra?: Record<string, string | null>, conte
 	// `extra` may carry `null` header-deletion markers from ProviderHeaders (pi ≥ 0.84).
 	// Strip them: undici rejects non-string header values (TypeError) or would send a
 	// literal "null". Defense-in-depth — the xAI path also sanitizes at its boundary.
-	const clean = sanitizeProviderHeaders(extra);
-	const headers: Record<string, string> = {
-		...clean,
-		Authorization: clean.Authorization ?? `Bearer ${apiKey}`,
-	};
+	const headers: Record<string, string> = sanitizeProviderHeaders(extra);
+	// Only inject the default Bearer when the caller didn't address Authorization
+	// at all. An explicit `Authorization: null` is a pi ≥ 0.84 deletion marker and
+	// must be honored (suppress the header) rather than re-adding the key and
+	// forwarding a credential that was deliberately suppressed.
+	if (!extra || !("Authorization" in extra)) {
+		headers.Authorization ??= `Bearer ${apiKey}`;
+	}
 	if (contentType) headers["Content-Type"] = contentType;
 	return headers;
 }
