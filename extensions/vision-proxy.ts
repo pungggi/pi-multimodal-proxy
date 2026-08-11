@@ -49,7 +49,7 @@ import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderHeaders, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
 
 type LegacyComplete = <TApi extends Api>(model: Model<TApi>, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>;
 
@@ -185,7 +185,9 @@ import {
 	resolveCropEntry,
 	sanitize,
 	sanitizeForLog,
+	sanitizeProviderHeaders,
 	shouldStripImages as shouldStripImagesPure,
+	selectVisionModels,
 	splitSubcommand,
 	stripImagePaths,
 	stripMediaPaths,
@@ -348,7 +350,11 @@ async function pickVisionModel(
 		);
 		return;
 	}
-	const vision = ctx.modelRegistry.getAll().filter((m) => m.input.includes("image"));
+	// Honor the session's model scope (ctx.scopedModels, pi ≥ 0.83.0) when set,
+	// so the picker mirrors the built-in /model selector instead of listing the
+	// whole catalogue. Falls back to the full registry when no scope is set or
+	// on runtimes that predate scopedModels.
+	const vision = selectVisionModels(ctx.scopedModels, ctx.modelRegistry.getAll());
 	if (vision.length === 0) {
 		ctx.ui.notify("[multimodal-proxy] No vision-capable models in registry.", "error");
 		return;
@@ -812,7 +818,9 @@ async function analyzeVideo(
 	);
 
 	if (isXaiProvider(config.videoProvider)) {
-		return analyzeVideoViaXaiNative(mediaFile, filename, prompt, conversationContext, config, auth.apiKey, auth.headers, ctx, hash, mediaPath);
+		// sanitizeProviderHeaders: auth.headers is ProviderHeaders (Record<string, string | null>,
+		// pi ≥ 0.84) where null = deletion marker; the xAI raw-fetch path needs clean strings.
+		return analyzeVideoViaXaiNative(mediaFile, filename, prompt, conversationContext, config, auth.apiKey, sanitizeProviderHeaders(auth.headers), ctx, hash, mediaPath);
 	}
 
 	const contextBlock = conversationContext
@@ -897,10 +905,14 @@ async function analyzeVideoViaXaiNative(
 
 // ── analyze_image tool handler ─────────────────────────────────────────────
 
-function xaiHeaders(apiKey: string, extra?: Record<string, string>, contentType?: string): Record<string, string> {
+function xaiHeaders(apiKey: string, extra?: Record<string, string | null>, contentType?: string): Record<string, string> {
+	// `extra` may carry `null` header-deletion markers from ProviderHeaders (pi ≥ 0.84).
+	// Strip them: undici rejects non-string header values (TypeError) or would send a
+	// literal "null". Defense-in-depth — the xAI path also sanitizes at its boundary.
+	const clean = sanitizeProviderHeaders(extra);
 	const headers: Record<string, string> = {
-		...(extra ?? {}),
-		Authorization: extra?.Authorization ?? `Bearer ${apiKey}`,
+		...clean,
+		Authorization: clean.Authorization ?? `Bearer ${apiKey}`,
 	};
 	if (contentType) headers["Content-Type"] = contentType;
 	return headers;
