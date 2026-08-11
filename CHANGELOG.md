@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.15.0] - 2026-08-11
+
+### Added
+
+- **Vision-model picker respects the session's model scope.** `/multimodal-proxy pick` now honors `ctx.scopedModels` (pi ≥ 0.83.0): when a scope is configured via `--models` or `enabledModels`, the picker lists only scoped vision-capable models, mirroring the built-in `/model` selector instead of enumerating the whole catalogue. Falls back to the full registry when no scope is set, and on runtimes that predate `scopedModels` (gracefully undefined). When the persisted provider is excluded by the configured scope, the picker opens on the first in-scope provider instead of an empty model list. New tested pure helper `selectVisionModels`.
+
+### Fixed
+
+- **Forward-compat with pi 0.84.0 `null` header-deletion markers.** Since pi 0.84.0, `ModelRegistry.getApiKeyAndHeaders()` returns `ProviderHeaders` (`Record<string, string | null>`) where `null` marks a header for deletion. The xAI native video path (STT / file-upload / `/v1/responses`) builds raw `fetch()` calls that cannot carry `null` — undici throws `TypeError` on a non-string header value, or sends a literal `"null"`. Those headers are now stripped at the call boundary (and at the `xaiHeaders` choke point as defense-in-depth). An explicit `Authorization: null` deletion marker is now honored — the header is suppressed rather than re-filled with the API key — so a credential deliberately suppressed by a provider/header hook is not forwarded. The pi-ai `complete()` paths continue to pass headers through unchanged, as required. New tested pure helper `sanitizeProviderHeaders`.
+
 ## [1.14.0] - 2026-08-09
 
 ### Added

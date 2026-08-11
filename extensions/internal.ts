@@ -1028,6 +1028,27 @@ export function sanitizeYtdlpExtractorArgs(value: unknown): string {
 	return value.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, YTDLP_EXTRACTOR_ARGS_MAX);
 }
 
+/**
+ * Drop `null` header values from a `ProviderHeaders` map. Since pi 0.84.0,
+ * `ModelRegistry.getApiKeyAndHeaders()` returns `Record<string, string | null>`
+ * where `null` marks a header for deletion. Raw `fetch()` calls (the xAI STT /
+ * file-upload / responses endpoints) can't carry `null` — undici throws
+ * `TypeError` on a non-string header value, or sends a literal `"null"` — so
+ * strip them before building fetch headers. (`undefined` values are also
+ * dropped defensively.)
+ */
+export function sanitizeProviderHeaders(
+	headers: Record<string, string | null> | undefined,
+): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (headers) {
+		for (const [key, value] of Object.entries(headers)) {
+			if (value !== null && value !== undefined) out[key] = value;
+		}
+	}
+	return out;
+}
+
 export function sanitize(config: VisionConfig): VisionConfig {
 	const safe: VisionConfig = { ...config };
 	if (typeof safe.provider === "string") safe.provider = canonicalProvider(safe.provider);
@@ -1923,6 +1944,30 @@ export function fuzzyMatches(target: string, query: string): boolean {
 		ti = found + 1;
 	}
 	return true;
+}
+
+/** Minimal model shape for vision selection (keeps this helper testable
+ *  without pulling in pi-ai's `Model`/`Api` types). */
+interface VisionModelLike {
+	input: readonly string[];
+}
+
+/**
+ * Vision-capable models for the picker. Honors the session's model scope
+ * (`ctx.scopedModels`, pi ≥ 0.83.0) when one is configured, so
+ * `/multimodal-proxy pick` mirrors the built-in `/model` selector instead of
+ * enumerating the whole catalogue. Falls back to the full list when no scope
+ * is set — an empty scope means every available model is usable — and on
+ * runtimes that predate `scopedModels`, where `scoped` is undefined.
+ */
+export function selectVisionModels<T extends VisionModelLike>(
+	scoped: readonly { model: T }[] | undefined,
+	all: readonly T[],
+): T[] {
+	if (scoped && scoped.length > 0) {
+		return scoped.map((s) => s.model).filter((m) => m.input.includes("image"));
+	}
+	return all.filter((m) => m.input.includes("image"));
 }
 
 export function shouldStripImages(config: VisionConfig, modelInput: readonly string[] | undefined): boolean {

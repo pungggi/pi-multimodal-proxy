@@ -53,6 +53,7 @@ import {
 	sanitizeAllowedFolders,
 	sanitizeYtdlpCookiesFromBrowser,
 	sanitizeYtdlpExtractorArgs,
+	sanitizeProviderHeaders,
 	YTDLP_COOKIES_BROWSERS,
 	pathAccessFromConfig,
 	MAX_ALLOWED_FOLDERS,
@@ -77,6 +78,7 @@ import {
 	piAiImageToBuffer,
 	bufferToPiAiImage,
 	shouldStripImages,
+	selectVisionModels,
 	splitSubcommand,
 	stripImagePaths,
 	stripMediaPaths,
@@ -316,6 +318,58 @@ describe("yt-dlp config sanitizers", () => {
 		assert.equal(sanitizeYtdlpExtractorArgs(""), "");
 		const long = "x".repeat(600);
 		assert.equal(sanitizeYtdlpExtractorArgs(long).length, 500);
+	});
+});
+
+describe("selectVisionModels", () => {
+	const img = (id: string) => ({ id, input: ["text", "image"] as readonly string[] });
+	const txt = (id: string) => ({ id, input: ["text"] as readonly string[] });
+
+	it("returns all vision models when no scope is configured (undefined)", () => {
+		const all = [img("a"), txt("b"), img("c")];
+		assert.deepEqual(selectVisionModels(undefined, all).map((m) => m.id), ["a", "c"]);
+	});
+	it("returns all vision models when scope is empty (every model usable)", () => {
+		const all = [img("a"), txt("b")];
+		assert.deepEqual(selectVisionModels([], all).map((m) => m.id), ["a"]);
+	});
+	it("restricts to scoped vision models when a scope is configured", () => {
+		const all = [img("a"), img("b"), img("c")];
+		const scoped = [{ model: img("b") }, { model: txt("x") }];
+		assert.deepEqual(selectVisionModels(scoped, all).map((m) => m.id), ["b"]);
+	});
+	it("uses the scope verbatim and ignores the full catalogue", () => {
+		// `b` is not in `all`; the scope is the source of truth when configured
+		const all = [img("a"), img("c")];
+		const scoped = [{ model: img("b") }];
+		assert.deepEqual(selectVisionModels(scoped, all).map((m) => m.id), ["b"]);
+	});
+	it("drops non-image scoped models", () => {
+		const scoped = [{ model: txt("x") }, { model: txt("y") }];
+		assert.deepEqual(selectVisionModels(scoped, [img("a")]).map((m) => m.id), []);
+	});
+});
+
+describe("sanitizeProviderHeaders", () => {
+	it("drops null deletion markers", () => {
+		assert.deepEqual(
+			sanitizeProviderHeaders({ Authorization: "Bearer x", "X-Delete": null, Keep: "v" }),
+			{ Authorization: "Bearer x", Keep: "v" },
+		);
+	});
+	it("drops undefined values defensively", () => {
+		assert.deepEqual(
+			sanitizeProviderHeaders({ A: undefined as unknown as null, B: "b" }),
+			{ B: "b" },
+		);
+	});
+	it("returns an empty object for undefined / empty input", () => {
+		assert.deepEqual(sanitizeProviderHeaders(undefined), {});
+		assert.deepEqual(sanitizeProviderHeaders({}), {});
+	});
+	it("never lets a null survive into the output", () => {
+		const out = sanitizeProviderHeaders({ "X-N": null, "X-S": "s" });
+		for (const v of Object.values(out)) assert.equal(typeof v, "string");
 	});
 });
 

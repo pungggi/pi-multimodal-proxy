@@ -49,7 +49,7 @@ import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs
 import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
+import { type ImageContent as PiAiImage, type Api, type Model, type Context, type ProviderHeaders, type ProviderStreamOptions, type AssistantMessage } from "@earendil-works/pi-ai";
 
 type LegacyComplete = <TApi extends Api>(model: Model<TApi>, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>;
 
@@ -185,7 +185,9 @@ import {
 	resolveCropEntry,
 	sanitize,
 	sanitizeForLog,
+	sanitizeProviderHeaders,
 	shouldStripImages as shouldStripImagesPure,
+	selectVisionModels,
 	splitSubcommand,
 	stripImagePaths,
 	stripMediaPaths,
@@ -348,7 +350,11 @@ async function pickVisionModel(
 		);
 		return;
 	}
-	const vision = ctx.modelRegistry.getAll().filter((m) => m.input.includes("image"));
+	// Honor the session's model scope (ctx.scopedModels, pi ≥ 0.83.0) when set,
+	// so the picker mirrors the built-in /model selector instead of listing the
+	// whole catalogue. Falls back to the full registry when no scope is set or
+	// on runtimes that predate scopedModels.
+	const vision = selectVisionModels(ctx.scopedModels, ctx.modelRegistry.getAll());
 	if (vision.length === 0) {
 		ctx.ui.notify("[multimodal-proxy] No vision-capable models in registry.", "error");
 		return;
@@ -376,9 +382,11 @@ async function pickVisionModel(
 	if (providerSet.length === 1) {
 		providerPicked = providerSet[0];
 	} else {
-		// Start directly at the model list for the current (★) provider
-		// User can navigate back to pick a different provider
-		providerPicked = currentProvider;
+		// Start at the current (★) provider's model list when it's still in the
+		// scoped set; otherwise fall back to the first available scoped provider
+		// so the picker never opens on a provider with zero models (e.g. when a
+		// model scope excludes the persisted provider).
+		providerPicked = providerSet.includes(currentProvider) ? currentProvider : providerSet[0];
 	}
 
 	// Provider selection loop - re-enters when user picks "← Change provider"
@@ -812,7 +820,9 @@ async function analyzeVideo(
 	);
 
 	if (isXaiProvider(config.videoProvider)) {
-		return analyzeVideoViaXaiNative(mediaFile, filename, prompt, conversationContext, config, auth.apiKey, auth.headers, ctx, hash, mediaPath);
+		// sanitizeProviderHeaders: auth.headers is ProviderHeaders (Record<string, string | null>,
+		// pi ≥ 0.84) where null = deletion marker; the xAI raw-fetch path needs clean strings.
+		return analyzeVideoViaXaiNative(mediaFile, filename, prompt, conversationContext, config, auth.apiKey, sanitizeProviderHeaders(auth.headers), ctx, hash, mediaPath);
 	}
 
 	const contextBlock = conversationContext
@@ -897,11 +907,18 @@ async function analyzeVideoViaXaiNative(
 
 // ── analyze_image tool handler ─────────────────────────────────────────────
 
-function xaiHeaders(apiKey: string, extra?: Record<string, string>, contentType?: string): Record<string, string> {
-	const headers: Record<string, string> = {
-		...(extra ?? {}),
-		Authorization: extra?.Authorization ?? `Bearer ${apiKey}`,
-	};
+function xaiHeaders(apiKey: string, extra?: Record<string, string | null>, contentType?: string): Record<string, string> {
+	// `extra` may carry `null` header-deletion markers from ProviderHeaders (pi ≥ 0.84).
+	// Strip them: undici rejects non-string header values (TypeError) or would send a
+	// literal "null". Defense-in-depth — the xAI path also sanitizes at its boundary.
+	const headers: Record<string, string> = sanitizeProviderHeaders(extra);
+	// Only inject the default Bearer when the caller didn't address Authorization
+	// at all. An explicit `Authorization: null` is a pi ≥ 0.84 deletion marker and
+	// must be honored (suppress the header) rather than re-adding the key and
+	// forwarding a credential that was deliberately suppressed.
+	if (!extra || !("Authorization" in extra)) {
+		headers.Authorization ??= `Bearer ${apiKey}`;
+	}
 	if (contentType) headers["Content-Type"] = contentType;
 	return headers;
 }
