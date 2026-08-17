@@ -96,6 +96,12 @@ import {
 	formatProgressStatus,
 	SPINNER_FRAMES,
 	RECALL_HINT,
+	downscaleForUpload,
+	downscaleTargetDim,
+	isAbortError,
+	isTransientVisionError,
+	retryDelayMs,
+	sleepWithAbort,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -270,18 +276,18 @@ describe("readEnvOverrides", () => {
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
@@ -3089,5 +3095,182 @@ describe("applyDefaultModelFallback", () => {
 		const out = applyDefaultModelFallback(cfg, registryWith(`${fb.provider}/${fb.modelId}`));
 		assert.equal(out.mode, "always");
 		assert.equal(out.cacheSize, 7);
+	});
+});
+
+describe("1.16.0 reliability: config defaults & sanitize", () => {
+	it("defaults retryMax / maxUploadDim / maxUploadBytes, no fallback model", () => {
+		const cfg = resolveConfig([], {});
+		assert.equal(cfg.retryMax, 2);
+		assert.equal(cfg.maxUploadDim, 2048);
+		assert.equal(cfg.maxUploadBytes, 5 * 1024 * 1024);
+		assert.equal(cfg.fallbackProvider, undefined);
+		assert.equal(cfg.fallbackModelId, undefined);
+	});
+
+	it("sanitize clamps out-of-range values to defaults", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, retryMax: 99, maxUploadDim: 10, maxUploadBytes: 1 });
+		assert.equal(cfg.retryMax, DEFAULT_CONFIG.retryMax);
+		assert.equal(cfg.maxUploadDim, DEFAULT_CONFIG.maxUploadDim);
+		assert.equal(cfg.maxUploadBytes, DEFAULT_CONFIG.maxUploadBytes);
+	});
+
+	it("sanitize keeps valid values and rounds floats", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, retryMax: 3.7, maxUploadDim: 4096.2, maxUploadBytes: 8 * 1024 * 1024 });
+		assert.equal(cfg.retryMax, 4);
+		assert.equal(cfg.maxUploadDim, 4096);
+		assert.equal(cfg.maxUploadBytes, 8 * 1024 * 1024);
+	});
+
+	it("sanitize requires both fallback halves and canonicalizes the provider", () => {
+		const half = sanitize({ ...DEFAULT_CONFIG, fallbackProvider: "openai" });
+		assert.equal(half.fallbackProvider, undefined);
+		assert.equal(half.fallbackModelId, undefined);
+		const both = sanitize({ ...DEFAULT_CONFIG, fallbackProvider: "x-ai", fallbackModelId: "grok-4.3" });
+		assert.equal(both.fallbackProvider, "xai");
+		assert.equal(both.fallbackModelId, "grok-4.3");
+		const badModel = sanitize({ ...DEFAULT_CONFIG, fallbackProvider: "openai", fallbackModelId: "bad id" });
+		assert.equal(badModel.fallbackProvider, undefined);
+		assert.equal(badModel.fallbackModelId, undefined);
+	});
+
+	it("readEnvOverrides parses retry / upload / fallback-model", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_RETRY_MAX: "3" }).retryMax, 3);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_RETRY_MAX: "9" }).retryMax, undefined);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "4096" }).maxUploadDim, 4096);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "100" }).maxUploadDim, undefined);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_MAX_UPLOAD_MB: "10" }).maxUploadBytes, 10 * 1024 * 1024);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_MAX_UPLOAD_MB: "0.2" }).maxUploadBytes, undefined);
+		const fb = readEnvOverrides({ PI_VISION_PROXY_FALLBACK_MODEL: "openai/gpt-5-mini" });
+		assert.equal(fb.fallbackProvider, "openai");
+		assert.equal(fb.fallbackModelId, "gpt-5-mini");
+		const cleared = readEnvOverrides({ PI_VISION_PROXY_FALLBACK_MODEL: "none" });
+		assert.equal(cleared.fallbackProvider, undefined);
+		assert.equal(cleared.fallbackModelId, undefined);
+	});
+
+	it("env FALLBACK_MODEL=none clears a persisted fallback (and locks the command)", () => {
+		const entries = [customEntry(CUSTOM_TYPE_CONFIG, { fallbackProvider: "openai", fallbackModelId: "gpt-5-mini" })];
+		const cfg = resolveConfig(entries, { PI_VISION_PROXY_FALLBACK_MODEL: "none" });
+		assert.equal(cfg.fallbackProvider, undefined);
+		assert.equal(cfg.fallbackModelId, undefined);
+		const persisted = resolveConfig(entries, {});
+		assert.equal(persisted.fallbackProvider, "openai");
+		assert.equal(persisted.fallbackModelId, "gpt-5-mini");
+	});
+
+	it("fallback model persists through resolveConfig layering", () => {
+		const entries = [customEntry(CUSTOM_TYPE_CONFIG, { fallbackProvider: "x-ai", fallbackModelId: "grok-4.3" })];
+		const cfg = resolveConfig(entries, {});
+		assert.equal(cfg.fallbackProvider, "xai");
+		assert.equal(cfg.fallbackModelId, "grok-4.3");
+	});
+});
+
+describe("1.16.0 isTransientVisionError", () => {
+	const cases: Array<[unknown, boolean, string]> = [
+		[Object.assign(new Error("Too many requests"), { status: 429 }), true, "429 status"],
+		[Object.assign(new Error("server error"), { status: 500 }), true, "500 status"],
+		[Object.assign(new Error("overloaded"), { status: 503 }), true, "503 status"],
+		[Object.assign(new Error("unauthorized"), { status: 401 }), false, "401 status"],
+		[Object.assign(new Error("bad request"), { statusCode: 400 }), false, "400 statusCode"],
+		[Object.assign(new Error("payload too large"), { status: 413 }), false, "413 status"],
+		[new Error("rate limit exceeded"), true, "message: rate limit"],
+		[new Error("Request timed out"), true, "message: timed out"],
+		[new Error("fetch failed"), true, "message: undici fetch failed"],
+		[new Error("socket hang up"), true, "message: socket hang up"],
+		[Object.assign(new Error("boom"), { code: "ECONNRESET" }), true, "code ECONNRESET"],
+		[Object.assign(new Error("boom"), { code: "ABORT_ERR" }), false, "code ABORT_ERR"],
+		[Object.assign(new Error("aborted"), { name: "AbortError" }), false, "AbortError name"],
+		[new Error("invalid api key provided"), false, "non-transient message"],
+		["429 Too Many Requests", true, "string error form"],
+		[undefined, false, "undefined"],
+	];
+	for (const [err, expected, name] of cases) {
+		it(`${name} → ${expected}`, () => {
+			assert.equal(isTransientVisionError(err), expected);
+		});
+	}
+	it("isAbortError detects abort shapes only", () => {
+		assert.equal(isAbortError(Object.assign(new Error("x"), { name: "AbortError" })), true);
+		assert.equal(isAbortError(Object.assign(new Error("x"), { code: "ABORT_ERR" })), true);
+		assert.equal(isAbortError(new Error("x")), false);
+		assert.equal(isAbortError(undefined), false);
+	});
+});
+
+describe("1.16.0 retryDelayMs / sleepWithAbort", () => {
+	it("exponential backoff with jitter stays within bounds", () => {
+		for (let i = 0; i < 200; i++) {
+			const d0 = retryDelayMs(0);
+			assert.ok(d0 >= 1000 && d0 <= 1300, `attempt 0 out of bounds: ${d0}`);
+			const d1 = retryDelayMs(1);
+			assert.ok(d1 >= 2000 && d1 <= 2600, `attempt 1 out of bounds: ${d1}`);
+			const d5 = retryDelayMs(5);
+			assert.ok(d5 >= 8000 && d5 <= 10400, `attempt 5 (capped) out of bounds: ${d5}`);
+		}
+	});
+
+	it("sleepWithAbort resolves true after the delay", async () => {
+		const t0 = Date.now();
+		assert.equal(await sleepWithAbort(30), true);
+		assert.ok(Date.now() - t0 >= 25);
+	});
+
+	it("sleepWithAbort resolves false immediately on an already-aborted signal", async () => {
+		const ac = new AbortController();
+		ac.abort();
+		assert.equal(await sleepWithAbort(5000, ac.signal), false);
+	});
+
+	it("sleepWithAbort resolves false when the signal aborts mid-sleep", async () => {
+		const ac = new AbortController();
+		setTimeout(() => ac.abort(), 20);
+		assert.equal(await sleepWithAbort(5000, ac.signal), false);
+	});
+});
+
+describe("1.16.0 downscaleTargetDim", () => {
+	const cfg = { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 };
+
+	it("null when small enough", () => {
+		assert.equal(downscaleTargetDim({ width: 1024, height: 768 }, 1000, cfg), null);
+	});
+
+	it("target when a dimension exceeds the limit", () => {
+		assert.equal(downscaleTargetDim({ width: 4000, height: 1000 }, 1000, cfg), 2048);
+		assert.equal(downscaleTargetDim({ width: 1000, height: 4000 }, 1000, cfg), 2048);
+	});
+
+	it("target when bytes exceed the budget even with small dims", () => {
+		assert.equal(downscaleTargetDim({ width: 800, height: 600 }, 6 * 1024 * 1024, cfg), 2048);
+	});
+
+	it("target when dims unknown and bytes over budget", () => {
+		assert.equal(downscaleTargetDim(undefined, 6 * 1024 * 1024, cfg), 2048);
+	});
+
+	it("null when dims unknown and bytes under budget", () => {
+		assert.equal(downscaleTargetDim(undefined, 1000, cfg), null);
+	});
+});
+
+describe("1.16.0 downscaleForUpload (integration)", () => {
+	it("downscales an oversized image to the configured long edge as JPEG", async () => {
+		const { Image } = await import("imagescript");
+		const big = Buffer.from(await new Image(3000, 200).encode(1));
+		const img = bufferToPiAiImage(big, "image/png");
+		const out = await downscaleForUpload(img, { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 });
+		assert.equal(out.mimeType, "image/jpeg");
+		const dims = extractDimensions(piAiImageToBuffer(out));
+		assert.equal(dims?.width, 2048);
+		assert.equal(dims?.height, 137);
+	});
+
+	it("keeps small images byte-identical (same object)", async () => {
+		const { Image } = await import("imagescript");
+		const small = bufferToPiAiImage(Buffer.from(await new Image(100, 100).encode(1)), "image/png");
+		const out = await downscaleForUpload(small, { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 });
+		assert.equal(out, small);
 	});
 });

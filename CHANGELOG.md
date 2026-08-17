@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.16.0] - 2026-08-17
+
+### Added
+
+- **Transient-error retry with backoff for all vision calls** (borrowed from a survey of atlas-vision-mcp). `completeCompat` call sites (auto-proxy, analyze_image tool, joint comparison, describe command, tool-result describe, video/audio) now go through a `completeVision` wrapper that retries transient failures — 429, 5xx, network errors (ECONNRESET/ETIMEDOUT/fetch failed/…) — up to `retryMax` times (default 2, range 0–5) with exponential backoff + jitter (1s·2^attempt capped at 8s, 0–30% jitter), abort-aware (a user cancel stops retries immediately, never fails over). Hard errors (401/403/413/…) and aborts are never retried. New tested pure helpers: `isTransientVisionError`, `isAbortError`, `retryDelayMs`, `sleepWithAbort`.
+- **Upload downscale for oversized images.** Images above the configured long-edge (default 2048 px) or byte budget (default 5 MB raw) are downscaled locally before upload — reusing the terminable ImageScript worker infrastructure (the crop worker now serves a `resize` op too, pooling and hard timeouts unchanged) — and re-encoded as JPEG q88. Dimension-triggered resizes are accepted even when the re-encode grows slightly (flat PNGs compress better than JPEG); byte-budget-triggered resizes only apply when the result is genuinely smaller. Description hashing, caching, and session recall still key on the ORIGINAL bytes — only the upload payload shrinks. New tested pure helper: `downscaleTargetDim`; new integration-tested helpers: `downscaleImage`, `downscaleForUpload`.
+- **Configurable fallback vision model.** When the primary vision model exhausts its retries (or hard-fails), the call re-runs once with `fallbackProvider/fallbackModelId` — only when it resolves in the registry, supports the required input kind (image, or video for the video pipeline), has an API key, and **its provider has data-egress consent** (a non-consented fallback is skipped silently; configuring one now prints a consent hint). Both fallback halves are validated together by `sanitize` (canonicalized provider, pattern-checked). Set via `/multimodal-proxy fallback-model provider/model-id|clear` (also in the interactive menu) or `PI_VISION_PROXY_FALLBACK_MODEL` (`none`/`off` clears).
+- **New commands**: `/multimodal-proxy retry <0-5>`, `/multimodal-proxy max-upload <dim|n mb|off>`, `/multimodal-proxy fallback-model <provider/model-id>|clear` — all reflected in the status summary, the interactive config menu, and the no-UI command list; all lockable via env (`PI_VISION_PROXY_RETRY_MAX`, `PI_VISION_PROXY_MAX_UPLOAD_DIM`, `PI_VISION_PROXY_MAX_UPLOAD_MB`, `PI_VISION_PROXY_FALLBACK_MODEL`).
+
 ## [1.15.0] - 2026-08-11
 
 ### Added
