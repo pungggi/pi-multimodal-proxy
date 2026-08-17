@@ -13,7 +13,7 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 Reliability features borrowed from a survey of [atlas-vision-mcp](https://github.com/QuangThai/vision-bridge-mcp) (ideas worth stealing, implementation our own):
 
 - **Transient-error retry with backoff** — vision calls that fail with rate limits (429), transient server errors (5xx), or network hiccups are retried up to a configurable number of times (default 2) with exponential backoff + jitter (1s → 2s → 4s, capped at 8s, ±30% jitter). User aborts and hard errors (401/403/413…) are never retried. Configure with `/multimodal-proxy retry <0-5>` or `PI_VISION_PROXY_RETRY_MAX`.
-- **Downscale oversized uploads before sending** — images larger than 2048 px on the long edge or 5 MB raw bytes are downscaled locally (ImageScript, JPEG q88, off-thread in the same terminable worker as cropping) before upload, protecting against provider payload limits and token waste. Hashes, caching, and session recall still key on the original bytes. Configure with `/multimodal-proxy max-upload <dim|n mb|off>` or `PI_VISION_PROXY_MAX_UPLOAD_DIM` / `PI_VISION_PROXY_MAX_UPLOAD_MB`.
+- **Downscale oversized uploads before sending** — images larger than 2048 px on the long edge or 5 MB raw bytes are downscaled locally (ImageScript, JPEG q88, off-thread in the same terminable worker as cropping) before upload, protecting against provider payload limits and token waste. Hashes, caching, and session recall still key on the original bytes. Configure with `/multimodal-proxy max-upload <dim|n mb|off>` or `PI_VISION_PROXY_MAX_UPLOAD_DIM` (`0` disables entirely) / `PI_VISION_PROXY_MAX_UPLOAD_MB`.
 - **Fallback vision model** — when the primary vision model fails after retries (or hard-fails, e.g. quota exhausted), the call re-runs once with a configured fallback model. The fallback only ever runs when it resolves in the registry, supports the input kind, has an API key, **and its provider has data-egress consent** — failure handling can never bypass the consent gate. Configure with `/multimodal-proxy fallback-model <provider/model-id>|clear` or `PI_VISION_PROXY_FALLBACK_MODEL`.
 
 ## What's new in 1.12.1
@@ -172,7 +172,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_MAX_VIDEO_BYTES` | positive integer | `209715200` (200 MB) |
 | `PI_VISION_PROXY_ALLOWED_PROVIDERS` | comma-separated provider ids pre-consented for data egress (e.g. `anthropic,openai`); set empty to disable a persisted list for this shell/project | not set |
 | `PI_VISION_PROXY_RETRY_MAX` | 0–5 retries on transient vision errors (429/5xx/network) | `2` |
-| `PI_VISION_PROXY_MAX_UPLOAD_DIM` | 512–8192 px long-edge downscale threshold | `2048` |
+| `PI_VISION_PROXY_MAX_UPLOAD_DIM` | `0` (disable downscaling entirely), or 512–8192 px long-edge threshold | `2048` |
 | `PI_VISION_PROXY_MAX_UPLOAD_MB` | 0.5–20 upload byte budget before downscale | `5` |
 | `PI_VISION_PROXY_FALLBACK_MODEL` | `provider/model-id`, or `none`/`off` to clear | not set |
 | `PI_VISION_PROXY_STATUS_LINE` | `on`, `off` | `on` |

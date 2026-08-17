@@ -173,8 +173,19 @@ async function completeVision(
 	};
 
 	let lastErr: unknown;
+	let fallbackTried = false;
 	for (let candIdx = 0; ; candIdx++) {
-		const candidate = candIdx === 0 ? primary : await resolveFallback();
+		let candidate: VisionCandidate | null;
+		if (candIdx === 0) {
+			candidate = primary;
+		} else if (fallbackTried) {
+			// The fallback gets exactly one round — re-resolving it after failure
+			// would retry the same model forever (review: infinite loop).
+			candidate = null;
+		} else {
+			fallbackTried = true;
+			candidate = await resolveFallback();
+		}
 		if (!candidate) break;
 		if (candIdx > 0) {
 			ctx.ui.notify(
@@ -189,11 +200,15 @@ async function completeVision(
 				return { response, usedFallback: candIdx > 0 };
 			} catch (err) {
 				lastErr = err;
-				if (isAbortError(err) || options.signal?.aborted) throw err;
+				if (isAbortError(err)) throw err;
+				// A cancel racing a provider failure must still surface as cancellation —
+				// not as the last transient error (review: error misclassification).
+				if (options.signal?.aborted) throw createAbortError();
 				if (!isTransientVisionError(err)) break; // hard error → try the next candidate
 				if (attempt + 1 < attempts) {
 					const slept = await sleepWithAbort(retryDelayMs(attempt), options.signal);
-					if (!slept) throw err;
+					// Abort during the backoff sleep → cancel, not the transient error.
+					if (!slept) throw createAbortError();
 				}
 			}
 		}
@@ -329,6 +344,7 @@ import {
 	RECALL_HINT,
 	UNTRUSTED_MEDIA_WARNING,
 	DEFAULT_VIDEO_SYSTEM_PROMPT,
+	createAbortError,
 	downscaleForUpload,
 	isAbortError,
 	isTransientVisionError,
@@ -655,7 +671,7 @@ function parseMaxUploadValue(
 ): { ok: true; patch: Partial<VisionConfig>; label: string } | { ok: false } {
 	const trimmed = raw.trim();
 	if (trimmed.toLowerCase() === "off") {
-		return { ok: true, patch: { maxUploadDim: 8192, maxUploadBytes: 20 * 1024 * 1024 }, label: "off (8192px / 20MB)" };
+		return { ok: true, patch: { maxUploadDim: 0, maxUploadBytes: 20 * 1024 * 1024 }, label: "off (no downscale)" };
 	}
 	const mb = /^(\d+(?:\.\d+)?)\s*mb$/i.exec(trimmed);
 	if (mb) {

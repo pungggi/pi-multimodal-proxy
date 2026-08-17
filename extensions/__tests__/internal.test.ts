@@ -96,6 +96,7 @@ import {
 	formatProgressStatus,
 	SPINNER_FRAMES,
 	RECALL_HINT,
+	createAbortError,
 	downscaleForUpload,
 	downscaleTargetDim,
 	isAbortError,
@@ -3272,5 +3273,60 @@ describe("1.16.0 downscaleForUpload (integration)", () => {
 		const small = bufferToPiAiImage(Buffer.from(await new Image(100, 100).encode(1)), "image/png");
 		const out = await downscaleForUpload(small, { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 });
 		assert.equal(out, small);
+	});
+});
+
+describe("1.16.0 review fixes (PR #27)", () => {
+	it("createAbortError is abort-shaped with the exact 'aborted' message", () => {
+		const err = createAbortError();
+		assert.equal(err.name, "AbortError");
+		assert.equal(err.message, "aborted");
+		assert.equal(isAbortError(err), true);
+	});
+
+	it("maxUploadDim 0 disables downscaleTargetDim entirely (incl. byte trigger)", () => {
+		const cfg = { maxUploadDim: 0, maxUploadBytes: 5 * 1024 * 1024 };
+		assert.equal(downscaleTargetDim({ width: 9000, height: 200 }, 1000, cfg), null);
+		assert.equal(downscaleTargetDim({ width: 800, height: 600 }, 6 * 1024 * 1024, cfg), null);
+		assert.equal(downscaleTargetDim(undefined, 100 * 1024 * 1024, cfg), null);
+	});
+
+	it("maxUploadDim 0 disables downscaleForUpload (oversized image passes through)", async () => {
+		const { Image } = await import("imagescript");
+		const big = bufferToPiAiImage(Buffer.from(await new Image(3000, 200).encode(1)), "image/png");
+		const out = await downscaleForUpload(big, { maxUploadDim: 0, maxUploadBytes: 5 * 1024 * 1024 });
+		assert.equal(out, big); // same object — no transformation at all
+	});
+
+	it("sanitize keeps maxUploadDim 0 and still rejects other sub-512 values", () => {
+		const off = sanitize({ ...DEFAULT_CONFIG, maxUploadDim: 0 });
+		assert.equal(off.maxUploadDim, 0);
+		const bad = sanitize({ ...DEFAULT_CONFIG, maxUploadDim: 10 });
+		assert.equal(bad.maxUploadDim, DEFAULT_CONFIG.maxUploadDim);
+	});
+
+	it("readEnvOverrides accepts PI_VISION_PROXY_MAX_UPLOAD_DIM=0 (disable)", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "0" }).maxUploadDim, 0);
+	});
+
+	it("envFlags: invalid values no longer lock their commands", () => {
+		assert.equal(envFlags({ PI_VISION_PROXY_RETRY_MAX: "9" }).retryMax, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_RETRY_MAX: "3" }).retryMax, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "100" }).maxUpload, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "4096" }).maxUpload, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_MAX_UPLOAD_DIM: "0" }).maxUpload, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_MAX_UPLOAD_MB: "0.2" }).maxUpload, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_MAX_UPLOAD_MB: "6" }).maxUpload, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_FALLBACK_MODEL: "junk" }).fallbackModel, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_FALLBACK_MODEL: "none" }).fallbackModel, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_FALLBACK_MODEL: "openai/gpt-5-mini" }).fallbackModel, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_FALLBACK_MODEL: "" }).fallbackModel, true);
+	});
+
+	it("shared env parsers: dim 0 and clear sentinel round-trip", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_RETRY_MAX: "9" }).retryMax, undefined);
+		const fb = readEnvOverrides({ PI_VISION_PROXY_FALLBACK_MODEL: "x-ai/grok-4.3" });
+		assert.equal(fb.fallbackProvider, "xai");
+		assert.equal(fb.fallbackModelId, "grok-4.3");
 	});
 });

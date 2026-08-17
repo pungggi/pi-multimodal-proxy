@@ -827,6 +827,50 @@ export function parseAllowHomeEnv(raw: string | undefined): boolean | undefined 
 	return undefined;
 }
 
+// ── 1.16.0 reliability env parsers ──────────────────────────────────────────
+// Shared by readEnvOverrides (apply) and envFlags (presence), so an invalid
+// value can never lock its command without producing an effective override.
+
+/** Retry budget 0..5; anything else is no override. */
+export function parseRetryMaxEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 && n <= 5 ? n : undefined;
+}
+
+/**
+ * Upload long-edge threshold: 0 (downscaling disabled entirely), or
+ * 512..8192 px; anything else is no override.
+ */
+export function parseUploadDimEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && (n === 0 || (n >= 512 && n <= 8192)) ? n : undefined;
+}
+
+/** Upload byte budget 0.5..20 MB → bytes; anything else is no override. */
+export function parseUploadMbEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = parseFloat(raw);
+	return Number.isFinite(n) && n >= 0.5 && n <= 20 ? Math.round(n * 1024 * 1024) : undefined;
+}
+
+/**
+ * Fallback vision model: a clear sentinel ("", "none", "off"), a valid
+ * provider/model-id, or no override.
+ */
+export function parseFallbackModelEnv(
+	raw: string | undefined,
+): { provider: string; modelId: string; clear?: false } | { clear: true } | undefined {
+	if (raw === undefined) return undefined;
+	const trimmed = raw.trim();
+	if (trimmed === "" || trimmed.toLowerCase() === "none" || trimmed.toLowerCase() === "off") {
+		return { clear: true };
+	}
+	const parsed = parseModelString(trimmed);
+	return parsed ? { provider: parsed.provider, modelId: parsed.modelId } : undefined;
+}
+
 export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<VisionConfig> {
 	const overrides: Partial<VisionConfig> = {};
 	const modeEnv = env.PI_VISION_PROXY_MODE;
@@ -903,34 +947,23 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 	if (cookiesEnv !== undefined) overrides.ytdlpCookiesFromBrowser = sanitizeYtdlpCookiesFromBrowser(cookiesEnv);
 	const extractorArgsEnv = env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS;
 	if (extractorArgsEnv !== undefined) overrides.ytdlpExtractorArgs = sanitizeYtdlpExtractorArgs(extractorArgsEnv);
-	// 1.16.0 reliability env overrides
-	const retryEnv = env.PI_VISION_PROXY_RETRY_MAX;
-	if (retryEnv) {
-		const n = Number.parseInt(retryEnv, 10);
-		if (Number.isFinite(n) && n >= 0 && n <= 5) overrides.retryMax = n;
-	}
-	const uploadDimEnv = env.PI_VISION_PROXY_MAX_UPLOAD_DIM;
-	if (uploadDimEnv) {
-		const n = Number.parseInt(uploadDimEnv, 10);
-		if (Number.isFinite(n) && n >= 512 && n <= 8192) overrides.maxUploadDim = n;
-	}
-	const uploadMbEnv = env.PI_VISION_PROXY_MAX_UPLOAD_MB;
-	if (uploadMbEnv) {
-		const n = parseFloat(uploadMbEnv);
-		if (Number.isFinite(n) && n >= 0.5 && n <= 20) overrides.maxUploadBytes = Math.round(n * 1024 * 1024);
-	}
-	const fallbackModelEnv = env.PI_VISION_PROXY_FALLBACK_MODEL;
-	if (fallbackModelEnv !== undefined) {
-		const trimmed = fallbackModelEnv.trim();
-		const cleared = trimmed === "" || trimmed.toLowerCase() === "none" || trimmed.toLowerCase() === "off";
-		const parsed = cleared ? null : parseModelString(trimmed);
-		if (cleared) {
+	// 1.16.0 reliability env overrides (shared parsers keep envFlags' presence
+	// detection consistent with what actually applies here)
+	const retryEnv = parseRetryMaxEnv(env.PI_VISION_PROXY_RETRY_MAX);
+	if (retryEnv !== undefined) overrides.retryMax = retryEnv;
+	const uploadDimEnv = parseUploadDimEnv(env.PI_VISION_PROXY_MAX_UPLOAD_DIM);
+	if (uploadDimEnv !== undefined) overrides.maxUploadDim = uploadDimEnv;
+	const uploadMbEnv = parseUploadMbEnv(env.PI_VISION_PROXY_MAX_UPLOAD_MB);
+	if (uploadMbEnv !== undefined) overrides.maxUploadBytes = uploadMbEnv;
+	const fallbackModelEnv = parseFallbackModelEnv(env.PI_VISION_PROXY_FALLBACK_MODEL);
+	if (fallbackModelEnv) {
+		if (fallbackModelEnv.clear) {
 			// Undefined values delete the keys when spread over defaults.
 			overrides.fallbackProvider = undefined;
 			overrides.fallbackModelId = undefined;
-		} else if (parsed) {
-			overrides.fallbackProvider = parsed.provider;
-			overrides.fallbackModelId = parsed.modelId;
+		} else {
+			overrides.fallbackProvider = fallbackModelEnv.provider;
+			overrides.fallbackModelId = fallbackModelEnv.modelId;
 		}
 	}
 	return overrides;
@@ -960,11 +993,11 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		ytdlpExtractorArgs: env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS !== undefined,
 		// 1.16.0 — only a value readEnvOverrides actually applies counts as an
 		// override; an invalid value must not lock the command.
-		retryMax: env.PI_VISION_PROXY_RETRY_MAX !== undefined,
+		retryMax: parseRetryMaxEnv(env.PI_VISION_PROXY_RETRY_MAX) !== undefined,
 		maxUpload:
-			env.PI_VISION_PROXY_MAX_UPLOAD_DIM !== undefined ||
-			env.PI_VISION_PROXY_MAX_UPLOAD_MB !== undefined,
-		fallbackModel: env.PI_VISION_PROXY_FALLBACK_MODEL !== undefined,
+			parseUploadDimEnv(env.PI_VISION_PROXY_MAX_UPLOAD_DIM) !== undefined ||
+			parseUploadMbEnv(env.PI_VISION_PROXY_MAX_UPLOAD_MB) !== undefined,
+		fallbackModel: parseFallbackModelEnv(env.PI_VISION_PROXY_FALLBACK_MODEL) !== undefined,
 	};
 }
 
@@ -1182,7 +1215,12 @@ export function sanitize(config: VisionConfig): VisionConfig {
 		safe.retryMax = DEFAULT_CONFIG.retryMax;
 	}
 	safe.retryMax = Math.round(safe.retryMax);
-	if (!Number.isFinite(safe.maxUploadDim) || safe.maxUploadDim < 512 || safe.maxUploadDim > 8192) {
+	// maxUploadDim 0 = upload downscaling disabled entirely (review: "off"
+	// previously clamped to 8192 px and still transformed oversized uploads).
+	if (
+		!Number.isFinite(safe.maxUploadDim) ||
+		!(safe.maxUploadDim === 0 || (safe.maxUploadDim >= 512 && safe.maxUploadDim <= 8192))
+	) {
 		safe.maxUploadDim = DEFAULT_CONFIG.maxUploadDim;
 	}
 	safe.maxUploadDim = Math.round(safe.maxUploadDim);
@@ -1416,6 +1454,18 @@ export function isTransientVisionError(err: unknown): boolean {
 		return true;
 	}
 	return typeof e.message === "string" ? TRANSIENT_MESSAGE_RE.test(e.message) : false;
+}
+
+/**
+ * Construct an abort-shaped error (name "AbortError", message "aborted") so
+ * callers classify a mid-retry user cancel as cancellation — not as the last
+ * transient provider error. The message "aborted" matches the exact-string
+ * checks call sites already use for the cancelled path.
+ */
+export function createAbortError(): Error {
+	const err = new Error("aborted");
+	err.name = "AbortError";
+	return err;
 }
 
 /**
@@ -2665,6 +2715,8 @@ export function downscaleTargetDim(
 	byteLength: number,
 	config: Pick<VisionConfig, "maxUploadDim" | "maxUploadBytes">,
 ): number | null {
+	// 0 = downscaling disabled entirely (including the byte trigger).
+	if (config.maxUploadDim === 0) return null;
 	if (dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim)) {
 		return config.maxUploadDim;
 	}
@@ -2749,6 +2801,7 @@ export async function downscaleForUpload(
 	img: PiAiImage,
 	config: Pick<VisionConfig, "maxUploadDim" | "maxUploadBytes">,
 ): Promise<PiAiImage> {
+	if (config.maxUploadDim === 0) return img; // downscaling disabled
 	const buf = piAiImageToBuffer(img);
 	const dims = extractDimensions(buf);
 	const overDim = Boolean(dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim));
