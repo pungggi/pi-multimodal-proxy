@@ -85,6 +85,15 @@ export interface VisionConfig {
 	// "youtube:player_client=web_safari,web").
 	ytdlpCookiesFromBrowser: string;
 	ytdlpExtractorArgs: string;
+	// 1.16.0 — reliability (borrowed from atlas-vision-mcp): transient-error
+	// retry budget for vision calls, upload downscale thresholds, and an
+	// optional fallback vision model used when the primary fails after
+	// retries. Both fallback halves must be set together or neither.
+	retryMax: number;
+	maxUploadDim: number;
+	maxUploadBytes: number;
+	fallbackProvider?: string;
+	fallbackModelId?: string;
 }
 
 export interface ImageMeta {
@@ -712,6 +721,12 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	},
 	ytdlpCookiesFromBrowser: "",
 	ytdlpExtractorArgs: "",
+	// 1.16.0 reliability defaults: 2 retries with exponential backoff+jitter;
+	// downscale uploads larger than 2048px on the long edge or 5 MB raw bytes
+	// (base64 inflates ~4/3, so 5 MB ≈ 6.7 MB payload — within provider limits).
+	retryMax: 2,
+	maxUploadDim: 2048,
+	maxUploadBytes: 5 * 1024 * 1024,
 };
 
 // ── Persistent file storage ────────────────────────────────────────────────
@@ -739,6 +754,11 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"pathDetection",
 	"ytdlpCookiesFromBrowser",
 	"ytdlpExtractorArgs",
+	"retryMax",
+	"maxUploadDim",
+	"maxUploadBytes",
+	"fallbackProvider",
+	"fallbackModelId",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -805,6 +825,50 @@ export function parseAllowHomeEnv(raw: string | undefined): boolean | undefined 
 	if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
 	if (v === "0" || v === "false" || v === "no" || v === "off") return false;
 	return undefined;
+}
+
+// ── 1.16.0 reliability env parsers ──────────────────────────────────────────
+// Shared by readEnvOverrides (apply) and envFlags (presence), so an invalid
+// value can never lock its command without producing an effective override.
+
+/** Retry budget 0..5; anything else is no override. */
+export function parseRetryMaxEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 && n <= 5 ? n : undefined;
+}
+
+/**
+ * Upload long-edge threshold: 0 (downscaling disabled entirely), or
+ * 512..8192 px; anything else is no override.
+ */
+export function parseUploadDimEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && (n === 0 || (n >= 512 && n <= 8192)) ? n : undefined;
+}
+
+/** Upload byte budget 0.5..20 MB → bytes; anything else is no override. */
+export function parseUploadMbEnv(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	const n = parseFloat(raw);
+	return Number.isFinite(n) && n >= 0.5 && n <= 20 ? Math.round(n * 1024 * 1024) : undefined;
+}
+
+/**
+ * Fallback vision model: a clear sentinel ("", "none", "off"), a valid
+ * provider/model-id, or no override.
+ */
+export function parseFallbackModelEnv(
+	raw: string | undefined,
+): { provider: string; modelId: string; clear?: false } | { clear: true } | undefined {
+	if (raw === undefined) return undefined;
+	const trimmed = raw.trim();
+	if (trimmed === "" || trimmed.toLowerCase() === "none" || trimmed.toLowerCase() === "off") {
+		return { clear: true };
+	}
+	const parsed = parseModelString(trimmed);
+	return parsed ? { provider: parsed.provider, modelId: parsed.modelId } : undefined;
 }
 
 export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<VisionConfig> {
@@ -883,10 +947,29 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 	if (cookiesEnv !== undefined) overrides.ytdlpCookiesFromBrowser = sanitizeYtdlpCookiesFromBrowser(cookiesEnv);
 	const extractorArgsEnv = env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS;
 	if (extractorArgsEnv !== undefined) overrides.ytdlpExtractorArgs = sanitizeYtdlpExtractorArgs(extractorArgsEnv);
+	// 1.16.0 reliability env overrides (shared parsers keep envFlags' presence
+	// detection consistent with what actually applies here)
+	const retryEnv = parseRetryMaxEnv(env.PI_VISION_PROXY_RETRY_MAX);
+	if (retryEnv !== undefined) overrides.retryMax = retryEnv;
+	const uploadDimEnv = parseUploadDimEnv(env.PI_VISION_PROXY_MAX_UPLOAD_DIM);
+	if (uploadDimEnv !== undefined) overrides.maxUploadDim = uploadDimEnv;
+	const uploadMbEnv = parseUploadMbEnv(env.PI_VISION_PROXY_MAX_UPLOAD_MB);
+	if (uploadMbEnv !== undefined) overrides.maxUploadBytes = uploadMbEnv;
+	const fallbackModelEnv = parseFallbackModelEnv(env.PI_VISION_PROXY_FALLBACK_MODEL);
+	if (fallbackModelEnv) {
+		if (fallbackModelEnv.clear) {
+			// Undefined values delete the keys when spread over defaults.
+			overrides.fallbackProvider = undefined;
+			overrides.fallbackModelId = undefined;
+		} else {
+			overrides.fallbackProvider = fallbackModelEnv.provider;
+			overrides.fallbackModelId = fallbackModelEnv.modelId;
+		}
+	}
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -908,6 +991,13 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		pathDetection: env.PI_VISION_PROXY_PATH_DETECTION === "on" || env.PI_VISION_PROXY_PATH_DETECTION === "off",
 		ytdlpCookies: env.PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER !== undefined,
 		ytdlpExtractorArgs: env.PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS !== undefined,
+		// 1.16.0 — only a value readEnvOverrides actually applies counts as an
+		// override; an invalid value must not lock the command.
+		retryMax: parseRetryMaxEnv(env.PI_VISION_PROXY_RETRY_MAX) !== undefined,
+		maxUpload:
+			parseUploadDimEnv(env.PI_VISION_PROXY_MAX_UPLOAD_DIM) !== undefined ||
+			parseUploadMbEnv(env.PI_VISION_PROXY_MAX_UPLOAD_MB) !== undefined,
+		fallbackModel: parseFallbackModelEnv(env.PI_VISION_PROXY_FALLBACK_MODEL) !== undefined,
 	};
 }
 
@@ -1120,6 +1210,40 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	// 1.12.1 yt-dlp tuning fields
 	safe.ytdlpCookiesFromBrowser = sanitizeYtdlpCookiesFromBrowser(safe.ytdlpCookiesFromBrowser);
 	safe.ytdlpExtractorArgs = sanitizeYtdlpExtractorArgs(safe.ytdlpExtractorArgs);
+	// 1.16.0 reliability fields
+	if (!Number.isFinite(safe.retryMax) || safe.retryMax < 0 || safe.retryMax > 5) {
+		safe.retryMax = DEFAULT_CONFIG.retryMax;
+	}
+	safe.retryMax = Math.round(safe.retryMax);
+	// maxUploadDim 0 = upload downscaling disabled entirely (review: "off"
+	// previously clamped to 8192 px and still transformed oversized uploads).
+	if (
+		!Number.isFinite(safe.maxUploadDim) ||
+		!(safe.maxUploadDim === 0 || (safe.maxUploadDim >= 512 && safe.maxUploadDim <= 8192))
+	) {
+		safe.maxUploadDim = DEFAULT_CONFIG.maxUploadDim;
+	}
+	safe.maxUploadDim = Math.round(safe.maxUploadDim);
+	if (
+		!Number.isFinite(safe.maxUploadBytes) ||
+		safe.maxUploadBytes < 512 * 1024 ||
+		safe.maxUploadBytes > 20 * 1024 * 1024
+	) {
+		safe.maxUploadBytes = DEFAULT_CONFIG.maxUploadBytes;
+	}
+	safe.maxUploadBytes = Math.round(safe.maxUploadBytes);
+	// Fallback model: canonicalize, validate, and require both halves together.
+	// Both halves must be real strings before the pattern checks — RegExp.test()
+	// coerces its argument, so a numeric modelId (e.g. 123) could otherwise pass.
+	if (typeof safe.fallbackProvider !== "string") delete safe.fallbackProvider;
+	else safe.fallbackProvider = canonicalProvider(safe.fallbackProvider);
+	if (typeof safe.fallbackModelId !== "string") delete safe.fallbackModelId;
+	if (safe.fallbackProvider !== undefined && !PROVIDER_PATTERN.test(safe.fallbackProvider)) delete safe.fallbackProvider;
+	if (safe.fallbackModelId !== undefined && !MODEL_ID_PATTERN.test(safe.fallbackModelId)) delete safe.fallbackModelId;
+	if (!safe.fallbackProvider || !safe.fallbackModelId) {
+		delete safe.fallbackProvider;
+		delete safe.fallbackModelId;
+	}
 	return safe;
 }
 
@@ -1287,6 +1411,100 @@ export function hasConsent(
 	if (allowedProviders?.includes("*")) return true;
 	// Otherwise, check if the specific provider is listed.
 	return Boolean(provider && allowedProviders?.includes(canonicalProvider(provider)));
+}
+
+// ── Vision-call retry & backoff (1.16.0) ───────────────────────────────────
+
+/** HTTP statuses worth retrying (rate limit + transient server/network). */
+const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/** Statuses that retrying can never fix — fall through to the next model. */
+const NON_TRANSIENT_STATUSES = new Set([400, 401, 403, 404, 405, 413, 422]);
+
+/**
+ * Message patterns of transient provider/network failures. Written against
+ * common pi-ai / undici error text; the status-code checks above take priority
+ * when the error carries one.
+ */
+const TRANSIENT_MESSAGE_RE =
+	/\b(429|too many requests|rate[ _-]?limit|overloaded|econnreset|econnrefused|etimedout|econnaborted|enotfound|eai_again|epipe|enotfound|timeout|timed out|fetch failed|network error|socket hang up|internal server error|bad gateway|service unavailable|gateway timeout)\b/i;
+
+/** Node/DOM abort signals — never retried, never failed over. */
+export function isAbortError(err: unknown): boolean {
+	if (!err || typeof err !== "object") return false;
+	const e = err as { name?: unknown; code?: unknown };
+	return e.name === "AbortError" || e.code === "ABORT_ERR";
+}
+
+/**
+ * Whether a vision-call failure is worth retrying: rate limits, transient 5xx,
+ * and network hiccups qualify; auth/permission/payload errors and user aborts
+ * do not. Defensive about error shape — providers throw plain Errors,
+ * status-carrying API errors, undici TypeErrors, and occasionally strings.
+ */
+export function isTransientVisionError(err: unknown): boolean {
+	if (!err) return false;
+	if (typeof err === "string") return TRANSIENT_MESSAGE_RE.test(err);
+	if (isAbortError(err)) return false;
+	const e = err as { status?: unknown; statusCode?: unknown; code?: unknown; message?: unknown };
+	for (const key of ["status", "statusCode"] as const) {
+		const v = e[key];
+		if (typeof v === "number" && Number.isFinite(v)) {
+			if (TRANSIENT_STATUSES.has(v)) return true;
+			if (NON_TRANSIENT_STATUSES.has(v)) return false;
+		}
+	}
+	if (typeof e.code === "string" && /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ECONNABORTED|ENOTFOUND|EAI_AGAIN|EPIPE|ENETUNREACH|EHOSTUNREACH)$/.test(e.code)) {
+		return true;
+	}
+	return typeof e.message === "string" ? TRANSIENT_MESSAGE_RE.test(e.message) : false;
+}
+
+/**
+ * Construct an abort-shaped error (name "AbortError", message "aborted") so
+ * callers classify a mid-retry user cancel as cancellation — not as the last
+ * transient provider error. The message "aborted" matches the exact-string
+ * checks call sites already use for the cancelled path.
+ */
+export function createAbortError(): Error {
+	const err = new Error("aborted");
+	err.name = "AbortError";
+	return err;
+}
+
+/**
+ * Backoff delay before retry attempt N (0-based): exponential 1s·2^N capped
+ * at 8s, plus 0–30% jitter to de-synchronize parallel image calls.
+ */
+export function retryDelayMs(attempt: number): number {
+	const base = Math.min(1000 * 2 ** attempt, 8000);
+	return Math.round(base + Math.random() * 0.3 * base);
+}
+
+/**
+ * Sleep for ms, resolving early with false when the signal aborts. Never
+ * rejects; callers treat a false result as cancellation.
+ */
+export function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<boolean> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) {
+			resolve(false);
+			return;
+		}
+		const onAbort = () => {
+			cleanup();
+			resolve(false);
+		};
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve(true);
+		}, ms);
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 // ── Image helpers ──────────────────────────────────────────────────────────
@@ -2243,12 +2461,21 @@ const CROP_WORKER_SRC = `
 const { parentPort, workerData } = require("worker_threads");
 const { Image } = require(workerData.imagescriptPath);
 parentPort.on("message", async (task) => {
-	const { bytes, crop, mimeType, maxDim } = task;
+	const { bytes, mimeType, maxDim } = task;
 	try {
 		const img = await Image.decode(new Uint8Array(bytes));
 		if (img.width > maxDim || img.height > maxDim) { parentPort.postMessage({ ok: false }); return; }
-		const cropped = img.crop(crop.x, crop.y, crop.width, crop.height);
-		const encoded = mimeType === "image/png" ? await cropped.encode(1) : await cropped.encodeJPEG(90);
+		let encoded;
+		if (task.op === "resize") {
+			const scale = Math.min(task.targetDim / img.width, task.targetDim / img.height, 1);
+			const w = Math.max(1, Math.round(img.width * scale));
+			const h = Math.max(1, Math.round(img.height * scale));
+			// Downscaled uploads are re-encoded as JPEG — the size reduction is the point.
+			encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(88);
+		} else {
+			const cropped = img.crop(task.crop.x, task.crop.y, task.crop.width, task.crop.height);
+			encoded = mimeType === "image/png" ? await cropped.encode(1) : await cropped.encodeJPEG(90);
+		}
 		const u8 = encoded instanceof Uint8Array ? encoded : new Uint8Array(encoded);
 		const out = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 		parentPort.postMessage({ ok: true, data: out }, [out]);
@@ -2350,10 +2577,15 @@ function releaseWorker(worker: NodeWorker): void {
 	});
 }
 
-/** Run one crop task on a worker with a hard timeout. `reusable` is false on timeout/error. */
+/** A crop or resize job for the decode worker (1.16.0 added the resize op). */
+type ImageWorkerTask =
+	| { op?: "crop"; bytes: ArrayBuffer; crop: ResolvedCrop; mimeType?: string; maxDim: number }
+	| { op: "resize"; bytes: ArrayBuffer; targetDim: number; mimeType?: string; maxDim: number };
+
+/** Run one crop/resize task on a worker with a hard timeout. `reusable` is false on timeout/error. */
 function runCropTask(
 	worker: NodeWorker,
-	task: { bytes: ArrayBuffer; crop: ResolvedCrop; mimeType?: string; maxDim: number },
+	task: ImageWorkerTask,
 	timeoutMs: number,
 ): Promise<{ result: Buffer | null; reusable: boolean }> {
 	return new Promise((resolve) => {
@@ -2407,7 +2639,7 @@ async function cropInWorker(
 
 	const { result, reusable } = await runCropTask(
 		worker,
-		{ bytes: ab, crop, mimeType, maxDim: MAX_IMAGE_DIMENSION },
+		{ op: "crop", bytes: ab, crop, mimeType, maxDim: MAX_IMAGE_DIMENSION },
 		timeoutMs,
 	);
 	if (reusable) releaseWorker(worker);
@@ -2473,6 +2705,124 @@ export function piAiImageToBuffer(img: PiAiImage): Buffer {
 export function bufferToPiAiImage(buf: Buffer, originalMimeType?: string): PiAiImage {
 	const mimeType = originalMimeType ?? "image/png";
 	return { type: "image", data: buf.toString("base64"), mimeType };
+}
+
+// ── Upload downscale (1.16.0) ───────────────────────────────────────────────
+
+/**
+ * Pure decision helper: whether an image exceeds the configured upload
+ * thresholds, and the long-edge bound to downscale to when it does. Returns
+ * null when the image is small enough to send as-is.
+ */
+export function downscaleTargetDim(
+	dims: { width: number; height: number } | undefined,
+	byteLength: number,
+	config: Pick<VisionConfig, "maxUploadDim" | "maxUploadBytes">,
+): number | null {
+	// 0 = downscaling disabled entirely (including the byte trigger).
+	if (config.maxUploadDim === 0) return null;
+	return overUploadDim(dims, config) || byteLength > config.maxUploadBytes ? config.maxUploadDim : null;
+}
+
+/**
+ * True when either edge exceeds the configured upload dimension. Shared by
+ * downscaleTargetDim and downscaleForUpload so the threshold decision cannot
+ * drift between them (CodeRabbit PR #27). 0 = disabled → always false.
+ */
+export function overUploadDim(
+	dims: { width: number; height: number } | undefined,
+	config: Pick<VisionConfig, "maxUploadDim">,
+): boolean {
+	if (config.maxUploadDim === 0) return false;
+	return Boolean(dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim));
+}
+
+/** In-thread decode → resize → JPEG encode, mirroring cropInThread. */
+async function resizeInThread(imageBytes: Buffer, targetDim: number): Promise<Buffer | null> {
+	const img = await decodeWithTimeout(imageBytes);
+	if (img.width > MAX_IMAGE_DIMENSION || img.height > MAX_IMAGE_DIMENSION) {
+		return null;
+	}
+	const scale = Math.min(targetDim / img.width, targetDim / img.height, 1);
+	const w = Math.max(1, Math.round(img.width * scale));
+	const h = Math.max(1, Math.round(img.height * scale));
+	const encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(88);
+	return Buffer.from(encoded);
+}
+
+/** Worker-path resize — same pooling/timeout guarantees as cropInWorker. */
+async function resizeInWorker(
+	imageBytes: Buffer,
+	targetDim: number,
+	timeoutMs: number,
+): Promise<Buffer | null | typeof WORKER_UNAVAILABLE> {
+	if (!(await ensureWorkerInfra())) return WORKER_UNAVAILABLE;
+
+	let worker: NodeWorker;
+	try {
+		worker = acquireWorker();
+	} catch {
+		return WORKER_UNAVAILABLE;
+	}
+
+	const ab = imageBytes.buffer.slice(imageBytes.byteOffset, imageBytes.byteOffset + imageBytes.byteLength);
+
+	const { result, reusable } = await runCropTask(
+		worker,
+		{ op: "resize", bytes: ab, targetDim, mimeType: "image/jpeg", maxDim: MAX_IMAGE_DIMENSION },
+		timeoutMs,
+	);
+	if (reusable) releaseWorker(worker);
+	else void worker.terminate();
+	return result;
+}
+
+/**
+ * Downscale image bytes so the long edge fits targetDim, re-encoding as
+ * JPEG q88. Returns null on decode/encode failure — callers then send the
+ * original bytes rather than failing the whole analysis.
+ */
+export async function downscaleImage(imageBytes: Buffer, targetDim: number): Promise<Buffer | null> {
+	try {
+		const dims = extractDimensions(imageBytes);
+		if (dims && (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION)) {
+			return null;
+		}
+		if (decodeWorkerEnabled()) {
+			const viaWorker = await resizeInWorker(imageBytes, targetDim, decodeTimeoutMs());
+			if (viaWorker !== WORKER_UNAVAILABLE) return viaWorker;
+			// else: worker infra unavailable — fall through to the in-thread path
+		}
+		return await resizeInThread(imageBytes, targetDim);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Downscale an image for upload when it exceeds the configured thresholds
+ * (1.16.0). Returns the original image untouched when it is small enough or
+ * when downscaling fails for any reason — upload downscale is best-effort
+ * cost/limit protection, never a hard failure.
+ *
+ * Dimension-triggered resizes are accepted even when the JPEG re-encode grows
+ * the payload slightly (flat-color PNGs compress better than JPEG) — the pixel
+ * reduction is what matters for provider dimension limits. Byte-budget-triggered
+ * resizes only pay off when the result is genuinely smaller.
+ */
+export async function downscaleForUpload(
+	img: PiAiImage,
+	config: Pick<VisionConfig, "maxUploadDim" | "maxUploadBytes">,
+): Promise<PiAiImage> {
+	if (config.maxUploadDim === 0) return img; // downscaling disabled
+	const buf = piAiImageToBuffer(img);
+	const dims = extractDimensions(buf);
+	const overDim = overUploadDim(dims, config);
+	if (downscaleTargetDim(dims, buf.byteLength, config) === null) return img;
+	const resized = await downscaleImage(buf, config.maxUploadDim);
+	if (!resized) return img;
+	if (!overDim && resized.byteLength >= buf.byteLength) return img;
+	return bufferToPiAiImage(resized, "image/jpeg");
 }
 
 // ── Perceptual hashing (imghash) ────────────────────────────────────────────

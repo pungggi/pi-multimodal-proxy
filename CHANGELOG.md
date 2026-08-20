@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.16.0] - 2026-08-17
+
+### Added
+
+- **Transient-error retry with backoff for all vision calls** (borrowed from a survey of atlas-vision-mcp). `completeCompat` call sites (auto-proxy, analyze_image tool, joint comparison, describe command, tool-result describe, video/audio) now go through a `completeVision` wrapper that retries transient failures — 429, 5xx, network errors (ECONNRESET/ETIMEDOUT/fetch failed/…) — up to `retryMax` times (default 2, range 0–5) with exponential backoff + jitter (1s·2^attempt capped at 8s, 0–30% jitter), abort-aware (a user cancel stops retries immediately, never fails over). Hard errors (401/403/413/…) and aborts are never retried. New tested pure helpers: `isTransientVisionError`, `isAbortError`, `retryDelayMs`, `sleepWithAbort`.
+- **Upload downscale for oversized images.** Images above the configured long-edge (default 2048 px) or byte budget (default 5 MB raw) are downscaled locally before upload — reusing the terminable ImageScript worker infrastructure (the crop worker now serves a `resize` op too, pooling and hard timeouts unchanged) — and re-encoded as JPEG q88. Dimension-triggered resizes are accepted even when the re-encode grows slightly (flat PNGs compress better than JPEG); byte-budget-triggered resizes only apply when the result is genuinely smaller. Description hashing, caching, and session recall still key on the ORIGINAL bytes — only the upload payload shrinks. New tested pure helper: `downscaleTargetDim`; new integration-tested helpers: `downscaleImage`, `downscaleForUpload`.
+- **Configurable fallback vision model.** When the primary vision model exhausts its retries (or hard-fails), the call re-runs once with `fallbackProvider/fallbackModelId` — only when it resolves in the registry, supports the required input kind (image, or video for the video pipeline), has an API key, and **its provider has data-egress consent** (a non-consented fallback is skipped silently; configuring one now prints a consent hint). Both fallback halves are validated together by `sanitize` (canonicalized provider, pattern-checked). Set via `/multimodal-proxy fallback-model provider/model-id|clear` (also in the interactive menu) or `PI_VISION_PROXY_FALLBACK_MODEL` (`none`/`off` clears).
+- **New commands**: `/multimodal-proxy retry <0-5>`, `/multimodal-proxy max-upload <dim|n mb|off>`, `/multimodal-proxy fallback-model <provider/model-id>|clear` — all reflected in the status summary, the interactive config menu, and the no-UI command list; all lockable via env (`PI_VISION_PROXY_RETRY_MAX`, `PI_VISION_PROXY_MAX_UPLOAD_DIM`, `PI_VISION_PROXY_MAX_UPLOAD_MB`, `PI_VISION_PROXY_FALLBACK_MODEL`).
+
+### Fixed (pre-release review, PR #27)
+
+- **Fallback model was retried forever.** `completeVision` re-resolved the same fallback candidate on every outer-loop iteration, so a failing fallback repeated its attempts, backoffs, and notifications indefinitely instead of being tried once. The fallback now gets exactly one round.
+- **Cancel during a backoff sleep surfaced the wrong error.** Aborting mid-retry threw the last transient provider error (e.g. a 429) instead of an abort-shaped error, so callers reported a vision failure rather than a user cancel. Cancels racing a provider failure are now normalized through the new tested helper `createAbortError()` (name `AbortError`, message `aborted` — matching call sites' cancelled-path checks).
+- **`max-upload off` didn't fully disable downscaling.** "off" previously clamped to 8192 px / 20 MB, so e.g. a 9000 px image was still resized and JPEG-re-encoded despite the opt-out. `maxUploadDim = 0` is now a true disable sentinel honored by `sanitize`, `downscaleTargetDim`, `downscaleForUpload`, the env parser (`PI_VISION_PROXY_MAX_UPLOAD_DIM=0`), and the command's "off" form.
+- **Invalid env values locked commands without overriding anything.** `PI_VISION_PROXY_RETRY_MAX=9`, an unparsable `PI_VISION_PROXY_MAX_UPLOAD_DIM`, or a malformed `PI_VISION_PROXY_FALLBACK_MODEL` made `envFlags` report an override (locking the matching `/multimodal-proxy` subcommand) while `readEnvOverrides` silently ignored the value. Parsing is now shared between the two (`parseRetryMaxEnv`, `parseUploadDimEnv`, `parseUploadMbEnv`, `parseFallbackModelEnv`), so only values that actually apply count as env overrides — matching the existing `statusLine`/`pathDetection` convention.
+
+- **Fallback-attributed telemetry (CodeRabbit round 2).** `completeVision` now also returns `usedProvider`/`usedModelId` of the candidate that actually answered; the `analyze_image` tool and `describe` telemetry entries record that model instead of always naming the primary, so fallback output is no longer misattributed.
+- **`sanitize` guards non-string fallback halves.** Both `fallbackProvider` and `fallbackModelId` must be real strings before canonicalization/pattern checks — `RegExp.test()` coerces its argument, so a numeric modelId could previously slip through.
+- **Shared `overUploadDim` helper.** `downscaleTargetDim` and `downscaleForUpload` now share one threshold decision so the two cannot drift; README jitter wording corrected (`±30%` → `0–30%`).
+
 ## [1.15.0] - 2026-08-11
 
 ### Added
