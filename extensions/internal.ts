@@ -1233,7 +1233,11 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	}
 	safe.maxUploadBytes = Math.round(safe.maxUploadBytes);
 	// Fallback model: canonicalize, validate, and require both halves together.
-	if (typeof safe.fallbackProvider === "string") safe.fallbackProvider = canonicalProvider(safe.fallbackProvider);
+	// Both halves must be real strings before the pattern checks — RegExp.test()
+	// coerces its argument, so a numeric modelId (e.g. 123) could otherwise pass.
+	if (typeof safe.fallbackProvider !== "string") delete safe.fallbackProvider;
+	else safe.fallbackProvider = canonicalProvider(safe.fallbackProvider);
+	if (typeof safe.fallbackModelId !== "string") delete safe.fallbackModelId;
 	if (safe.fallbackProvider !== undefined && !PROVIDER_PATTERN.test(safe.fallbackProvider)) delete safe.fallbackProvider;
 	if (safe.fallbackModelId !== undefined && !MODEL_ID_PATTERN.test(safe.fallbackModelId)) delete safe.fallbackModelId;
 	if (!safe.fallbackProvider || !safe.fallbackModelId) {
@@ -2717,11 +2721,20 @@ export function downscaleTargetDim(
 ): number | null {
 	// 0 = downscaling disabled entirely (including the byte trigger).
 	if (config.maxUploadDim === 0) return null;
-	if (dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim)) {
-		return config.maxUploadDim;
-	}
-	if (byteLength > config.maxUploadBytes) return config.maxUploadDim;
-	return null;
+	return overUploadDim(dims, config) || byteLength > config.maxUploadBytes ? config.maxUploadDim : null;
+}
+
+/**
+ * True when either edge exceeds the configured upload dimension. Shared by
+ * downscaleTargetDim and downscaleForUpload so the threshold decision cannot
+ * drift between them (CodeRabbit PR #27). 0 = disabled → always false.
+ */
+export function overUploadDim(
+	dims: { width: number; height: number } | undefined,
+	config: Pick<VisionConfig, "maxUploadDim">,
+): boolean {
+	if (config.maxUploadDim === 0) return false;
+	return Boolean(dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim));
 }
 
 /** In-thread decode → resize → JPEG encode, mirroring cropInThread. */
@@ -2804,9 +2817,8 @@ export async function downscaleForUpload(
 	if (config.maxUploadDim === 0) return img; // downscaling disabled
 	const buf = piAiImageToBuffer(img);
 	const dims = extractDimensions(buf);
-	const overDim = Boolean(dims && (dims.width > config.maxUploadDim || dims.height > config.maxUploadDim));
-	const overBytes = buf.byteLength > config.maxUploadBytes;
-	if (!overDim && !overBytes) return img;
+	const overDim = overUploadDim(dims, config);
+	if (downscaleTargetDim(dims, buf.byteLength, config) === null) return img;
 	const resized = await downscaleImage(buf, config.maxUploadDim);
 	if (!resized) return img;
 	if (!overDim && resized.byteLength >= buf.byteLength) return img;

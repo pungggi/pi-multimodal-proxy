@@ -140,7 +140,9 @@ function visionCandidate(
  *   its provider has data-egress consent. A consent-less fallback is skipped
  *   silently so failure handling can never bypass the consent gate.
  *
- * Returns the winning response plus whether the fallback produced it.
+ * Returns the winning response plus the provider/modelId that actually
+ * answered (usedFallback tells which candidate that was), so telemetry and
+ * fences attribute output to the model that produced it.
  */
 async function completeVision(
 	ctx: ExtensionContext,
@@ -151,7 +153,7 @@ async function completeVision(
 	options: VisionCallOptions,
 	fallbackInput: "image" | "video",
 	label: string,
-): Promise<{ response: AssistantMessage; usedFallback: boolean }> {
+): Promise<{ response: AssistantMessage; usedFallback: boolean; usedProvider: string; usedModelId: string }> {
 	const resolveFallback = async (): Promise<VisionCandidate | null> => {
 		if (!config.fallbackProvider || !config.fallbackModelId) return null;
 		if (primary.provider === config.fallbackProvider && primary.modelId === config.fallbackModelId) return null;
@@ -197,7 +199,7 @@ async function completeVision(
 		for (let attempt = 0; attempt < attempts; attempt++) {
 			try {
 				const response = await candidate.complete(options);
-				return { response, usedFallback: candIdx > 0 };
+				return { response, usedFallback: candIdx > 0, usedProvider: candidate.provider, usedModelId: candidate.modelId };
 			} catch (err) {
 				lastErr = err;
 				if (isAbortError(err)) throw err;
@@ -1695,7 +1697,7 @@ async function handleAnalyzeImage(
 
 	try {
 		const startTime = Date.now();
-		const { response } = await completeVision(
+		const { response, usedProvider, usedModelId } = await completeVision(
 			ctx,
 			config,
 			ctx.sessionManager.getEntries(),
@@ -1759,7 +1761,8 @@ async function handleAnalyzeImage(
 			cropApplied: anyCropApplied,
 			question: sanitizeForLog(question),
 			reason: reason ? sanitizeForLog(reason) : undefined,
-			model: `${visionProvider}/${visionModelId}`,
+			// Attribute the output to the model that actually answered (fallback-aware).
+			model: `${usedProvider}/${usedModelId}`,
 			latencyMs,
 			cacheHit: false,
 			groundingFormat,
@@ -3550,7 +3553,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 
 				try {
 					const startTime = Date.now();
-					const { response } = await completeVision(
+					const { response, usedProvider, usedModelId } = await completeVision(
 						ctx,
 						descConfig,
 						entries,
@@ -3611,7 +3614,8 @@ Use "*" or "all" to grant consent for all providers globally.`,
 						images: imagePayloads.map((p) => p.hash),
 						question: sanitizeForLog(question),
 						save: parsed.save,
-						model: `${descConfig.provider}/${descConfig.modelId}`,
+						// Attribute the output to the model that actually answered (fallback-aware).
+						model: `${usedProvider}/${usedModelId}`,
 						latencyMs,
 					});
 

@@ -98,6 +98,7 @@ import {
 	RECALL_HINT,
 	createAbortError,
 	downscaleForUpload,
+	overUploadDim,
 	downscaleTargetDim,
 	isAbortError,
 	isTransientVisionError,
@@ -3328,5 +3329,32 @@ describe("1.16.0 review fixes (PR #27)", () => {
 		const fb = readEnvOverrides({ PI_VISION_PROXY_FALLBACK_MODEL: "x-ai/grok-4.3" });
 		assert.equal(fb.fallbackProvider, "xai");
 		assert.equal(fb.fallbackModelId, "grok-4.3");
+	});
+});
+
+describe("CodeRabbit round-2 fixes (PR #27)", () => {
+	it("sanitize drops non-string fallback halves (RegExp coercion guard)", () => {
+		const num = sanitize({ ...DEFAULT_CONFIG, fallbackProvider: "openai", fallbackModelId: 123 as any });
+		assert.equal(num.fallbackProvider, undefined);
+		assert.equal(num.fallbackModelId, undefined);
+		const numProvider = sanitize({ ...DEFAULT_CONFIG, fallbackProvider: 42 as any, fallbackModelId: "grok-4.3" });
+		assert.equal(numProvider.fallbackProvider, undefined);
+		assert.equal(numProvider.fallbackModelId, undefined);
+	});
+
+	it("overUploadDim: truth table incl. disabled sentinel", () => {
+		const cfg = { maxUploadDim: 2048 };
+		assert.equal(overUploadDim({ width: 4096, height: 100 }, cfg), true);
+		assert.equal(overUploadDim({ width: 100, height: 4096 }, cfg), true);
+		assert.equal(overUploadDim({ width: 2048, height: 2048 }, cfg), false); // not strictly over
+		assert.equal(overUploadDim(undefined, cfg), false);
+		assert.equal(overUploadDim({ width: 9000, height: 100 }, { maxUploadDim: 0 }), false);
+	});
+
+	it("downscaleTargetDim stays consistent with overUploadDim after refactor", () => {
+		const cfg = { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 };
+		assert.equal(downscaleTargetDim({ width: 4096, height: 100 }, 100, cfg), 2048);
+		assert.equal(downscaleTargetDim({ width: 800, height: 600 }, 6 * 1024 * 1024, cfg), 2048);
+		assert.equal(downscaleTargetDim({ width: 800, height: 600 }, 100, cfg), null);
 	});
 });

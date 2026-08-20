@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`max-upload off` didn't fully disable downscaling.** "off" previously clamped to 8192 px / 20 MB, so e.g. a 9000 px image was still resized and JPEG-re-encoded despite the opt-out. `maxUploadDim = 0` is now a true disable sentinel honored by `sanitize`, `downscaleTargetDim`, `downscaleForUpload`, the env parser (`PI_VISION_PROXY_MAX_UPLOAD_DIM=0`), and the command's "off" form.
 - **Invalid env values locked commands without overriding anything.** `PI_VISION_PROXY_RETRY_MAX=9`, an unparsable `PI_VISION_PROXY_MAX_UPLOAD_DIM`, or a malformed `PI_VISION_PROXY_FALLBACK_MODEL` made `envFlags` report an override (locking the matching `/multimodal-proxy` subcommand) while `readEnvOverrides` silently ignored the value. Parsing is now shared between the two (`parseRetryMaxEnv`, `parseUploadDimEnv`, `parseUploadMbEnv`, `parseFallbackModelEnv`), so only values that actually apply count as env overrides — matching the existing `statusLine`/`pathDetection` convention.
 
+- **Fallback-attributed telemetry (CodeRabbit round 2).** `completeVision` now also returns `usedProvider`/`usedModelId` of the candidate that actually answered; the `analyze_image` tool and `describe` telemetry entries record that model instead of always naming the primary, so fallback output is no longer misattributed.
+- **`sanitize` guards non-string fallback halves.** Both `fallbackProvider` and `fallbackModelId` must be real strings before canonicalization/pattern checks — `RegExp.test()` coerces its argument, so a numeric modelId could previously slip through.
+- **Shared `overUploadDim` helper.** `downscaleTargetDim` and `downscaleForUpload` now share one threshold decision so the two cannot drift; README jitter wording corrected (`±30%` → `0–30%`).
+
 ## [1.15.0] - 2026-08-11
 
 ### Added
