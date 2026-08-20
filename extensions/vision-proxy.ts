@@ -3787,7 +3787,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					ctx.ui.notify("[multimodal-proxy] Env override active for fallback-model.", "warning");
 					return;
 				}
-				const val = await ctx.ui.input("
+				const val = await ctx.ui.input(
 					"Fallback vision model (provider/model-id, or empty to clear)",
 					effective.fallbackProvider ? `${effective.fallbackProvider}/${effective.fallbackModelId}` : "",
 				);
