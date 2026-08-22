@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.16.1] - 2026-08-22
+
+### Fixed
+
+- **Syntax error in the interactive config menu** (v1.16.0 regression): the "Fallback model" handler opened `ctx.ui.input(` with a stray trailing quote, making the whole `vision-proxy.ts` extension unparseable for pi's jiti/oxc loader (`Unterminated string constant` at `vision-proxy.ts:3790`). Every pi process loading the package crashed at startup — daemons crash-looped until the extension was removed or the file hand-patched. `node --check` (swc) accepts the broken construct, so it slipped through the existing gates.
+- The shipped file is now byte-identical to the hand-patched copy that has been running in production.
+
+### Added
+
+- **Syntax gate for shipped extensions** (`npm run check`, `tools/check-syntax.mjs`): parses every `.ts` under `extensions/` with the TypeScript parser and fails on any parse diagnostic — a parser that actually rejects the class of error that shipped. Wired into `release.yml` before `npm test`, so an unparseable extension can no longer reach npm.
+
 ## [1.16.0] - 2026-08-17
 
 ### Added

@@ -35,6 +35,7 @@ jobs:
           npm -v
 
       - run: npm ci
+      - run: npm run check
       - run: npm test
 
       - name: Determine version
