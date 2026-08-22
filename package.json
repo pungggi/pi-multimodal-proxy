@@ -1,6 +1,6 @@
 {
   "name": "pi-multimodal-proxy",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "Automatic image, video and audio description for any model in Pi. Routes media to a multimodal model and injects descriptions into context.",
   "keywords": [
     "pi-package"
@@ -14,6 +14,7 @@
   "type": "module",
   "scripts": {
     "test": "node --experimental-strip-types --no-warnings --test extensions/__tests__/*.test.ts",
+    "check": "node tools/check-syntax.mjs",
     "prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked.')\""
   },
   "pi": {
@@ -41,5 +42,8 @@
     "README.md",
     "CHANGELOG.md",
     "SECURITY-REVIEW.md"
-  ]
+  ],
+  "devDependencies": {
+    "typescript": "5.9"
+  }
 }
