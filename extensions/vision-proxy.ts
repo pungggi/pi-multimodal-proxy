@@ -2653,7 +2653,7 @@ export default function (pi: ExtensionAPI) {
 				const parsed = parseModelString(value);
 				if (!parsed) {
 					ctx.ui.notify(
-						"Usage: /multimodal-proxy model provider/model-id\nExample: /multimodal-proxy model anthropic/claude-sonnet-5",
+						"Usage: /multimodal-proxy model provider/model-id\nExample: /multimodal-proxy model zai/glm-5.3-flash",
 						"warning",
 					);
 					return;

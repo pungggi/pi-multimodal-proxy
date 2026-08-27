@@ -8,6 +8,10 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+## What's new in 1.17.0
+
+- **Default vision model is now GLM 5.3 Flash** (`zai/glm-5.3-flash`) — fast, cheap image description ($0.075/M input, $0.25/M output) with a 1M-token context window. Models you never chose explicitly track the package default: configs that merely inherited the old default (`anthropic/claude-sonnet-5`) are upgraded when GLM 5.3 Flash is in the catalog, and on Pi versions without it the default falls back to `anthropic/claude-sonnet-5` (then `anthropic/claude-sonnet-4-5` on the oldest catalogs). Models chosen explicitly — via `/multimodal-proxy model`, `pick`, or `PI_VISION_PROXY_MODEL` — are never rewritten. **Heads-up:** the default provider is now Z.ai — you need a `zai` API key and will be asked for first-use data-egress consent unless you pin a different model (e.g. `/multimodal-proxy model anthropic/claude-sonnet-5`).
+
 ## What's new in 1.16.0
 
 Reliability features borrowed from a survey of [atlas-vision-mcp](https://github.com/QuangThai/vision-bridge-mcp) (ideas worth stealing, implementation our own):
@@ -157,7 +161,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | Variable | Values | Default |
 |----------|--------|---------|
 | `PI_VISION_PROXY_MODE` | `fallback`, `always`, `off` | `fallback` |
-| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `anthropic/claude-sonnet-5` |
+| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `zai/glm-5.3-flash` |
 | `PI_VISION_PROXY_INCLUDE_CONTEXT` | bool | `true` |
 | `PI_VISION_PROXY_TOOL` | `on`, `off` | `on` |
 | `PI_VISION_PROXY_MAX_IMAGES_PER_CALL` | 1–20 | `10` |
@@ -306,7 +310,7 @@ When a model is in the grounding registry, a format-specific instruction is appe
 
 ## Privacy & security
 
-This extension **sends data to a third-party provider**. By default that is `anthropic/claude-sonnet-5` for images (`anthropic/claude-sonnet-4-5` on older Pi versions without Sonnet 5 in the catalog) and `xai/grok-4.3` for video/audio. Be aware:
+This extension **sends data to a third-party provider**. By default that is `zai/glm-5.3-flash` for images (`anthropic/claude-sonnet-5` on older Pi versions without GLM 5.3 Flash in the catalog, then `anthropic/claude-sonnet-4-5`) and `xai/grok-4.3` for video/audio. Be aware:
 
 1. **Image and video data is uploaded** to the configured provider on every proxied request. Crop coordinates are applied locally before upload — only the cropped region is sent.
 2. **Recent conversation context** (last 8 messages, truncated) is uploaded with the image unless you set `/multimodal-proxy context off` or `PI_VISION_PROXY_INCLUDE_CONTEXT=false`. Disable it for sensitive sessions.
@@ -325,7 +329,7 @@ For the full security audit see [`SECURITY-REVIEW.md`](./SECURITY-REVIEW.md).
 
 ## Requirements
 
-- A vision-capable model with a valid API key (e.g. Claude, GPT-4o, Gemini, Qwen-VL)
+- A vision-capable model with a valid API key (e.g. GLM 5.3 Flash, Claude, GPT-4o, Gemini, Qwen-VL)
 - For video/audio: a multimodal model that supports video input (e.g. Grok 4.3, Gemini 2.5 Pro)
 - The models must be registered in Pi (built-in or via `models.json`)
 

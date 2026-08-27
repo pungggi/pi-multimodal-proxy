@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.17.0] - 2026-08-27
+
+### Changed
+
+- **Default vision model is now GLM 5.3 Flash (`zai/glm-5.3-flash`).** `DEFAULT_CONFIG` ships `zai/glm-5.3-flash` (image input, 1M context, $0.075/M input — $0.25/M output) as the default image-description model, replacing `anthropic/claude-sonnet-5`. Implicit configs keep tracking the package default: `anthropic/claude-sonnet-5` was added to `LEGACY_DEFAULT_MODELS` (so configs that merely inherited Sonnet 5 upgrade to GLM 5.3 Flash once it's in the catalog), `DEFAULT_MODEL_FALLBACKS` now tries `anthropic/claude-sonnet-5` and then `anthropic/claude-sonnet-4-5` on catalogs without GLM 5.3 Flash, and explicit choices (`modelExplicit`, `PI_VISION_PROXY_MODEL`) are never rewritten. README (What's new, env-table default, privacy note, requirements) and the `/multimodal-proxy model` usage example updated to the new default.
+
 ## [1.16.1] - 2026-08-22
 
 ### Fixed

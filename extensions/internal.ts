@@ -681,8 +681,8 @@ export const DEFAULT_VIDEO_SYSTEM_PROMPT = [
 
 export const DEFAULT_CONFIG: VisionConfig = {
 	mode: "fallback",
-	provider: "anthropic",
-	modelId: "claude-sonnet-5",
+	provider: "zai",
+	modelId: "glm-5.3-flash",
 	systemPrompt: [
 		"You are a precise image analysis assistant.",
 		"Describe the image factually for a downstream agent that may act on the description.",
@@ -1261,9 +1261,10 @@ export function resolveConfig(
 
 /**
  * Ordered fallbacks tried when the built-in default vision model is missing
- * from the model registry — e.g. Pi < 0.80.3 catalogs without Claude Sonnet 5.
+ * from the model registry — e.g. Pi catalogs that predate GLM 5.3 Flash.
  */
 export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId: string }> = [
+	{ provider: "anthropic", modelId: "claude-sonnet-5" },
 	{ provider: "anthropic", modelId: "claude-sonnet-4-5" },
 ];
 
@@ -1274,6 +1275,7 @@ export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId:
  * model" and may track the current package default.
  */
 export const LEGACY_DEFAULT_MODELS: ReadonlyArray<{ provider: string; modelId: string }> = [
+	{ provider: "anthropic", modelId: "claude-sonnet-5" },
 	{ provider: "anthropic", modelId: "claude-sonnet-4-5" },
 ];
 
