@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.18.1] - 2026-08-30
+
+### Fixed (post-release review of 1.18.0)
+
+- **The stage-2 syntax gate was a silent no-op on Windows.** `tools/check-syntax.mjs` compared `walk()` paths (backslash separators) against TypeScript-normalized source-file names (forward slashes), so the `has()` filter dropped every diagnostic — a planted `await`-in-non-async probe passed the gate. Both sides are now normalized; the planted-probe test fails the gate as intended. (Linux CI paths happened to match, so releases were still protected — local/dev Windows runs were not.)
+- **Default-substitution notice no longer fires when the proxy is `off`** — model resolution is irrelevant with media analysis disabled.
+- **The substitution hint is now cause-aware**: when the substituted-from model is missing from the catalog the notice suggests updating pi / pinning a model, instead of the (wrong) `pi --login` key hint that only fits the no-API-key case.
+- **`writePersisted`'s fire-and-forget status refresh gained a `.catch`** — a rejected key probe can no longer surface as an unhandled promise rejection in daemon processes.
+- **`withModelFallback` skips the 5 async key probes for explicit configs** (`PI_VISION_PROXY_MODEL` or persisted `modelExplicit`), where resolution is a no-op by definition.
+
 ## [1.18.0] - 2026-08-30
 
 ### Added

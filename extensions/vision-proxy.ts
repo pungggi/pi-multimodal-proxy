@@ -667,9 +667,10 @@ function shouldStripImages(config: VisionConfig, model: ExtensionContext["model"
  * this runs on every prompt, tool result, and status refresh.
  */
 async function withModelFallback(config: VisionConfig, ctx: ExtensionContext): Promise<VisionConfig> {
-	const hasModel = (p: string, m: string) => Boolean(ctx.modelRegistry.find(p, m));
-	if (envFlags().model) return applyDefaultModelFallback(config, hasModel, true);
+	// Explicit choices are never rewritten — skip the key probes entirely.
+	if (envFlags().model || config.modelExplicit === true) return config;
 
+	const hasModel = (p: string, m: string) => Boolean(ctx.modelRegistry.find(p, m));
 	const state = getSessionState(ctx);
 	state.keyProbe ??= new Map<string, boolean>();
 	const probe = async (p: string, m: string): Promise<boolean> => {
@@ -708,6 +709,8 @@ async function withModelFallback(config: VisionConfig, ctx: ExtensionContext): P
  * configured model — e.g. no zai key → deepseek/deepseek-v4-flash-vision-exp.
  */
 function notifyDefaultSubstitution(config: VisionConfig, resolved: VisionConfig, ctx: ExtensionContext): void {
+	// Proxy disabled — model resolution is irrelevant, don't add noise.
+	if (resolved.mode === "off") return;
 	const state = getSessionState(ctx);
 	const before = `${config.provider}/${config.modelId}`;
 	const after = `${resolved.provider}/${resolved.modelId}`;
@@ -715,11 +718,11 @@ function notifyDefaultSubstitution(config: VisionConfig, resolved: VisionConfig,
 	const key = `${before}→${after}`;
 	if (state.notifiedDefaultSub === key) return;
 	state.notifiedDefaultSub = key;
-	ctx.ui.notify(
-		`[multimodal-proxy] Vision default resolved to ${after} (${before} not usable here). ` +
-			`Pin a model with /multimodal-proxy model, or add a key: pi --login ${config.provider}`,
-		"info",
-	);
+	const missingFromCatalog = !ctx.modelRegistry.find(config.provider, config.modelId);
+	const hint = missingFromCatalog
+		? "update pi (older model catalog), or pin a model with /multimodal-proxy model"
+		: `add a key: pi --login ${config.provider} — or pin a model with /multimodal-proxy model`;
+	ctx.ui.notify(`[multimodal-proxy] Vision default resolved to ${after} (${before} not usable here). ${hint}`, "info");
 }
 
 // ── Content sniffing (Pi ≥ 0.84.4) ───────────────────────────────────────
@@ -2814,9 +2817,13 @@ export default function (pi: ExtensionAPI) {
 				const eff = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
 				// Fire-and-forget: writePersisted stays synchronous for its ~30 call
 				// sites; the status refresh just needs the resolved model eventually.
-				void withModelFallback(eff, ctx).then((resolved) =>
+				void withModelFallback(eff, ctx)
+				.then((resolved) =>
 					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry)),
-				);
+				)
+				.catch(() => {
+					// Key probing must never surface as an unhandled rejection in daemons.
+				});
 				return validated;
 			};
 

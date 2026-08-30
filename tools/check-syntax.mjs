@@ -45,10 +45,17 @@ function* walk(dir) {
 let bad = 0;
 let checked = 0;
 const allFiles = [];
+// TypeScript normalizes source file names to forward slashes on every
+// platform; walk() yields platform separators. Normalize both sides or the
+// `has()` filter below silently drops every diagnostic on Windows (found in
+// review: the planted-probe test passed with the gate as a no-op).
+const toTsPath = (p) => p.replace(/\\/g, '/');
+const allFilesTs = new Set();
 for (const root of roots) {
   for (const file of walk(root)) {
     checked++;
     allFiles.push(file);
+    allFilesTs.add(toTsPath(file));
     const source = ts.createSourceFile(file, ts.sys.readFile(file) ?? '', ts.ScriptTarget.ESNext, true);
     const diags = source.parseDiagnostics;
     if (diags.length > 0) {
@@ -80,7 +87,7 @@ if (allFiles.length > 0) {
     .filter((d) => {
       // Only diagnostics attached to our own files (skip lib/no-file entries).
       if (!d.file) return false;
-      return allFiles.includes(d.file.fileName);
+      return allFilesTs.has(toTsPath(d.file.fileName));
     });
   if (semantic.length > 0) {
     bad += semantic.length;
