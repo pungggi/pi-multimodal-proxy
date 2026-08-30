@@ -1466,6 +1466,62 @@ describe("readImageFileWithReason", () => {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects a mis-typed image via the injected sniffer (invalid-image)", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "fake.png");
+		const contents = Buffer.from("this is actually text, not an image");
+		await writeFile(file, contents);
+		try {
+			const r = await readImageFileWithReason(file, undefined, async () => null);
+			assert.equal(r.image, null);
+			assert.equal(r.reason, "invalid-image");
+			assert.equal(r.bytes, contents.length);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("corrects the MIME type when the sniff disagrees with the extension", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "actually-jpeg.png");
+		await writeFile(file, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46]));
+		try {
+			const r = await readImageFileWithReason(file, undefined, async () => "image/jpeg");
+			assert.ok(r.image, "image should be returned");
+			assert.equal(r.image?.mimeType, "image/jpeg");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts an unknown extension when the sniffer recognizes the contents", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "no-extension");
+		await writeFile(file, TINY_PNG);
+		try {
+			const r = await readImageFileWithReason(file, undefined, async () => "image/png");
+			assert.ok(r.image, "image should be returned");
+			assert.equal(r.image?.mimeType, "image/png");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("degrades to extension-only when the sniffer throws", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "ok.png");
+		await writeFile(file, TINY_PNG);
+		try {
+			const r = await readImageFileWithReason(file, undefined, async () => {
+				throw new Error("sniffer exploded");
+			});
+			assert.ok(r.image, "image should be returned");
+			assert.equal(r.image?.mimeType, "image/png");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("readMediaFileWithReason", () => {
@@ -3023,7 +3079,7 @@ describe("Review fixes: storeImageMeta filename backfill", () => {
 
 // ── Default model fallback (1.8.0) ──────────────────────────────────────────
 
-import { applyDefaultModelFallback, DEFAULT_MODEL_FALLBACKS } from "../internal.ts";
+import { applyDefaultModelFallback, DEFAULT_MODEL_FALLBACKS, decideImageMime, SNIFFABLE_IMAGE_MIMES } from "../internal.ts";
 
 describe("applyDefaultModelFallback", () => {
 	const registryWith = (...models: string[]) => (p: string, m: string) => models.includes(`${p}/${m}`);
@@ -3097,6 +3153,153 @@ describe("applyDefaultModelFallback", () => {
 		const out = applyDefaultModelFallback(cfg, registryWith(`${fb.provider}/${fb.modelId}`));
 		assert.equal(out.mode, "always");
 		assert.equal(out.cacheSize, 7);
+	});
+});
+
+describe("1.18.0 key-aware default model resolution", () => {
+	const registryWith = (...models: string[]) => (p: string, m: string) => models.includes(`${p}/${m}`);
+	const keyWith = (...keyed: string[]) => (p: string, m: string) => keyed.includes(`${p}/${m}`);
+	const builtin = { ...DEFAULT_CONFIG };
+	const deepseek = DEFAULT_MODEL_FALLBACKS.find((m) => m.provider === "deepseek")!;
+	const sonnet5 = { provider: "anthropic", modelId: "claude-sonnet-5" };
+
+	it("lists the DeepSeek vision model first among fallbacks", () => {
+		assert.equal(DEFAULT_MODEL_FALLBACKS[0]!.provider, "deepseek");
+		assert.equal(DEFAULT_MODEL_FALLBACKS[0]!.modelId, "deepseek-v4-flash-vision-exp");
+	});
+
+	it("keeps the default when it is in the catalog and keyed", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(`${builtin.provider}/${builtin.modelId}`),
+			false,
+			keyWith(`${builtin.provider}/${builtin.modelId}`),
+		);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("substitutes the first keyed candidate when the default has no key", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(`${builtin.provider}/${builtin.modelId}`, `${deepseek.provider}/${deepseek.modelId}`, "anthropic/claude-sonnet-5"),
+			false,
+			keyWith(`${deepseek.provider}/${deepseek.modelId}`, "anthropic/claude-sonnet-5"),
+		);
+		assert.equal(out.provider, deepseek.provider);
+		assert.equal(out.modelId, deepseek.modelId);
+	});
+
+	it("skips unkeyed candidates and picks the next keyed one", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(`${builtin.provider}/${builtin.modelId}`, `${deepseek.provider}/${deepseek.modelId}`, "anthropic/claude-sonnet-5"),
+			false,
+			keyWith("anthropic/claude-sonnet-5"),
+		);
+		assert.equal(out.provider, "anthropic");
+		assert.equal(out.modelId, "claude-sonnet-5");
+	});
+
+	it("keeps the in-catalog default when nothing is keyed (login-hint path)", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(`${builtin.provider}/${builtin.modelId}`, "anthropic/claude-sonnet-5"),
+			false,
+			() => false,
+		);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("prefers a keyed legacy default over an unkeyed current default", () => {
+		const legacy = { ...DEFAULT_CONFIG, ...sonnet5 };
+		const out = applyDefaultModelFallback(
+			legacy,
+			registryWith(`${builtin.provider}/${builtin.modelId}`, "anthropic/claude-sonnet-5"),
+			false,
+			keyWith("anthropic/claude-sonnet-5"),
+		);
+		assert.equal(out.provider, "anthropic");
+		assert.equal(out.modelId, "claude-sonnet-5");
+	});
+
+	it("substitutes a keyed chain member for an unkeyed legacy default", () => {
+		const legacy = { ...DEFAULT_CONFIG, ...sonnet5 };
+		const out = applyDefaultModelFallback(
+			legacy,
+			registryWith("anthropic/claude-sonnet-5", `${deepseek.provider}/${deepseek.modelId}`),
+			false,
+			keyWith(`${deepseek.provider}/${deepseek.modelId}`),
+		);
+		assert.equal(out.provider, deepseek.provider);
+		assert.equal(out.modelId, deepseek.modelId);
+	});
+
+	it("never rewrites an explicit choice even with key information", () => {
+		const explicit = { ...DEFAULT_CONFIG, modelExplicit: true };
+		const out = applyDefaultModelFallback(
+			explicit,
+			registryWith(`${deepseek.provider}/${deepseek.modelId}`),
+			false,
+			keyWith(`${deepseek.provider}/${deepseek.modelId}`),
+		);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("does not mutate other config fields when substituting for a keyed candidate", () => {
+		const cfg = { ...DEFAULT_CONFIG, mode: "always" as const, cacheSize: 9 };
+		const out = applyDefaultModelFallback(
+			cfg,
+			registryWith(`${deepseek.provider}/${deepseek.modelId}`),
+			false,
+			keyWith(`${deepseek.provider}/${deepseek.modelId}`),
+		);
+		assert.equal(out.mode, "always");
+		assert.equal(out.cacheSize, 9);
+	});
+});
+
+describe("decideImageMime (content sniffing)", () => {
+	const pngHead = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+
+	it("sniffed type wins over the extension", () => {
+		const out = decideImageMime("image/png", "image/jpeg", pngHead);
+		assert.deepEqual(out, { mime: "image/jpeg" });
+	});
+
+	it("rejects an in-coverage extension whose contents are not an image", () => {
+		const out = decideImageMime("image/png", null, new TextEncoder().encode("hello world"));
+		assert.deepEqual(out, { reject: true });
+	});
+
+	it("accepts a PNG-signature file the sniffer rejected (APNG passthrough)", () => {
+		const out = decideImageMime("image/png", null, pngHead);
+		assert.deepEqual(out, { mime: "image/png" });
+	});
+
+	it("trusts extensions outside sniffer coverage when the sniff finds nothing", () => {
+		const out = decideImageMime("image/tiff", null, new TextEncoder().encode("whatever"));
+		assert.deepEqual(out, { mime: "image/tiff" });
+	});
+
+	it("falls back to the extension map when the sniffer is unavailable", () => {
+		const out = decideImageMime("image/png", undefined, new TextEncoder().encode("not really"));
+		assert.deepEqual(out, { mime: "image/png" });
+	});
+
+	it("returns no mime for an unknown extension without a sniffer", () => {
+		const out = decideImageMime(undefined, undefined, pngHead);
+		assert.equal(out.mime, undefined);
+		assert.equal(out.reject, undefined);
+	});
+
+	it("coverage set matches the formats Pi's sniffer validates", () => {
+		assert.ok(SNIFFABLE_IMAGE_MIMES.has("image/jpeg"));
+		assert.ok(SNIFFABLE_IMAGE_MIMES.has("image/png"));
+		assert.ok(SNIFFABLE_IMAGE_MIMES.has("image/gif"));
+		assert.ok(SNIFFABLE_IMAGE_MIMES.has("image/webp"));
+		assert.ok(SNIFFABLE_IMAGE_MIMES.has("image/bmp"));
+		assert.ok(!SNIFFABLE_IMAGE_MIMES.has("image/tiff"));
+		assert.ok(!SNIFFABLE_IMAGE_MIMES.has("image/avif"));
 	});
 });
 

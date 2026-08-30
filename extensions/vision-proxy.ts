@@ -18,6 +18,8 @@
  *                                                    - persisted pre-consented providers
  *                                                    - use "*" or "all" to consent globally for all providers
  *                 /multimodal-proxy tool on|off     - enable/disable analyze_image tool
+ *                 /multimodal-proxy doctor          - one-shot setup diagnostics
+ *                 /multimodal-proxy test            - end-to-end self-test (synthetic image)
  *                 /multimodal-proxy max-images-per-call <n>
  *                 /multimodal-proxy max-batch <n>
  *                 /multimodal-proxy cache-size <n>
@@ -274,6 +276,7 @@ import {
 	canonicalYouTubeUrl,
 	youTubeVideoId,
 	applyDefaultModelFallback,
+	DEFAULT_MODEL_FALLBACKS,
 	applyRecallCompletion,
 	buildRecallItems,
 	collectRecallCandidates,
@@ -317,6 +320,7 @@ import {
 	persistedBase,
 	pluralImages,
 	type ReadImageReason,
+	type SniffImageFile,
 	readImageFileWithReason,
 	readPersistentFile,
 	resolveConfig,
@@ -447,6 +451,10 @@ interface SessionState {
 	 * post-compaction recall digest.
 	 */
 	compaction?: { reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean };
+	/** Cached "provider/model has an API key" probes (cleared per session). */
+	keyProbe?: Map<string, boolean>;
+	/** Last implicit-default substitution already notified this session. */
+	notifiedDefaultSub?: string;
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -649,17 +657,91 @@ function shouldStripImages(config: VisionConfig, model: ExtensionContext["model"
 }
 
 /**
- * Swap the untouched built-in default vision model for a fallback when the
- * running Pi's catalog doesn't know it (e.g. Claude Sonnet 5 on Pi < 0.80.3).
- * A model set via PI_VISION_PROXY_MODEL is an explicit user choice and is
- * never rewritten, even when it equals the built-in default.
+ * Swap the untouched built-in default vision model for a usable one when the
+ * running Pi's catalog doesn't know it (e.g. GLM 5.3 Flash on Pi < 0.84.x) or
+ * its provider has no API key (1.18.0: key-aware resolution). A model set via
+ * PI_VISION_PROXY_MODEL is an explicit user choice and is never rewritten,
+ * even when it equals the built-in default.
+ *
+ * Key probes are cached per session — they are cheap env/file lookups, but
+ * this runs on every prompt, tool result, and status refresh.
  */
-function withModelFallback(config: VisionConfig, ctx: ExtensionContext): VisionConfig {
-	return applyDefaultModelFallback(
-		config,
-		(p, m) => Boolean(ctx.modelRegistry.find(p, m)),
-		envFlags().model,
+async function withModelFallback(config: VisionConfig, ctx: ExtensionContext): Promise<VisionConfig> {
+	const hasModel = (p: string, m: string) => Boolean(ctx.modelRegistry.find(p, m));
+	if (envFlags().model) return applyDefaultModelFallback(config, hasModel, true);
+
+	const state = getSessionState(ctx);
+	state.keyProbe ??= new Map<string, boolean>();
+	const probe = async (p: string, m: string): Promise<boolean> => {
+		const key = `${p}/${m}`;
+		const cached = state.keyProbe!.get(key);
+		if (cached !== undefined) return cached;
+		let ok = false;
+		try {
+			const model = ctx.modelRegistry.find(p, m);
+			if (model) {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				ok = auth.ok && Boolean(auth.apiKey);
+			}
+		} catch {
+			ok = false;
+		}
+		state.keyProbe!.set(key, ok);
+		return ok;
+	};
+
+	const pairs = [
+		{ provider: DEFAULT_CONFIG.provider, modelId: DEFAULT_CONFIG.modelId },
+		...DEFAULT_MODEL_FALLBACKS,
+		{ provider: config.provider, modelId: config.modelId },
+	];
+	const keys = new Map<string, boolean>();
+	for (const pair of pairs) {
+		keys.set(`${pair.provider}/${pair.modelId}`, await probe(pair.provider, pair.modelId));
+	}
+	const hasKey = (p: string, m: string) => keys.get(`${p}/${m}`) === true;
+	return applyDefaultModelFallback(config, hasModel, false, hasKey);
+}
+
+/**
+ * Notify (once per session) when implicit-default resolution substituted the
+ * configured model — e.g. no zai key → deepseek/deepseek-v4-flash-vision-exp.
+ */
+function notifyDefaultSubstitution(config: VisionConfig, resolved: VisionConfig, ctx: ExtensionContext): void {
+	const state = getSessionState(ctx);
+	const before = `${config.provider}/${config.modelId}`;
+	const after = `${resolved.provider}/${resolved.modelId}`;
+	if (before === after) return;
+	const key = `${before}→${after}`;
+	if (state.notifiedDefaultSub === key) return;
+	state.notifiedDefaultSub = key;
+	ctx.ui.notify(
+		`[multimodal-proxy] Vision default resolved to ${after} (${before} not usable here). ` +
+			`Pin a model with /multimodal-proxy model, or add a key: pi --login ${config.provider}`,
+		"info",
 	);
+}
+
+// ── Content sniffing (Pi ≥ 0.84.4) ───────────────────────────────────────
+
+/**
+ * Lazily resolve Pi's exported `detectSupportedImageMimeTypeFromFile`
+ * (public since 0.84.4). Returns undefined when unavailable — callers then
+ * degrade to the extension-only MIME path.
+ */
+let _sniffImageFile: SniffImageFile | null | undefined;
+async function sniffImageFile(filePath: string): Promise<string | null | undefined> {
+	if (_sniffImageFile === undefined) {
+		try {
+			const mod = (await import("@earendil-works/pi-coding-agent")) as Record<string, unknown>;
+			const fn = mod.detectSupportedImageMimeTypeFromFile;
+			_sniffImageFile = typeof fn === "function" ? (fn as SniffImageFile) : null;
+		} catch {
+			_sniffImageFile = null;
+		}
+	}
+	if (_sniffImageFile === null) return undefined;
+	return _sniffImageFile(filePath);
 }
 
 /**
@@ -764,6 +846,8 @@ function describeReadReason(reason: ReadImageReason, bytes?: number): string {
 			return `${bytes ?? "?"} bytes exceeds limit (override with PI_VISION_PROXY_MAX_IMAGE_BYTES)`;
 		case "not-an-image":
 			return "unsupported extension";
+		case "invalid-image":
+			return "file contents are not a recognized image (extension does not match contents — e.g. a non-image renamed to .png)";
 		default:
 			return reason;
 	}
@@ -1567,7 +1651,7 @@ async function handleAnalyzeImage(
 		if (ref.includes("..")) {
 			return `Error: path contains disallowed ".." segments.`;
 		}
-		const r = await readImageFileWithReason(ref, pathAccessFromConfig(config));
+		const r = await readImageFileWithReason(ref, pathAccessFromConfig(config), sniffImageFile);
 		if (!r.image) {
 			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
 		}
@@ -1862,7 +1946,7 @@ export default function (pi: ExtensionAPI) {
 				parameters: AnalyzeImageParams,
 				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
 					const entries = extCtx.sessionManager.getEntries();
-					const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
+					const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
 
 					// Runtime check - tool may have been disabled mid-session
 					if (config.tool !== "on" || config.mode === "off") {
@@ -1901,12 +1985,13 @@ export default function (pi: ExtensionAPI) {
 		state.imageMeta.clear();
 		clearImageData(state.imageData);
 		state.compaction = undefined;
+		state.keyProbe = undefined;
+		state.notifiedDefaultSub = undefined;
 
 		_fileConfig = await readPersistentFile();
-		const config = withModelFallback(
-			resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig),
-			ctx,
-		);
+		const rawConfig = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+		const config = await withModelFallback(rawConfig, ctx);
+		notifyDefaultSubstitution(rawConfig, config, ctx);
 		ctx.ui.setStatus("multimodal-proxy", steadyStatusText(config, ctx.modelRegistry));
 
 		// Register tool if enabled
@@ -1931,7 +2016,9 @@ export default function (pi: ExtensionAPI) {
 			// Resolve config up front — file loading below honors the configurable
 			// folder allowlist (allowedFolders / allowHome).
 			const entries = ctx.sessionManager.getEntries();
-			const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
+			const rawConfig = resolveConfig(entries, process.env, _fileConfig);
+			const config = await withModelFallback(rawConfig, ctx);
+			notifyDefaultSubstitution(rawConfig, config, ctx);
 			const pathAccess = pathAccessFromConfig(config);
 
 			// Collect images: structured attachments + file paths detected in prompt
@@ -1944,7 +2031,7 @@ export default function (pi: ExtensionAPI) {
 			const acceptedPaths: string[] = [];
 			for (const fp of filePaths) {
 				if (fp.includes("..")) continue; // defense-in-depth: reject traversal
-				const r = await readImageFileWithReason(fp, pathAccess);
+				const r = await readImageFileWithReason(fp, pathAccess, sniffImageFile);
 				if (r.image) {
 					images.push(r.image);
 					acceptedPaths.push(fp);
@@ -2378,7 +2465,7 @@ export default function (pi: ExtensionAPI) {
 		if (images.length === 0) return; // fast path: most tool results carry no image
 
 		const entries = ctx.sessionManager.getEntries();
-		const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
+		const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
 		// Model supports images, or proxy is off → pass the block through unchanged.
 		if (!shouldStripImages(config, ctx.model)) return;
 
@@ -2567,6 +2654,138 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /multimodal-proxy command ─────────────────────────────────────────
 
+	/**
+	 * /multimodal-proxy doctor — one-shot setup diagnostics: effective model
+	 * resolution, catalog presence, API keys, consent, fallback and video model,
+	 * yt-dlp/ffmpeg availability, path access, and recall-store usage.
+	 */
+	const runDoctor = async (ctx: ExtensionContext, entries: readonly SessionEntry[], effective: VisionConfig) => {
+		const lines: string[] = [];
+		const resolved = await withModelFallback(effective, ctx);
+		const explicit = Boolean(envFlags().model) || effective.modelExplicit === true;
+		const substituted =
+			!explicit && (resolved.provider !== effective.provider || resolved.modelId !== effective.modelId);
+		const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
+		let keyOk = false;
+		try {
+			if (model) {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				keyOk = auth.ok && Boolean(auth.apiKey);
+			}
+		} catch {
+			keyOk = false;
+		}
+		lines.push(`mode: ${modeLabel(resolved.mode)}`);
+		lines.push(
+			`vision model: ${resolved.provider}/${resolved.modelId}` +
+				(explicit ? " (explicit)" : substituted ? " (implicit default, substituted)" : " (implicit default)") +
+				(model ? "" : " — NOT in catalog (update pi, or /multimodal-proxy model)") +
+				(model && !keyOk ? ` — no API key (run: pi --login ${resolved.provider})` : ""),
+		);
+		lines.push(
+			`consent (${resolved.provider}): ` +
+				(hasConsent(entries, resolved.provider, resolved.allowedProviders, resolved.deniedProviders)
+					? "granted"
+					: "not granted (/multimodal-proxy consent yes)"),
+		);
+		if (resolved.fallbackProvider && resolved.fallbackModelId) {
+			const fb = ctx.modelRegistry.find(resolved.fallbackProvider, resolved.fallbackModelId);
+			lines.push(
+				`fallback model: ${resolved.fallbackProvider}/${resolved.fallbackModelId}` +
+					(fb ? "" : " — NOT in catalog"),
+			);
+		}
+		const videoModel = ctx.modelRegistry.find(resolved.videoProvider, resolved.videoModelId);
+		let videoKeyOk = false;
+		try {
+			if (videoModel) {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(videoModel);
+				videoKeyOk = auth.ok && Boolean(auth.apiKey);
+			}
+		} catch {
+			videoKeyOk = false;
+		}
+		lines.push(
+			`video model: ${resolved.videoProvider}/${resolved.videoModelId}` +
+				(videoModel ? "" : " — NOT in catalog") +
+				(videoModel && !videoKeyOk ? ` — no API key (run: pi --login ${resolved.videoProvider})` : ""),
+		);
+		const toolVersion = async (bin: string): Promise<string> => {
+			try {
+				const { stdout } = await execFileAsync(bin, ["--version"], { windowsHide: true, timeout: 10_000 });
+				return (stdout.trim().split(/\r?\n/)[0] ?? "").slice(0, 48);
+			} catch {
+				return "";
+			}
+		};
+		const ytdlpVersion = await toolVersion("yt-dlp");
+		lines.push(`yt-dlp: ${ytdlpVersion || "not found (needed for YouTube URLs)"}`);
+		const ffmpegVersion = await toolVersion("ffmpeg");
+		lines.push(`ffmpeg: ${ffmpegVersion || "not found (needed for video duration probing / stream merging)"}`);
+		lines.push(
+			`path detection: ${resolved.pathDetection === "on" ? "ON" : "OFF"}` +
+				` | allow home: ${resolved.allowHome ? "ON" : "OFF"}` +
+				` | extra folders: ${resolved.allowedFolders.length}`,
+		);
+		const store = getSessionState(ctx).imageData;
+		lines.push(
+			`recall store: ${store.map.size} image(s), ${(store.totalBytes / 1048576).toFixed(1)} MB retained (in-memory only)`,
+		);
+		ctx.ui.notify(`[multimodal-proxy] doctor\n  ${lines.join("\n  ")}`, "info");
+	};
+
+	/**
+	 * /multimodal-proxy test — end-to-end self-test: synthesizes a tiny image
+	 * locally and describes it through the full pipeline (model resolution, key,
+	 * consent, retry/backoff, upload path). No file or network fixture needed.
+	 */
+	const runSelfTest = async (ctx: ExtensionContext, entries: readonly SessionEntry[], effective: VisionConfig) => {
+		if (effective.mode === "off") {
+			ctx.ui.notify("[multimodal-proxy] Proxy is off — enable with /multimodal-proxy fallback or always.", "warning");
+			return;
+		}
+		const resolved = await withModelFallback(effective, ctx);
+		// Tiny locally generated gradient PNG — no fixture file, no network.
+		const { Image } = await import("imagescript");
+		const img = new Image(96, 96);
+		img.fill(
+			(x, y) => ((0xff << 24) | ((x * 2) << 16) | ((y * 2) << 8) | ((x + y) % 256)) >>> 0,
+		);
+		const encoded = await img.encode();
+		const image: PiAiImage = {
+			type: "image",
+			data: Buffer.from(encoded).toString("base64"),
+			mimeType: "image/png",
+		};
+		if (!(await ensureConsent(resolved, ctx, entries, pi))) {
+			ctx.ui.notify("[multimodal-proxy] Self-test aborted — data-egress consent declined.", "warning");
+			return;
+		}
+		const started = Date.now();
+		const results = await analyzeImages(
+			[image],
+			"This is a connectivity self-test with a locally generated gradient image. Describe it in one short sentence.",
+			"",
+			resolved,
+			ctx,
+		);
+		const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+		const first = results?.[0];
+		if (first?.description) {
+			const snippet = first.description.length > 200 ? `${first.description.slice(0, 200)}…` : first.description;
+			ctx.ui.notify(
+				`[multimodal-proxy] Self-test OK via ${resolved.provider}/${resolved.modelId} in ${elapsed}s:\n"${snippet}"`,
+				"info",
+			);
+		} else {
+			ctx.ui.notify(
+				`[multimodal-proxy] Self-test FAILED in ${elapsed}s — run /multimodal-proxy doctor (model, API key, consent)` +
+					(first?.error ? ` Error: ${first.error}` : ""),
+				"error",
+			);
+		}
+	};
+
 	// Register both names — /multimodal-proxy (canonical) and /multimodal-proxy (legacy alias)
 	const commandHandler = async (args: string, ctx: ExtensionContext) => {
 			const entries = ctx.sessionManager.getEntries();
@@ -2593,9 +2812,10 @@ export default function (pi: ExtensionAPI) {
 				writePersistentFile(fileNext);
 				_fileConfig = fileNext;
 				const eff = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
-				ctx.ui.setStatus(
-					"multimodal-proxy",
-					steadyStatusText(withModelFallback(eff, ctx), ctx.modelRegistry),
+				// Fire-and-forget: writePersisted stays synchronous for its ~30 call
+				// sites; the status refresh just needs the resolved model eventually.
+				void withModelFallback(eff, ctx).then((resolved) =>
+					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry)),
 				);
 				return validated;
 			};
@@ -3384,6 +3604,17 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			}
 
 			// ── describe / redescribe ───────────────────────────
+			// ── Diagnostics ────────────────────────────────────────
+			if (sub === "doctor") {
+				await runDoctor(ctx, entries, effective);
+				return;
+			}
+
+			if (sub === "test") {
+				await runSelfTest(ctx, entries, effective);
+				return;
+			}
+
 			if (sub === "describe" || sub === "redescribe") {
 				if (effective.mode === "off") {
 					ctx.ui.notify("[multimodal-proxy] Proxy is off - enable with /multimodal-proxy fallback or /multimodal-proxy always.", "warning");
@@ -3396,7 +3627,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				}
 
 				// Resolve model override
-				let descConfig = withModelFallback(effective, ctx);
+				let descConfig = await withModelFallback(effective, ctx);
 				if (parsed.model) {
 					const parsedModel = parseModelString(parsed.model);
 					if (!parsedModel) {
@@ -3438,7 +3669,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 						ctx.ui.notify(`[multimodal-proxy] Error: path contains disallowed \"..\" segments.`, "error");
 						return;
 					}
-					const r = await readImageFileWithReason(ref, pathAccessFromConfig(effective));
+					const r = await readImageFileWithReason(ref, pathAccessFromConfig(effective), sniffImageFile);
 					if (!r.image) {
 						ctx.ui.notify(`[multimodal-proxy] Could not read image: ${ref} (${describeReadReason(r.reason ?? "not-an-image", r.bytes)})`, "error");
 						return;
@@ -3629,7 +3860,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 
 			// ── Interactive config ──────────────────────────────
 			// Display the model requests will actually use (registry fallback applied)
-			const friendlyEffective = friendlyModelLabel(withModelFallback(effective, ctx), ctx.modelRegistry);
+			const friendlyEffective = friendlyModelLabel(await withModelFallback(effective, ctx), ctx.modelRegistry);
 			const activeEnvOverrides = [
 				env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool",
 				env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize",
@@ -3661,7 +3892,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off>`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | doctor | test`,
 					"info",
 				);
 				return;
@@ -3684,6 +3915,8 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}`,
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
+				"Run diagnostics (doctor)",
+				"Run self-test (test image)",
 			]);
 
 			if (!choice) return;
@@ -3941,6 +4174,16 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					`Allowed providers: ${next.length > 0 ? next.join(", ") : "none"}`,
 					next.length > 0 ? "info" : "warning",
 				);
+				return;
+			}
+
+			if (choice === "Run diagnostics (doctor)") {
+				await runDoctor(ctx, entries, effective);
+				return;
+			}
+
+			if (choice === "Run self-test (test image)") {
+				await runSelfTest(ctx, entries, effective);
 				return;
 			}
 		};

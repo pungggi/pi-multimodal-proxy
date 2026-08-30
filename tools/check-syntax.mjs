@@ -7,8 +7,16 @@
 // only reliable gate is the TypeScript parser's parse diagnostics: pure
 // syntax, no type resolution, no ambient types needed.
 //
+// Stage 2 (1.18.0): parse-only misses constructs that only the binder sees —
+// e.g. `await` inside a non-async arrow (valid to the parser, SyntaxError at
+// load under node --experimental-strip-types). A full `createProgram` pass
+// filtered to syntax-range codes (< 2000) catches those while staying immune
+// to the known pre-existing type-level noise (TS2xxx), so the gate starts
+// from a clean baseline.
+//
 // Usage: node tools/check-syntax.mjs [dirs...]  (default: extensions/)
-// Exits 1 on any parse diagnostic. CI runs this before publish.
+// Exits 1 on any parse or syntax-range diagnostic. CI runs this before
+// publish.
 
 import { createRequire } from 'node:module';
 import { readdirSync, statSync } from 'node:fs';
@@ -36,9 +44,11 @@ function* walk(dir) {
 
 let bad = 0;
 let checked = 0;
+const allFiles = [];
 for (const root of roots) {
   for (const file of walk(root)) {
     checked++;
+    allFiles.push(file);
     const source = ts.createSourceFile(file, ts.sys.readFile(file) ?? '', ts.ScriptTarget.ESNext, true);
     const diags = source.parseDiagnostics;
     if (diags.length > 0) {
@@ -47,6 +57,36 @@ for (const root of roots) {
         const { line, character } = source.getLineAndCharacterOfPosition(d.start);
         console.error(`${file}:${line + 1}:${character + 1} TS${d.code} ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
       }
+    }
+  }
+}
+
+// Stage 2 — binder-level syntax diagnostics (codes < 2000) via a real
+// program build. Type-level errors (TS2xxx) are deliberately ignored: the
+// runtime strips types, and the codebase has pre-existing type noise we do
+// not gate on. Requires node_modules (peer types) to be installed.
+if (allFiles.length > 0) {
+  const program = ts.createProgram(allFiles, {
+    noEmit: true,
+    skipLibCheck: true,
+    allowJs: false,
+    target: ts.ScriptTarget.ES2023,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+  });
+  const semantic = ts
+    .getPreEmitDiagnostics(program)
+    .filter((d) => typeof d.code === 'number' && d.code < 2000)
+    .filter((d) => {
+      // Only diagnostics attached to our own files (skip lib/no-file entries).
+      if (!d.file) return false;
+      return allFiles.includes(d.file.fileName);
+    });
+  if (semantic.length > 0) {
+    bad += semantic.length;
+    for (const d of semantic.slice(0, 10)) {
+      const { line, character } = d.file.getLineAndCharacterOfPosition(d.start);
+      console.error(`${d.file.fileName}:${line + 1}:${character + 1} TS${d.code} ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
     }
   }
 }
