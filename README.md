@@ -8,6 +8,13 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+## What's new in 1.18.0
+
+- **Key-aware default model resolution** — the implicit vision default now lands on a model you can actually call. If the default (`zai/glm-5.3-flash`) has no API key in your setup, the proxy walks a preference-ordered candidate chain — `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` (new in Pi 0.84.4, cheap, built-in provider) → `anthropic/claude-sonnet-5` — and picks the first candidate that is in the catalog **and keyed**. A keyed legacy default is never traded for an unkeyed model; explicit choices (`/multimodal-proxy model`, `pick`, `PI_VISION_PROXY_MODEL`) are still never rewritten; and when nothing is keyed you get the actionable `pi --login` hint as before. A substitution is announced once per session.
+- **Content-sniffed image validation** (Pi ≥ 0.84.4, graceful on older) — image files are validated by magic bytes via Pi's exported `detectSupportedImageMimeTypeFromFile()`: a `notes.png` that is really a PDF is rejected with a clear `invalid-image` reason instead of being shipped to the vision model, mis-typed extensions are **corrected** (a JPEG named `.png` uploads as `image/jpeg`), extensionless files with recognizable contents are accepted, and formats outside the sniffer's coverage (tiff/ico/avif) keep the extension-only path. APNG still passes as `image/png`.
+- **`/multimodal-proxy doctor`** — one-shot setup diagnostics: effective model (explicit / implicit / substituted), catalog presence, API keys, consent state, fallback + video model, yt-dlp & ffmpeg availability, path access, and recall-store usage.
+- **`/multimodal-proxy test`** — end-to-end self-test: synthesizes a tiny gradient image locally and describes it through the full pipeline (model resolution → key → consent → retry → upload), reporting the model, latency, and result. No fixture files, no extra setup.
+
 ## What's new in 1.17.0
 
 - **Default vision model is now GLM 5.3 Flash** (`zai/glm-5.3-flash`) — fast, cheap image description ($0.075/M input, $0.25/M output) with a 1M-token context window. Models you never chose explicitly track the package default: configs that merely inherited the old default (`anthropic/claude-sonnet-5`) are upgraded when GLM 5.3 Flash is in the catalog, and on Pi versions without it the default falls back to `anthropic/claude-sonnet-5` (then `anthropic/claude-sonnet-4-5` on the oldest catalogs). Models chosen explicitly — via `/multimodal-proxy model`, `pick`, or `PI_VISION_PROXY_MODEL` — are never rewritten. **Heads-up:** the default provider is now Z.ai — you need a `zai` API key and will be asked for first-use data-egress consent unless you pin a different model (e.g. `/multimodal-proxy model anthropic/claude-sonnet-5`).
@@ -152,6 +159,8 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
 /multimodal-proxy allow-home on | off                  → allow reading media anywhere under your home folder
 /multimodal-proxy path-detection on | off              → auto-load media file paths found in prompt text (off = attachments only)
 /multimodal-proxy describe <path>... [--question "<text>"] [--crop <i>:<form>] [--model <provider/id>] [--save]
+/multimodal-proxy doctor                                → one-shot setup diagnostics (model, keys, consent, yt-dlp/ffmpeg, paths, recall)
+/multimodal-proxy test                                  → end-to-end self-test with a locally generated image
 
 Legacy alias: /vision-proxy <args> works identically.
 ```
@@ -329,9 +338,10 @@ For the full security audit see [`SECURITY-REVIEW.md`](./SECURITY-REVIEW.md).
 
 ## Requirements
 
-- A vision-capable model with a valid API key (e.g. GLM 5.3 Flash, Claude, GPT-4o, Gemini, Qwen-VL)
+- A vision-capable model with a valid API key (e.g. GLM 5.3 Flash, Claude, GPT-4o, Gemini, Qwen-VL) — any provider you already have a key for works; the implicit default picks a keyed model automatically (1.18.0)
 - For video/audio: a multimodal model that supports video input (e.g. Grok 4.3, Gemini 2.5 Pro)
 - The models must be registered in Pi (built-in or via `models.json`)
+- Optional: Pi ≥ 0.84.4 enables content-sniffed image validation (mis-typed extensions are corrected or rejected); older versions keep the extension-only path
 
 ## License
 

@@ -1261,9 +1261,13 @@ export function resolveConfig(
 
 /**
  * Ordered fallbacks tried when the built-in default vision model is missing
- * from the model registry — e.g. Pi catalogs that predate GLM 5.3 Flash.
+ * from the model registry — e.g. Pi catalogs that predate GLM 5.3 Flash. The
+ * same list (prefixed with the current default) forms the key-aware candidate
+ * chain: the first candidate that is both in the registry and has an API key
+ * wins when the default itself isn't usable.
  */
 export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId: string }> = [
+	{ provider: "deepseek", modelId: "deepseek-v4-flash-vision-exp" }, // Pi ≥ 0.84.4, cheap, common key
 	{ provider: "anthropic", modelId: "claude-sonnet-5" },
 	{ provider: "anthropic", modelId: "claude-sonnet-4-5" },
 ];
@@ -1286,36 +1290,76 @@ export const LEGACY_DEFAULT_MODELS: ReadonlyArray<{ provider: string; modelId: s
  * - a legacy baked-in default is upgraded to the current package default when
  *   the registry has it (otherwise it keeps working as-is);
  * - the current default is substituted with the first available fallback when
- *   the registry doesn't know it (older Pi catalogs).
+ *   the registry doesn't know it (older Pi catalogs);
+ * - with `hasKey` (optional, 1.18.0) resolution is key-aware: a candidate only
+ *   wins when it is in the registry AND its provider has an API key, so the
+ *   implicit default lands on a model the user can actually call. A keyed
+ *   legacy default is never traded for an unkeyed model, and when nothing is
+ *   keyed the catalog-only rules above apply unchanged (the first image then
+ *   fails with the actionable "No API key … pi --login" notice).
  *
  * Explicit choices are never rewritten: `userConfigured` (the caller saw
  * PI_VISION_PROXY_MODEL) or `config.modelExplicit` (persisted via
- * /multimodal-proxy model|pick) disable both substitutions, so a missing
+ * /multimodal-proxy model|pick) disable all substitutions, so a missing
  * explicit model still surfaces as "Model not found".
  */
 export function applyDefaultModelFallback(
 	config: VisionConfig,
 	hasModel: (provider: string, modelId: string) => boolean,
 	userConfigured = false,
+	hasKey?: (provider: string, modelId: string) => boolean,
 ): VisionConfig {
 	if (userConfigured || config.modelExplicit === true) return config;
 
-	const isCurrentDefault =
-		config.provider === DEFAULT_CONFIG.provider && config.modelId === DEFAULT_CONFIG.modelId;
-	if (!isCurrentDefault) {
-		const isLegacyDefault = LEGACY_DEFAULT_MODELS.some(
-			(m) => m.provider === config.provider && m.modelId === config.modelId,
-		);
-		if (isLegacyDefault && hasModel(DEFAULT_CONFIG.provider, DEFAULT_CONFIG.modelId)) {
-			return { ...config, provider: DEFAULT_CONFIG.provider, modelId: DEFAULT_CONFIG.modelId };
+	const currentDefault = { provider: DEFAULT_CONFIG.provider, modelId: DEFAULT_CONFIG.modelId };
+	const isSame = (m: { provider: string; modelId: string }) =>
+		m.provider === config.provider && m.modelId === config.modelId;
+	const isCurrentDefault = isSame(currentDefault);
+	const isLegacyDefault = LEGACY_DEFAULT_MODELS.some(isSame);
+	if (!isCurrentDefault && !isLegacyDefault) return config;
+
+	// Candidate chain in preference order: current default first, then fallbacks.
+	const chain = [currentDefault, ...DEFAULT_MODEL_FALLBACKS];
+	// "Usable" = in the registry (and keyed, when key information is available).
+	const usable = (m: { provider: string; modelId: string }) =>
+		hasKey ? hasModel(m.provider, m.modelId) && hasKey(m.provider, m.modelId) : hasModel(m.provider, m.modelId);
+
+	if (isLegacyDefault) {
+		// Old rule first: upgrade an implicit legacy default to the current
+		// default when that one is usable.
+		if (usable(currentDefault)) {
+			return { ...config, provider: currentDefault.provider, modelId: currentDefault.modelId };
 		}
+		if (hasKey) {
+			// A keyed legacy default keeps working — never trade it for an unkeyed model.
+			if (usable(config)) return config;
+			// Otherwise the first keyed candidate anywhere in the chain wins.
+			for (const cand of chain) {
+				if (usable(cand)) return { ...config, provider: cand.provider, modelId: cand.modelId };
+			}
+		}
+		// No key information (older callers): exact pre-1.18 behavior — only the
+		// current-default upgrade above applies.
 		return config;
 	}
 
-	if (hasModel(config.provider, config.modelId)) return config;
-	for (const fb of DEFAULT_MODEL_FALLBACKS) {
-		if (hasModel(fb.provider, fb.modelId)) {
-			return { ...config, provider: fb.provider, modelId: fb.modelId };
+	// Config holds the current default pair.
+	if (usable(currentDefault)) return config;
+
+	if (hasKey) {
+		// First keyed candidate in the chain wins (current default is not usable).
+		for (const cand of chain) {
+			if (isSame(cand)) continue;
+			if (usable(cand)) return { ...config, provider: cand.provider, modelId: cand.modelId };
+		}
+		// Nothing keyed anywhere: fall through to catalog-only resolution so the
+		// user still gets the actionable "No API key" notice on first use.
+	}
+
+	if (hasModel(currentDefault.provider, currentDefault.modelId)) return config;
+	for (const cand of chain) {
+		if (hasModel(cand.provider, cand.modelId)) {
+			return { ...config, provider: cand.provider, modelId: cand.modelId };
 		}
 	}
 	return config;
@@ -1556,6 +1600,64 @@ function mimeTypeForExt(filePath: string): string | undefined {
 	return EXT_TO_MIME[extname(filePath).toLowerCase()];
 }
 
+// ── Content-sniffed image validation (Pi ≥ 0.84.4) ───────────────────────────────
+
+/**
+ * Image MIME types Pi's exported content sniffer can validate
+ * (`detectSupportedImageMimeTypeFromFile`, public since Pi 0.84.4). Files
+ * whose extension maps to one of these are rejected when the sniffer says
+ * the bytes are not that kind of image; formats outside this set (tiff, ico,
+ * avif) keep the extension-only behavior.
+ */
+export const SNIFFABLE_IMAGE_MIMES: ReadonlySet<string> = new Set([
+	"image/jpeg",
+	"image/png",
+	"image/gif",
+	"image/webp",
+	"image/bmp",
+]);
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function hasPngSignature(buffer: Uint8Array): boolean {
+	if (buffer.length < PNG_SIGNATURE.length) return false;
+	return PNG_SIGNATURE.every((byte, i) => buffer[i] === byte);
+}
+
+/** Outcome of combining the extension map with a content sniff. */
+export interface ImageMimeDecision {
+	/** MIME type to use, when the file is accepted. */
+	mime?: string;
+	/** True when the extension claims an image but the contents are not one. */
+	reject?: boolean;
+}
+
+/**
+ * Decide an image file's MIME type from its extension and (optionally) a
+ * content sniff:
+ *
+ * - a sniffed type wins over the extension (corrects mis-typed files, e.g. a
+ *   JPEG named `.png`);
+ * - a sniff that finds no image rejects files whose extension is inside the
+ *   sniffer's coverage — with one carve-out: a file with a PNG signature that
+ *   the sniffer rejects as animated (APNG) is still accepted as `image/png`,
+ *   matching the pre-sniff behavior for providers that decode the first frame;
+ * - formats outside sniffer coverage, or a missing/unavailable sniffer
+ *   (`sniffed === undefined`), keep the extension-only behavior.
+ */
+export function decideImageMime(
+	extMime: string | undefined,
+	sniffed: string | null | undefined,
+	head: Uint8Array,
+): ImageMimeDecision {
+	if (typeof sniffed === "string") return { mime: sniffed };
+	if (sniffed === null) {
+		if (extMime === "image/png" && hasPngSignature(head)) return { mime: "image/png" };
+		if (extMime && SNIFFABLE_IMAGE_MIMES.has(extMime)) return { reject: true };
+	}
+	return { mime: extMime };
+}
+
 // ── File-path video detection ────────────────────────────────────────────────
 
 const VIDEO_EXT_TO_MIME: Record<string, string> = {
@@ -1791,10 +1893,19 @@ function maxImageFileBytes(): number {
 
 export type ReadImageReason =
 	| "not-an-image"
+	| "invalid-image"
 	| "denied"
 	| "unreadable"
 	| "empty"
 	| "too-large";
+
+/**
+ * Optional content sniffer: returns a sniffed MIME type, `null` when the
+ * contents are not a recognizable image, or `undefined` when sniffing is
+ * unavailable (Pi < 0.84.4, or the export failed to load). Backed by Pi's
+ * exported `detectSupportedImageMimeTypeFromFile` at runtime.
+ */
+export type SniffImageFile = (filePath: string) => Promise<string | null | undefined>;
 
 export interface ReadImageResult {
 	image: PiAiImage | null;
@@ -1911,10 +2022,18 @@ export async function isPathAllowed(filePath: string, access?: PathAccessOptions
 
 /**
  * Read an image file and return as base64 ImageContent with a structured reason on failure.
+ *
+ * The MIME type comes from the extension map, validated (and corrected) by a
+ * content sniff when a sniffer is available — see `decideImageMime`. With no
+ * sniffer the behavior is exactly the pre-1.18 extension-only path.
  */
-export async function readImageFileWithReason(filePath: string, access?: PathAccessOptions): Promise<ReadImageResult> {
+export async function readImageFileWithReason(
+	filePath: string,
+	access?: PathAccessOptions,
+	sniffFile?: SniffImageFile,
+): Promise<ReadImageResult> {
 	const mimeType = mimeTypeForExt(filePath);
-	if (!mimeType) return { image: null, reason: "not-an-image" };
+	if (!mimeType && !sniffFile) return { image: null, reason: "not-an-image" };
 	if (!(await isPathAllowed(filePath, access))) return { image: null, reason: "denied" };
 	let content: Buffer;
 	try {
@@ -1930,8 +2049,22 @@ export async function readImageFileWithReason(filePath: string, access?: PathAcc
 	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
 	const limit = maxImageFileBytes();
 	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
+
+	let sniffed: string | null | undefined;
+	if (sniffFile) {
+		try {
+			sniffed = await sniffFile(filePath);
+		} catch {
+			sniffed = undefined; // sniffer failure degrades to extension-only
+		}
+	}
+	const decision = decideImageMime(mimeType, sniffed, content);
+	if (decision.reject) {
+		return { image: null, reason: "invalid-image", bytes: content.length, filename: basename(filePath) };
+	}
+	if (!decision.mime) return { image: null, reason: "not-an-image", bytes: content.length };
 	return {
-		image: { type: "image", data: content.toString("base64"), mimeType },
+		image: { type: "image", data: content.toString("base64"), mimeType: decision.mime },
 		bytes: content.length,
 		filename: basename(filePath),
 	};

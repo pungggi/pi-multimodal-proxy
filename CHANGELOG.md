@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.18.0] - 2026-08-30
+
+### Added
+
+- **Key-aware default model resolution.** The implicit vision default now resolves to a model the user can actually call: when the configured default (`zai/glm-5.3-flash`) is not usable — missing from the catalog **or its provider has no API key** — `applyDefaultModelFallback` walks a preference-ordered candidate chain and picks the first entry that is both in the registry and keyed. `DEFAULT_MODEL_FALLBACKS` gained `deepseek/deepseek-v4-flash-vision-exp` (vision-capable via the built-in DeepSeek provider since Pi 0.84.4, ≈$0.22/M in) ahead of the Claude fallbacks. Safety rules: a keyed legacy default is never traded for an unkeyed model; explicit choices (`modelExplicit`, `PI_VISION_PROXY_MODEL`) are never rewritten; when nothing is keyed the catalog-only behavior applies so first use still surfaces the actionable "No API key — pi --login" notice. `withModelFallback` became async and probes keys via `ModelRegistry.getApiKeyAndHeaders` with a per-session cache; substitutions are announced once per session (`notifyDefaultSubstitution`) from `session_start` / `before_agent_start`.
+- **Content-sniffed image validation** (Pi ≥ 0.84.4, graceful on older runtimes). `readImageFileWithReason` accepts an injectable sniffer backed by Pi's newly exported `detectSupportedImageMimeTypeFromFile`; new pure helper `decideImageMime` merges the extension map with the sniff: sniffed type wins (corrects mis-typed files), a sniff that finds no image rejects files whose extension is inside the sniffer's coverage (new reason `invalid-image`), PNG-signature files the sniffer rejects as animated still pass as `image/png` (APNG passthrough), formats outside coverage (tiff/ico/avif) and sniffer-unavailable runtimes keep the extension-only path, and extensionless files with recognizable contents are now accepted. The sniffer fails open: a throwing sniffer degrades to extension-only.
+- **`/multimodal-proxy doctor`** — one-shot setup diagnostics covering effective model resolution (explicit / implicit / substituted), catalog presence, API keys, data-egress consent, fallback and video model, yt-dlp/ffmpeg availability (with versions), path-detection/allowlist state, and in-memory recall-store usage. Also available from the interactive menu.
+- **`/multimodal-proxy test`** — end-to-end self-test: generates a tiny gradient PNG locally (ImageScript, no fixture file), runs it through the full describe pipeline (model resolution → key check → consent → retry/backoff → upload), and reports the model, latency, and description (or the failure pointer to `doctor`). Also available from the interactive menu.
+- **Hardened syntax gate** (`tools/check-syntax.mjs` stage 2): beside the existing parse-only check, a `ts.createProgram` pass filtered to syntax-range diagnostic codes (< 2000) catches constructs the parser alone accepts but the runtime rejects — most notably `await` inside a non-async function (introduced and caught during this release's review; it crash-loops every pi loading the package, the exact 1.16.1 incident class). Type-level noise (TS2xxx) stays out of the gate, so the baseline is zero.
+
 ## [1.17.0] - 2026-08-27
 
 ### Changed
