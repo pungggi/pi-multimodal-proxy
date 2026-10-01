@@ -479,9 +479,19 @@ const DEFAULT_TOOL_CACHE_SIZE = 50;
 // unreliable. Key the state off the session's SessionManager instance, which
 // is unique per session; the WeakMap entry is reclaimed when the session ends.
 
+/**
+ * Cached analyze_image result: the model-facing fence plus the raw analysis
+ * text, so cache hits can return the same schema-shaped structuredContent as
+ * fresh calls (PR #34 review).
+ */
+interface AnalyzeImageCacheValue {
+	fence: string;
+	raw: string;
+}
+
 interface SessionState {
 	/** Tool result cache, shared across calls within one session. */
-	toolCache: LRUCache<string, string>;
+	toolCache: LRUCache<string, AnalyzeImageCacheValue>;
 	/** Current turn's tool call count (reset on each before_agent_start). */
 	toolCallCount: number;
 	/** Image hash → dimensions/filename, populated on first ingestion this session. */
@@ -513,7 +523,7 @@ function getSessionState(ctx: ExtensionContext): SessionState {
 	let state = _sessionState.get(key);
 	if (!state) {
 		state = {
-			toolCache: new LRUCache<string, string>(DEFAULT_TOOL_CACHE_SIZE),
+			toolCache: new LRUCache<string, AnalyzeImageCacheValue>(DEFAULT_TOOL_CACHE_SIZE),
 			toolCallCount: 0,
 			imageMeta: createImageMetaStore(),
 			imageData: createImageDataStore(),
@@ -1810,8 +1820,8 @@ async function handleAnalyzeImage(
 			groundingFormat,
 		});
 		return {
-			text: cached,
-			structured: { ok: true, text: cached, cached: true, groundingFormat },
+			text: cached.fence,
+			structured: { ok: true, text: cached.raw, cached: true, groundingFormat },
 		};
 	}
 
@@ -1911,8 +1921,8 @@ async function handleAnalyzeImage(
 		);
 	}
 
-		// Cache the result
-		_toolCache.set(cacheKey, result);
+		// Cache the result (fence for the model + raw text for structured output)
+		_toolCache.set(cacheKey, { fence: result, raw: text });
 
 		// Log telemetry
 		pi.appendEntry(CUSTOM_TYPE_TOOL_CALL, {
@@ -2057,7 +2067,12 @@ export default function (pi: ExtensionAPI) {
 			? [{ provider: config.provider, modelId: config.modelId }]
 			: [{ provider: config.provider, modelId: config.modelId }, ...DEFAULT_MODEL_FALLBACKS];
 		for (const cand of chain) {
-			if (ctx.modelRegistry.find(cand.provider, cand.modelId)) return cand;
+			const model = ctx.modelRegistry.find(cand.provider, cand.modelId);
+			// Only vision-capable entries qualify: a text-only pin (via
+			// /multimodal-proxy model or PI_VISION_PROXY_MODEL) must not route
+			// media turns to a model that would receive image placeholders
+			// instead of native pixels (PR #34 review).
+			if (model && Array.isArray(model.input) && model.input.includes("image")) return cand;
 		}
 		return null;
 	}

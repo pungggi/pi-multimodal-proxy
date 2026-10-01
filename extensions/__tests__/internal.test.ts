@@ -3519,6 +3519,37 @@ describe("1.19.0 model image limits (pi ≥ 0.87 inputLimits.images.resize)", ()
 		assert.equal(partial?.maxBytes, undefined);
 	});
 
+	it("maxBytes-only declarations are honored — targetDim stays unset, budget and quality tighten (PR #34 review)", () => {
+		const limits = modelImageResizeLimits({
+			inputLimits: { images: { resize: { maxBytes: 524288, jpegQuality: 70 } } },
+		});
+		assert.notEqual(limits, null);
+		assert.equal(limits?.targetDim, undefined);
+		assert.equal(limits?.quality, 70);
+		assert.equal(limits?.maxBytes, 393216);
+		// A tiny maxBytes never collapses to a zero budget
+		assert.equal(modelImageResizeLimits({ inputLimits: { images: { resize: { maxBytes: 1 } } } })?.maxBytes, 1);
+	});
+
+	it("maxBytes-only limits trigger the byte budget on downscaleForUpload (PR #34 review)", async () => {
+		const { Image } = await import("imagescript");
+		const noise = new Image(200, 150);
+		for (let x = 1; x <= 200; x++) {
+			for (let y = 1; y <= 150; y++) {
+				noise.setPixelAt(x, y, (Math.random() * 0xffffffff) >>> 0);
+			}
+		}
+		const img = bufferToPiAiImage(Buffer.from(await noise.encode(1)), "image/png");
+		// Dims are inside every dim threshold; only the model's byte budget
+		// (2048 raw) is exceeded by the ~100 KB noise PNG → must re-encode.
+		const out = await downscaleForUpload(
+			img,
+			{ maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 },
+			{ quality: 75, maxBytes: 2048 },
+		);
+		assert.equal(out.mimeType, "image/jpeg");
+	});
+
 	it("model limits tighten downscaleForUpload below the user config", async () => {
 		const { Image } = await import("imagescript");
 		const big = bufferToPiAiImage(Buffer.from(await new Image(3000, 200).encode(1)), "image/png");

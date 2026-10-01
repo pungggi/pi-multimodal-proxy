@@ -2989,8 +2989,8 @@ export async function downscaleImage(
  * Returns null when the model declares nothing (or an older pi host).
  */
 export interface ModelImageResizeLimits {
-	/** Long-edge target that satisfies the model's max-width/max-height box. */
-	targetDim: number;
+	/** Long-edge target that satisfies the model's max-width/max-height box. Absent when the model declares no dimension limits (byte-budget-only declarations keep the user's dim target). */
+	targetDim?: number;
 	/** JPEG re-encode quality (default 88). */
 	quality: number;
 	/** Raw-byte budget derived from the base64 maxBytes, when declared. */
@@ -3019,16 +3019,25 @@ export function modelImageResizeLimits(model: unknown): ModelImageResizeLimits |
 	const maxW = typeof resize.maxWidth === "number" && resize.maxWidth > 0 ? resize.maxWidth : undefined;
 	const maxH = typeof resize.maxHeight === "number" && resize.maxHeight > 0 ? resize.maxHeight : undefined;
 	const dims = [maxW, maxH].filter((d): d is number => d !== undefined);
-	if (dims.length === 0) return null;
 	const quality =
 		typeof resize.jpegQuality === "number" && resize.jpegQuality >= 1 && resize.jpegQuality <= 100
 			? Math.round(resize.jpegQuality)
 			: 88;
 	const maxBytes =
 		typeof resize.maxBytes === "number" && resize.maxBytes > 0
-			? Math.floor(resize.maxBytes * 0.75)
+			? Math.max(1, Math.floor(resize.maxBytes * 0.75))
 			: undefined;
-	return { targetDim: Math.min(...dims), quality, maxBytes };
+	// A declaration must carry at least one meaningful limit — dimensions or a
+	// byte budget. Quality alone changes nothing until a resize triggers, so a
+	// quality-only declaration is treated as absent. A maxBytes-only
+	// declaration is honored (PR #34 review): targetDim stays unset and only
+	// the byte budget and quality tighten the user's thresholds.
+	if (dims.length === 0 && maxBytes === undefined) return null;
+	return {
+		targetDim: dims.length > 0 ? Math.min(...dims) : undefined,
+		quality,
+		maxBytes,
+	};
 }
 
 /**
@@ -3050,10 +3059,13 @@ export async function downscaleForUpload(
 	modelLimits?: ModelImageResizeLimits | null,
 ): Promise<PiAiImage> {
 	if (config.maxUploadDim === 0) return img; // downscaling disabled
-	const targetDim = modelLimits ? Math.min(config.maxUploadDim, modelLimits.targetDim) : config.maxUploadDim;
-	const maxUploadBytes = modelLimits?.maxBytes
-		? Math.min(config.maxUploadBytes, modelLimits.maxBytes)
-		: config.maxUploadBytes;
+	const targetDim = modelLimits?.targetDim
+		? Math.min(config.maxUploadDim, modelLimits.targetDim)
+		: config.maxUploadDim;
+	const maxUploadBytes =
+		modelLimits?.maxBytes !== undefined
+			? Math.min(config.maxUploadBytes, modelLimits.maxBytes)
+			: config.maxUploadBytes;
 	const quality = modelLimits?.quality ?? 88;
 	const effective = { maxUploadDim: targetDim, maxUploadBytes };
 	const buf = piAiImageToBuffer(img);

@@ -18,6 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `envFlags()` reports two new presence flags (`virtual`, `virtualBase`); the config summary, no-UI command list, and interactive menu show the virtual-model state (including a "(needs pi ≥ 0.99)" qualifier when registered on an older host).
 - Six new tests: env override + flag presence for the virtual vars, `modelImageResizeLimits` derivation (null cases, box target, quality default, raw-byte conversion), model-limits tightening vs. user-disabled downscale vs. in-budget images, and sanitize validation of the new fields (494 total, all green).
 
+### Fixed (PR #34 review)
+
+- **`modelImageResizeLimits` no longer drops maxBytes-only declarations** — a catalog entry with `inputLimits.images.resize.maxBytes` but no `maxWidth`/`maxHeight` is now honored: `targetDim` stays unset (the user's dim target applies) while the byte budget (converted to raw bytes, floored at 1) and JPEG quality still tighten the upload path. Quality-only declarations remain a no-op.
+- **Virtual-model routing filters for vision-capable entries** — `resolveVisionTarget` only accepts models whose `input` includes `image`, so a text-only pin (via `/multimodal-proxy model` or `PI_VISION_PROXY_MODEL`) can no longer route a media turn to a model that would receive image placeholders; `route()` throws the actionable `/multimodal-proxy pick` error instead.
+- **Cache-hit `structuredContent.text` now matches fresh calls** — the analyze_image tool cache stores `{ fence, raw }`, so cached requests return the raw analysis text in `structuredContent` (as `AnalyzeImageOutput` advertises) while the model still sees the identical fence.
+
 ## [1.18.1] - 2026-08-30
 
 ### Fixed (post-release review of 1.18.0)
