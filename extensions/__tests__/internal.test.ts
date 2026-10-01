@@ -98,6 +98,7 @@ import {
 	RECALL_HINT,
 	createAbortError,
 	downscaleForUpload,
+	modelImageResizeLimits,
 	overUploadDim,
 	downscaleTargetDim,
 	isAbortError,
@@ -278,18 +279,18 @@ describe("readEnvOverrides", () => {
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
@@ -302,6 +303,21 @@ describe("envFlags", () => {
 		assert.equal(envFlags({ PI_VISION_PROXY_STATUS_LINE: "bogus" }).statusLine, false);
 		assert.equal(envFlags({ PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER: "chrome" }).ytdlpCookies, true);
 		assert.equal(envFlags({ PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS: "youtube:player_client=web" }).ytdlpExtractorArgs, true);
+		// 1.19.0 virtual-model overrides
+		assert.equal(envFlags({ PI_VISION_PROXY_VIRTUAL: "on" }).virtual, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_VIRTUAL: "bogus" }).virtual, false);
+		assert.equal(envFlags({ PI_VISION_PROXY_VIRTUAL_BASE: "zai/glm-5.3-flash" }).virtualBase, true);
+		assert.equal(envFlags({ PI_VISION_PROXY_VIRTUAL_BASE: "none" }).virtualBase, true);
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_VIRTUAL: "off" }).virtualModel, "off");
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_VIRTUAL: "bogus" }).virtualModel, undefined);
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_VIRTUAL_BASE: "zai/glm-5.3-flash" }), {
+			virtualBaseProvider: "zai",
+			virtualBaseModelId: "glm-5.3-flash",
+		});
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_VIRTUAL_BASE: "none" }), {
+			virtualBaseProvider: undefined,
+			virtualBaseModelId: undefined,
+		});
 	});
 });
 
@@ -3477,6 +3493,109 @@ describe("1.16.0 downscaleForUpload (integration)", () => {
 		const small = bufferToPiAiImage(Buffer.from(await new Image(100, 100).encode(1)), "image/png");
 		const out = await downscaleForUpload(small, { maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 });
 		assert.equal(out, small);
+	});
+});
+
+describe("1.19.0 model image limits (pi ≥ 0.87 inputLimits.images.resize)", () => {
+	it("modelImageResizeLimits returns null without a declaration", () => {
+		assert.equal(modelImageResizeLimits(undefined), null);
+		assert.equal(modelImageResizeLimits({}), null);
+		assert.equal(modelImageResizeLimits({ inputLimits: {} }), null);
+		assert.equal(modelImageResizeLimits({ inputLimits: { images: {} } }), null);
+		// No numeric dimension → no usable target
+		assert.equal(modelImageResizeLimits({ inputLimits: { images: { resize: { jpegQuality: 75 } } } }), null);
+	});
+
+	it("modelImageResizeLimits derives a long-edge target, quality, and raw-byte budget", () => {
+		const limits = modelImageResizeLimits({
+			inputLimits: { images: { resize: { maxWidth: 1568, maxHeight: 1040, jpegQuality: 75, maxBytes: 524288 } } },
+		});
+		assert.equal(limits?.targetDim, 1040);
+		assert.equal(limits?.quality, 75);
+		assert.equal(limits?.maxBytes, 393216); // 524288 × 0.75
+		const partial = modelImageResizeLimits({ inputLimits: { images: { resize: { maxWidth: 1568 } } } });
+		assert.equal(partial?.targetDim, 1568);
+		assert.equal(partial?.quality, 88);
+		assert.equal(partial?.maxBytes, undefined);
+	});
+
+	it("maxBytes-only declarations are honored — targetDim stays unset, budget and quality tighten (PR #34 review)", () => {
+		const limits = modelImageResizeLimits({
+			inputLimits: { images: { resize: { maxBytes: 524288, jpegQuality: 70 } } },
+		});
+		assert.notEqual(limits, null);
+		assert.equal(limits?.targetDim, undefined);
+		assert.equal(limits?.quality, 70);
+		assert.equal(limits?.maxBytes, 393216);
+		// A tiny maxBytes never collapses to a zero budget
+		assert.equal(modelImageResizeLimits({ inputLimits: { images: { resize: { maxBytes: 1 } } } })?.maxBytes, 1);
+	});
+
+	it("maxBytes-only limits trigger the byte budget on downscaleForUpload (PR #34 review)", async () => {
+		const { Image } = await import("imagescript");
+		const noise = new Image(200, 150);
+		for (let x = 1; x <= 200; x++) {
+			for (let y = 1; y <= 150; y++) {
+				noise.setPixelAt(x, y, (Math.random() * 0xffffffff) >>> 0);
+			}
+		}
+		const img = bufferToPiAiImage(Buffer.from(await noise.encode(1)), "image/png");
+		// Dims are inside every dim threshold; only the model's byte budget
+		// (2048 raw) is exceeded by the ~100 KB noise PNG → must re-encode.
+		const out = await downscaleForUpload(
+			img,
+			{ maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 },
+			{ quality: 75, maxBytes: 2048 },
+		);
+		assert.equal(out.mimeType, "image/jpeg");
+	});
+
+	it("model limits tighten downscaleForUpload below the user config", async () => {
+		const { Image } = await import("imagescript");
+		const big = bufferToPiAiImage(Buffer.from(await new Image(3000, 200).encode(1)), "image/png");
+		const out = await downscaleForUpload(
+			big,
+			{ maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 },
+			{ targetDim: 1024, quality: 75 },
+		);
+		assert.equal(out.mimeType, "image/jpeg");
+		const dims = extractDimensions(piAiImageToBuffer(out));
+		assert.equal(dims?.width, 1024);
+	});
+
+	it("model limits never re-enable a user-disabled downscale", async () => {
+		const { Image } = await import("imagescript");
+		const big = bufferToPiAiImage(Buffer.from(await new Image(3000, 200).encode(1)), "image/png");
+		const out = await downscaleForUpload(
+			big,
+			{ maxUploadDim: 0, maxUploadBytes: 5 * 1024 * 1024 },
+			{ targetDim: 1024, quality: 75 },
+		);
+		assert.equal(out, big);
+	});
+
+	it("model limits under the user config do not shrink an in-budget image", async () => {
+		const { Image } = await import("imagescript");
+		const small = bufferToPiAiImage(Buffer.from(await new Image(800, 600).encode(1)), "image/png");
+		const out = await downscaleForUpload(
+			small,
+			{ maxUploadDim: 2048, maxUploadBytes: 5 * 1024 * 1024 },
+			{ targetDim: 1024, quality: 75 },
+		);
+		assert.equal(out, small);
+	});
+
+	it("sanitize validates the 1.19.0 virtual-model fields", () => {
+		assert.equal(sanitize({ ...DEFAULT_CONFIG }).virtualModel, "on");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, virtualModel: "off" }).virtualModel, "off");
+		assert.equal(sanitize({ ...DEFAULT_CONFIG, virtualModel: "bogus" as any }).virtualModel, "on");
+		const pinned = sanitize({ ...DEFAULT_CONFIG, virtualBaseProvider: "x-ai", virtualBaseModelId: "some-model" });
+		assert.equal(pinned.virtualBaseProvider, "xai");
+		assert.equal(pinned.virtualBaseModelId, "some-model");
+		// Both halves required — a lone provider is dropped
+		const lone = sanitize({ ...DEFAULT_CONFIG, virtualBaseProvider: "zai" });
+		assert.equal("virtualBaseProvider" in lone, false);
+		assert.equal("virtualBaseModelId" in lone, false);
 	});
 });
 
