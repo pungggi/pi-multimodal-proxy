@@ -886,6 +886,7 @@ export function parseFallbackModelEnv(
 	return parsed ? { provider: parsed.provider, modelId: parsed.modelId } : undefined;
 }
 
+/** Environment overrides (PI_VISION_PROXY_*) applied last; only recognized values land. */
 export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<VisionConfig> {
 	const overrides: Partial<VisionConfig> = {};
 	const modeEnv = env.PI_VISION_PROXY_MODE;
@@ -997,6 +998,7 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 	return overrides;
 }
 
+/** Which env vars actually override a setting — used to lock the matching commands. */
 export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean; virtual: boolean; virtualBase: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
@@ -1170,6 +1172,7 @@ export function sanitizeProviderHeaders(
 	return out;
 }
 
+/** Validate and normalize a merged config: canonicalize providers, clamp numbers, drop malformed pairs. */
 export function sanitize(config: VisionConfig): VisionConfig {
 	const safe: VisionConfig = { ...config };
 	if (typeof safe.provider === "string") safe.provider = canonicalProvider(safe.provider);
@@ -1293,6 +1296,11 @@ export function persistedBase(entries: readonly SessionEntry[]): VisionConfig {
 	return sanitize({ ...DEFAULT_CONFIG, ...readPersistedConfig(entries) });
 }
 
+/**
+ * Resolve the effective config: defaults ← persisted file ← session-entry
+ * config ← environment overrides, then sanitize (invalid values fall back to
+ * defaults; half-set model pairs are dropped).
+ */
 export function resolveConfig(
 	entries: readonly SessionEntry[],
 	env: NodeJS.ProcessEnv = process.env,

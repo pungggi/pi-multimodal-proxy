@@ -434,13 +434,15 @@ const AnalyzeImageOutput = Type.Object({
 				width: Type.Optional(Type.Number()),
 				height: Type.Optional(Type.Number()),
 				crop: Type.Optional(
-					Type.Object({
-						x: Type.Number(),
-						y: Type.Number(),
-						width: Type.Number(),
-						height: Type.Number(),
-						description: "Absolute-pixel crop applied before the call; add (x, y) to returned coordinates to map back to the full image.",
-					}),
+					Type.Object(
+						{ x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number() },
+						{
+							// PR #34 review: options argument, not a property — a raw-string
+							// "description" inside the properties map makes the schema invalid.
+							description:
+								"Absolute-pixel crop applied before the call; add (x, y) to returned coordinates to map back to the full image.",
+						},
+					),
 				),
 			}),
 		),
@@ -850,6 +852,7 @@ function friendlyModelLabel(
  * Returns undefined (which clears the status entry) when the user hid the
  * status line via `/multimodal-proxy status off`.
  */
+/** Steady-state status-line text summarizing mode, models, tool, and virtual-model state. */
 function steadyStatusText(
 	config: VisionConfig,
 	registry: ExtensionContext["modelRegistry"],
@@ -1643,6 +1646,13 @@ function analysisError(message: string): AnalyzeImageOutcome {
 	return { text: message, isError: true, structured: { ok: false, error: message } };
 }
 
+/**
+ * Answer a targeted analyze_image question about one or more images: resolve
+ * references (session recall ids or file paths), validate and apply crops,
+ * consult the per-session cache, and call the vision model (with retry and
+ * fallback). Returns the fenced text for the model plus a machine-readable
+ * structured payload for programmatic callers.
+ */
 async function handleAnalyzeImage(
 	params: {
 		images: string[];
@@ -2141,6 +2151,23 @@ export default function (pi: ExtensionAPI) {
 						return model;
 					};
 
+					// PR #34 review (security): the virtual model auto-selects the
+					// vision provider on the user's behalf, so native delivery must
+					// respect the extension's data-egress consent state for it —
+					// selecting automatic routing must not silently contradict a
+					// revocation. Consent is evaluated whenever a target is
+					// (re)selected — i.e. at the start of every user turn; sticky
+					// continuations/retries keep the already-authorized target so
+					// prompt caches stay valid.
+					const requireConsent = (provider: string): void => {
+						const entries = ctx.sessionManager.getEntries();
+						if (!hasConsent(entries, provider, _fileConfig.allowedProviders, _fileConfig.deniedProviders)) {
+							throw new Error(
+								`[multimodal-proxy] data-egress consent for ${provider} is required before the virtual model can route there. Run /multimodal-proxy consent yes, or pre-consent permanently: /multimodal-proxy allowed-providers add ${provider}`,
+							);
+						}
+					};
+
 					if (requestHasMedia(request.messages)) {
 						// Media turn: route natively to the vision model — the actual
 						// pixels reach a model that can see them, no text fence needed.
@@ -2150,6 +2177,7 @@ export default function (pi: ExtensionAPI) {
 								"[multimodal-proxy] no vision model configured for the virtual model — run /multimodal-proxy pick.",
 							);
 						}
+						requireConsent(target.provider);
 						return {
 							model: findOrThrow(target.provider, target.modelId, "vision model"),
 							thinkingLevel: request.thinkingLevel,
@@ -2175,6 +2203,7 @@ export default function (pi: ExtensionAPI) {
 								"[multimodal-proxy] no vision model configured for the virtual model — run /multimodal-proxy pick.",
 							);
 					}
+					requireConsent(target.provider);
 					return {
 							model: findOrThrow(target.provider, target.modelId, "vision model"),
 							thinkingLevel: request.thinkingLevel,
