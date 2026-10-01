@@ -94,6 +94,15 @@ export interface VisionConfig {
 	maxUploadBytes: number;
 	fallbackProvider?: string;
 	fallbackModelId?: string;
+	// 1.19.0 — virtual model (pi ≥ 0.99): registers `multimodal-proxy/auto`, a
+	// selectable model that routes media-bearing turns to the configured vision
+	// model and text turns to a base model. "on" registers it, "off" never
+	// does. The optional base pin names the physical text model; unset = stay on
+	// whatever physical model handled the session before, falling back to the
+	// vision model for the first turn.
+	virtualModel: ToolSetting;
+	virtualBaseProvider?: string;
+	virtualBaseModelId?: string;
 }
 
 export interface ImageMeta {
@@ -727,6 +736,9 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	retryMax: 2,
 	maxUploadDim: 2048,
 	maxUploadBytes: 5 * 1024 * 1024,
+	// 1.19.0 — virtual model registered on hosts with pi.registerVirtualModel()
+	// (pi ≥ 0.99); feature-detected and skipped on older hosts.
+	virtualModel: "on",
 };
 
 // ── Persistent file storage ────────────────────────────────────────────────
@@ -759,6 +771,9 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"maxUploadBytes",
 	"fallbackProvider",
 	"fallbackModelId",
+	"virtualModel",
+	"virtualBaseProvider",
+	"virtualBaseModelId",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -966,10 +981,23 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 			overrides.fallbackModelId = fallbackModelEnv.modelId;
 		}
 	}
+	// 1.19.0 virtual-model overrides
+	const virtualEnv = env.PI_VISION_PROXY_VIRTUAL;
+	if (virtualEnv === "on" || virtualEnv === "off") overrides.virtualModel = virtualEnv;
+	const virtualBaseEnv = parseFallbackModelEnv(env.PI_VISION_PROXY_VIRTUAL_BASE);
+	if (virtualBaseEnv) {
+		if (virtualBaseEnv.clear) {
+			overrides.virtualBaseProvider = undefined;
+			overrides.virtualBaseModelId = undefined;
+		} else {
+			overrides.virtualBaseProvider = virtualBaseEnv.provider;
+			overrides.virtualBaseModelId = virtualBaseEnv.modelId;
+		}
+	}
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean; virtual: boolean; virtualBase: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -998,6 +1026,9 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 			parseUploadDimEnv(env.PI_VISION_PROXY_MAX_UPLOAD_DIM) !== undefined ||
 			parseUploadMbEnv(env.PI_VISION_PROXY_MAX_UPLOAD_MB) !== undefined,
 		fallbackModel: parseFallbackModelEnv(env.PI_VISION_PROXY_FALLBACK_MODEL) !== undefined,
+		// 1.19.0 — only recognized values count as overrides.
+		virtual: env.PI_VISION_PROXY_VIRTUAL === "on" || env.PI_VISION_PROXY_VIRTUAL === "off",
+		virtualBase: parseFallbackModelEnv(env.PI_VISION_PROXY_VIRTUAL_BASE) !== undefined,
 	};
 }
 
@@ -1243,6 +1274,17 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	if (!safe.fallbackProvider || !safe.fallbackModelId) {
 		delete safe.fallbackProvider;
 		delete safe.fallbackModelId;
+	}
+	// 1.19.0 virtual-model fields
+	if (safe.virtualModel !== "on" && safe.virtualModel !== "off") safe.virtualModel = DEFAULT_CONFIG.virtualModel;
+	if (typeof safe.virtualBaseProvider !== "string") delete safe.virtualBaseProvider;
+	else safe.virtualBaseProvider = canonicalProvider(safe.virtualBaseProvider);
+	if (typeof safe.virtualBaseModelId !== "string") delete safe.virtualBaseModelId;
+	if (safe.virtualBaseProvider !== undefined && !PROVIDER_PATTERN.test(safe.virtualBaseProvider)) delete safe.virtualBaseProvider;
+	if (safe.virtualBaseModelId !== undefined && !MODEL_ID_PATTERN.test(safe.virtualBaseModelId)) delete safe.virtualBaseModelId;
+	if (!safe.virtualBaseProvider || !safe.virtualBaseModelId) {
+		delete safe.virtualBaseProvider;
+		delete safe.virtualBaseModelId;
 	}
 	return safe;
 }
@@ -2606,7 +2648,7 @@ parentPort.on("message", async (task) => {
 			const w = Math.max(1, Math.round(img.width * scale));
 			const h = Math.max(1, Math.round(img.height * scale));
 			// Downscaled uploads are re-encoded as JPEG — the size reduction is the point.
-			encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(88);
+			encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(task.quality ?? 88);
 		} else {
 			const cropped = img.crop(task.crop.x, task.crop.y, task.crop.width, task.crop.height);
 			encoded = mimeType === "image/png" ? await cropped.encode(1) : await cropped.encodeJPEG(90);
@@ -2873,7 +2915,7 @@ export function overUploadDim(
 }
 
 /** In-thread decode → resize → JPEG encode, mirroring cropInThread. */
-async function resizeInThread(imageBytes: Buffer, targetDim: number): Promise<Buffer | null> {
+async function resizeInThread(imageBytes: Buffer, targetDim: number, quality = 88): Promise<Buffer | null> {
 	const img = await decodeWithTimeout(imageBytes);
 	if (img.width > MAX_IMAGE_DIMENSION || img.height > MAX_IMAGE_DIMENSION) {
 		return null;
@@ -2881,7 +2923,7 @@ async function resizeInThread(imageBytes: Buffer, targetDim: number): Promise<Bu
 	const scale = Math.min(targetDim / img.width, targetDim / img.height, 1);
 	const w = Math.max(1, Math.round(img.width * scale));
 	const h = Math.max(1, Math.round(img.height * scale));
-	const encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(88);
+	const encoded = await (scale >= 1 ? img : img.resize(w, h)).encodeJPEG(quality);
 	return Buffer.from(encoded);
 }
 
@@ -2890,6 +2932,7 @@ async function resizeInWorker(
 	imageBytes: Buffer,
 	targetDim: number,
 	timeoutMs: number,
+	quality?: number,
 ): Promise<Buffer | null | typeof WORKER_UNAVAILABLE> {
 	if (!(await ensureWorkerInfra())) return WORKER_UNAVAILABLE;
 
@@ -2904,7 +2947,7 @@ async function resizeInWorker(
 
 	const { result, reusable } = await runCropTask(
 		worker,
-		{ op: "resize", bytes: ab, targetDim, mimeType: "image/jpeg", maxDim: MAX_IMAGE_DIMENSION },
+		{ op: "resize", bytes: ab, targetDim, quality, mimeType: "image/jpeg", maxDim: MAX_IMAGE_DIMENSION },
 		timeoutMs,
 	);
 	if (reusable) releaseWorker(worker);
@@ -2913,32 +2956,88 @@ async function resizeInWorker(
 }
 
 /**
- * Downscale image bytes so the long edge fits targetDim, re-encoding as
- * JPEG q88. Returns null on decode/encode failure — callers then send the
- * original bytes rather than failing the whole analysis.
+ * Downscale image bytes so the long edge fits targetDim, re-encoding as JPEG
+ * (quality 88 unless overridden). Returns null on decode/encode failure —
+ * callers then send the original bytes rather than failing the whole analysis.
  */
-export async function downscaleImage(imageBytes: Buffer, targetDim: number): Promise<Buffer | null> {
+export async function downscaleImage(
+	imageBytes: Buffer,
+	targetDim: number,
+	quality = 88,
+): Promise<Buffer | null> {
 	try {
 		const dims = extractDimensions(imageBytes);
 		if (dims && (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION)) {
 			return null;
 		}
 		if (decodeWorkerEnabled()) {
-			const viaWorker = await resizeInWorker(imageBytes, targetDim, decodeTimeoutMs());
+			const viaWorker = await resizeInWorker(imageBytes, targetDim, decodeTimeoutMs(), quality);
 			if (viaWorker !== WORKER_UNAVAILABLE) return viaWorker;
 			// else: worker infra unavailable — fall through to the in-thread path
 		}
-		return await resizeInThread(imageBytes, targetDim);
+		return await resizeInThread(imageBytes, targetDim, quality);
 	} catch {
 		return null;
 	}
 }
 
 /**
+ * Per-model image upload limits declared on a catalog entry (pi ≥ 0.87):
+ * `inputLimits.images.resize` = { maxWidth, maxHeight, maxBytes, jpegQuality }.
+ * `maxBytes` limits the base64 payload; here it is converted to a raw-byte
+ * budget (~3/4) so it can share the raw-byte comparison of the user config.
+ * Returns null when the model declares nothing (or an older pi host).
+ */
+export interface ModelImageResizeLimits {
+	/** Long-edge target that satisfies the model's max-width/max-height box. */
+	targetDim: number;
+	/** JPEG re-encode quality (default 88). */
+	quality: number;
+	/** Raw-byte budget derived from the base64 maxBytes, when declared. */
+	maxBytes?: number;
+}
+
+export function modelImageResizeLimits(model: unknown): ModelImageResizeLimits | null {
+	const resize = (
+		model as
+			| {
+					inputLimits?: {
+						images?: {
+							resize?: {
+								maxWidth?: unknown;
+								maxHeight?: unknown;
+								maxBytes?: unknown;
+								jpegQuality?: unknown;
+							};
+						};
+				};
+			  }
+			| null
+			| undefined
+	)?.inputLimits?.images?.resize;
+	if (!resize) return null;
+	const maxW = typeof resize.maxWidth === "number" && resize.maxWidth > 0 ? resize.maxWidth : undefined;
+	const maxH = typeof resize.maxHeight === "number" && resize.maxHeight > 0 ? resize.maxHeight : undefined;
+	const dims = [maxW, maxH].filter((d): d is number => d !== undefined);
+	if (dims.length === 0) return null;
+	const quality =
+		typeof resize.jpegQuality === "number" && resize.jpegQuality >= 1 && resize.jpegQuality <= 100
+			? Math.round(resize.jpegQuality)
+			: 88;
+	const maxBytes =
+		typeof resize.maxBytes === "number" && resize.maxBytes > 0
+			? Math.floor(resize.maxBytes * 0.75)
+			: undefined;
+	return { targetDim: Math.min(...dims), quality, maxBytes };
+}
+
+/**
  * Downscale an image for upload when it exceeds the configured thresholds
- * (1.16.0). Returns the original image untouched when it is small enough or
- * when downscaling fails for any reason — upload downscale is best-effort
- * cost/limit protection, never a hard failure.
+ * (1.16.0). Model-declared limits (pi ≥ 0.87 `inputLimits.images.resize`,
+ * 1.19.0) tighten the user's thresholds; they never re-enable a downscale the
+ * user disabled with `maxUploadDim: 0`. Returns the original image untouched
+ * when it is small enough or when downscaling fails for any reason — upload
+ * downscale is best-effort cost/limit protection, never a hard failure.
  *
  * Dimension-triggered resizes are accepted even when the JPEG re-encode grows
  * the payload slightly (flat-color PNGs compress better than JPEG) — the pixel
@@ -2948,13 +3047,20 @@ export async function downscaleImage(imageBytes: Buffer, targetDim: number): Pro
 export async function downscaleForUpload(
 	img: PiAiImage,
 	config: Pick<VisionConfig, "maxUploadDim" | "maxUploadBytes">,
+	modelLimits?: ModelImageResizeLimits | null,
 ): Promise<PiAiImage> {
 	if (config.maxUploadDim === 0) return img; // downscaling disabled
+	const targetDim = modelLimits ? Math.min(config.maxUploadDim, modelLimits.targetDim) : config.maxUploadDim;
+	const maxUploadBytes = modelLimits?.maxBytes
+		? Math.min(config.maxUploadBytes, modelLimits.maxBytes)
+		: config.maxUploadBytes;
+	const quality = modelLimits?.quality ?? 88;
+	const effective = { maxUploadDim: targetDim, maxUploadBytes };
 	const buf = piAiImageToBuffer(img);
 	const dims = extractDimensions(buf);
-	const overDim = overUploadDim(dims, config);
-	if (downscaleTargetDim(dims, buf.byteLength, config) === null) return img;
-	const resized = await downscaleImage(buf, config.maxUploadDim);
+	const overDim = overUploadDim(dims, effective);
+	if (downscaleTargetDim(dims, buf.byteLength, effective) === null) return img;
+	const resized = await downscaleImage(buf, targetDim, quality);
 	if (!resized) return img;
 	if (!overDim && resized.byteLength >= buf.byteLength) return img;
 	return bufferToPiAiImage(resized, "image/jpeg");

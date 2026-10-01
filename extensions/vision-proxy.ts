@@ -26,6 +26,10 @@
  *                 /multimodal-proxy fallback-model provider/model-id|clear (1.16.0)
  *                 /multimodal-proxy retry <0-5>                    - retries on transient errors (1.16.0)
  *                 /multimodal-proxy max-upload <dim|n mb|off>      - downscale oversized uploads (1.16.0)
+ *                 /multimodal-proxy virtual on|off                 - register/unregister the 'Multimodal Auto'
+ *                                                                      virtual model (1.19.0, pi ≥ 0.99)
+ *                 /multimodal-proxy virtual-base provider/model-id|off - pin the text-turn model for the
+ *                                                                      virtual model; 'off'/blank = auto (1.19.0)
  *                 /multimodal-proxy status on|off   - show/hide the steady status line
  *
  *   Legacy alias: /vision-proxy <args> works identically.
@@ -48,6 +52,8 @@
  *     PI_VISION_PROXY_MAX_UPLOAD_DIM   - 512..8192 px long-edge downscale threshold (default 2048)
  *     PI_VISION_PROXY_MAX_UPLOAD_MB    - 0.5..20 upload byte budget (default 5)
  *     PI_VISION_PROXY_FALLBACK_MODEL   - "provider/model-id" or "none" (default none)
+ *     PI_VISION_PROXY_VIRTUAL          - "on" | "off" — register the virtual model (1.19.0, default on)
+ *     PI_VISION_PROXY_VIRTUAL_BASE     - "provider/model-id" or "none" — pin its text-turn model (1.19.0)
  *
  * Install:
  *   pi install ./packages/pi-multimodal-proxy
@@ -316,6 +322,7 @@ import {
 	modelLabel,
 	normalizeAllowedProviders,
 	parseModelString,
+	modelImageResizeLimits,
 	parseProviderList,
 	persistedBase,
 	pluralImages,
@@ -404,6 +411,42 @@ const AnalyzeImageParams = Type.Object({
 	reason: Type.Optional(Type.String({ description: "Optional; logged for analytics only" })),
 });
 
+/**
+ * outputSchema of analyze_image (pi ≥ 0.99): codemode scripts and other
+ * programmatic callers receive this structuredContent instead of the text
+ * fence; the model still sees `content`. Declared but harmlessly ignored by
+ * older hosts.
+ */
+const AnalyzeImageOutput = Type.Object({
+	ok: Type.Boolean({ description: "Whether the analysis succeeded." }),
+	text: Type.String({ description: "The analysis text (same content the model sees, without the XML fence)." }),
+	error: Type.Optional(Type.String({ description: "Failure message, present when ok is false." })),
+	cached: Type.Optional(Type.Boolean({ description: "True when served from the per-session tool cache." })),
+	provider: Type.Optional(Type.String({ description: "Provider that answered (fallback-aware)." })),
+	model: Type.Optional(Type.String({ description: "Model id that answered (fallback-aware)." })),
+	latencyMs: Type.Optional(Type.Number()),
+	groundingFormat: Type.Optional(Type.String()),
+	images: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.String({ description: "Stable image id usable for recall (image=\"...\")." }),
+				filename: Type.Optional(Type.String()),
+				width: Type.Optional(Type.Number()),
+				height: Type.Optional(Type.Number()),
+				crop: Type.Optional(
+					Type.Object({
+						x: Type.Number(),
+						y: Type.Number(),
+						width: Type.Number(),
+						height: Type.Number(),
+						description: "Absolute-pixel crop applied before the call; add (x, y) to returned coordinates to map back to the full image.",
+					}),
+				),
+			}),
+		),
+	),
+});
+
 const TOOL_DESCRIPTION = [
 	"Use `analyze_image` when (a) the cached description of an image lacks a detail you need,",
 	"(b) you need to compare or cross-reference multiple images, or (c) you need to focus on a specific region.",
@@ -455,6 +498,12 @@ interface SessionState {
 	keyProbe?: Map<string, boolean>;
 	/** Last implicit-default substitution already notified this session. */
 	notifiedDefaultSub?: string;
+	/**
+	 * True once a `context_with_system` event has been observed (pi ≥ 0.87).
+	 * Doubles as the probe that keeps the recall affordance out of the
+	 * per-image user-message path once the system-layer path takes over.
+	 */
+	cwsSupported?: boolean;
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -799,7 +848,8 @@ function steadyStatusText(
 	return (
 		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)} ` +
 		`| video: ${config.videoProvider}/${config.videoModelId}` +
-		`${config.tool === "on" && config.mode !== "off" ? " [+tool]" : ""}`
+		`${config.tool === "on" && config.mode !== "off" ? " [+tool]" : ""}` +
+		`${config.virtualModel === "on" ? " [+virtual]" : ""}`
 	);
 }
 
@@ -967,8 +1017,9 @@ async function analyzeImages(
 
 		// 1.16.0 — best-effort downscale of oversized uploads (cost/limit protection).
 		// Hash/cache/recall still key on the ORIGINAL bytes — only the upload
-		// payload is shrunk.
-		const uploadPayload = await downscaleForUpload(piAiImage, config);
+		// payload is shrunk. 1.19.0 — tightened by the vision model's declared
+		// inputLimits.images.resize (pi ≥ 0.87) when present.
+		const uploadPayload = await downscaleForUpload(piAiImage, config, modelImageResizeLimits(visionModel));
 
 		try {
 			const { response } = await completeVision(
@@ -1563,6 +1614,25 @@ async function analyzeVideoViaXaiResponsesFile(
 	}
 }
 
+/**
+ * Structured outcome of one analyze_image call (1.19.0): the model-facing
+ * text plus optional machine-readable fields for programmatic callers
+ * (pi ≥ 0.99 codemode scripts receive `structuredContent` instead of text).
+ */
+interface AnalyzeImageOutcome {
+	/** Model-facing text: the analysis fence, or the error message. */
+	text: string;
+	/** True when the call failed — surfaced as `isError` on hosts ≥ 0.99. */
+	isError?: boolean;
+	/** Machine-readable result matching AnalyzeImageOutput. */
+	structured?: Record<string, unknown>;
+}
+
+/** Wrap a failure message as an AnalyzeImageOutcome. */
+function analysisError(message: string): AnalyzeImageOutcome {
+	return { text: message, isError: true, structured: { ok: false, error: message } };
+}
+
 async function handleAnalyzeImage(
 	params: {
 		images: string[];
@@ -1574,20 +1644,20 @@ async function handleAnalyzeImage(
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
 	config: VisionConfig,
-): Promise<string> {
+): Promise<AnalyzeImageOutcome> {
 	const { images: imageRefs, question, model: modelOverride, crop: crops, reason } = params;
 
 	if (!question || question.trim().length === 0) {
-		return "Error: question is required and must be non-empty.";
+		return analysisError("Error: question is required and must be non-empty.");
 	}
 	if (question.length > 4000) {
-		return "Error: question must be at most 4000 characters.";
+		return analysisError("Error: question must be at most 4000 characters.");
 	}
 	if (imageRefs.length === 0) {
-		return "Error: at least one image is required.";
+		return analysisError("Error: at least one image is required.");
 	}
 	if (imageRefs.length > config.maxImagesPerCall) {
-		return `Error: too many images (${imageRefs.length}). Maximum is ${config.maxImagesPerCall}.`;
+		return analysisError(`Error: too many images (${imageRefs.length}). Maximum is ${config.maxImagesPerCall}.`);
 	}
 
 	// Validate crop indices: no duplicates, all in range
@@ -1595,11 +1665,11 @@ async function handleAnalyzeImage(
 		const seen = new Set<number>();
 		for (const c of crops) {
 			if (seen.has(c.image_index)) {
-				return `Error: duplicate crop for image index ${c.image_index}. At most one crop per image.`;
+				return analysisError(`Error: duplicate crop for image index ${c.image_index}. At most one crop per image.`);
 			}
 			seen.add(c.image_index);
 			if (c.image_index < 0 || c.image_index >= imageRefs.length) {
-				return `Error: crop image_index ${c.image_index} is out of range (0-${imageRefs.length - 1}).`;
+				return analysisError(`Error: crop image_index ${c.image_index} is out of range (0-${imageRefs.length - 1}).`);
 			}
 		}
 	}
@@ -1610,7 +1680,7 @@ async function handleAnalyzeImage(
 	if (modelOverride) {
 		const parsed = parseModelString(modelOverride);
 		if (!parsed) {
-			return `Error: invalid model string "${modelOverride}". Expected format: provider/model-id`;
+			return analysisError(`Error: invalid model string "${modelOverride}". Expected format: provider/model-id`);
 		}
 		visionProvider = parsed.provider;
 		visionModelId = parsed.modelId;
@@ -1619,16 +1689,16 @@ async function handleAnalyzeImage(
 	// Verify model exists and supports images
 	const visionModel = ctx.modelRegistry.find(visionProvider, visionModelId);
 	if (!visionModel) {
-		return `Error: model "${visionProvider}/${visionModelId}" not found in registry. Use /multimodal-proxy pick to choose a vision model.`;
+		return analysisError(`Error: model "${visionProvider}/${visionModelId}" not found in registry. Use /multimodal-proxy pick to choose a vision model.`);
 	}
 	if (!visionModel.input.includes("image")) {
-		return `Error: model "${visionModel.name ?? visionModelId}" does not support image input.`;
+		return analysisError(`Error: model "${visionModel.name ?? visionModelId}" does not support image input.`);
 	}
 
 	// Check consent for the resolved vision provider
 	const entries = ctx.sessionManager.getEntries();
 	if (!hasConsent(entries, visionProvider, config.allowedProviders, config.deniedProviders)) {
-		return `Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes\n\n(To pre-consent this provider permanently: /multimodal-proxy allowed-providers add ${visionProvider})`
+		return analysisError(`Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes\n\n(To pre-consent this provider permanently: /multimodal-proxy allowed-providers add ${visionProvider})`)
 	}
 
 	// Resolve image references to PiAiImage objects.
@@ -1641,7 +1711,7 @@ async function handleAnalyzeImage(
 		if (recallHash) {
 			const stored = getImageData(imageData, recallHash);
 			if (!stored) {
-				return `Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed. Ask the user to re-attach it, or pass a file path.`;
+				return analysisError(`Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed. Ask the user to re-attach it, or pass a file path.`);
 			}
 			const image: PiAiImage = { type: "image", data: stored.data, mimeType: stored.mimeType };
 			// Backfill dimensions if metadata was evicted, so crops still work on recall.
@@ -1652,11 +1722,11 @@ async function handleAnalyzeImage(
 
 		// File path
 		if (ref.includes("..")) {
-			return `Error: path contains disallowed ".." segments.`;
+			return analysisError(`Error: path contains disallowed ".." segments.`);
 		}
 		const r = await readImageFileWithReason(ref, pathAccessFromConfig(config), sniffImageFile);
 		if (!r.image) {
-			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
+			return analysisError(`Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`);
 		}
 		const hash = hashImageData(r.image.data);
 		storeImageMeta(imageMeta, hash, r.image.data, r.filename);
@@ -1676,13 +1746,13 @@ async function handleAnalyzeImage(
 		if (cropEntry) {
 			const meta = entry.meta;
 			if (!meta) {
-				return `Error: cannot crop image ${i} - image dimensions unknown.`;
+				return analysisError(`Error: cannot crop image ${i} - image dimensions unknown.`);
 			}
 			try {
 				const resolved = resolveCropEntry(cropEntry, meta.width, meta.height);
 				imagePayloads.push({ ...entry, crop: resolved });
 			} catch (err) {
-				return `Error: crop for image ${i} failed: ${err instanceof Error ? err.message : String(err)}`;
+				return analysisError(`Error: crop for image ${i} failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		} else {
 			imagePayloads.push(entry);
@@ -1710,7 +1780,7 @@ async function handleAnalyzeImage(
 
 	// 1.16.0 — best-effort downscale of oversized uploads after cropping
 	for (const p of imagePayloads) {
-		p.image = await downscaleForUpload(p.image, config);
+		p.image = await downscaleForUpload(p.image, config, modelImageResizeLimits(visionModel));
 	}
 
 	// Build cache key AFTER crop resolution (so failed crops don't create stale crop keys)
@@ -1739,13 +1809,16 @@ async function handleAnalyzeImage(
 			cacheHit: true,
 			groundingFormat,
 		});
-		return cached;
+		return {
+			text: cached,
+			structured: { ok: true, text: cached, cached: true, groundingFormat },
+		};
 	}
 
 	// Call vision model
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(visionModel);
 	if (!auth.ok || !auth.apiKey) {
-		return `Error: no API key for ${visionModel.name ?? modelLabel({ provider: visionProvider, modelId: visionModelId })}. Run: pi --login ${visionProvider}`;
+		return analysisError(`Error: no API key for ${visionModel.name ?? modelLabel({ provider: visionProvider, modelId: visionModelId })}. Run: pi --login ${visionProvider}`);
 	}
 
 	ctx.ui.notify(
@@ -1806,7 +1879,7 @@ async function handleAnalyzeImage(
 		const latencyMs = Date.now() - startTime;
 
 		if (response.stopReason === "aborted") {
-			return "Error: analysis was cancelled.";
+			return analysisError("Error: analysis was cancelled.");
 		}
 
 		const text = response.content
@@ -1816,7 +1889,7 @@ async function handleAnalyzeImage(
 			.trim();
 
 		if (!text) {
-			return "Error: vision model returned an empty response.";
+			return analysisError("Error: vision model returned an empty response.");
 		}
 
 	// Build result fence(s)
@@ -1855,9 +1928,28 @@ async function handleAnalyzeImage(
 			groundingFormat,
 		});
 
-		return result;
+		return {
+			text: result,
+			structured: {
+				ok: true,
+				text,
+				provider: usedProvider,
+				model: usedModelId,
+				latencyMs,
+				groundingFormat,
+				images: imagePayloads.map((p) => ({
+					id: p.hash,
+					filename: p.meta?.filename,
+					width: p.crop ? p.crop.width : p.meta?.width,
+					height: p.crop ? p.crop.height : p.meta?.height,
+					crop: p.crop
+						? { x: p.crop.x, y: p.crop.y, width: p.crop.width, height: p.crop.height }
+						: undefined,
+				})),
+			},
+		};
 	} catch (err) {
-		return `Error: vision model call failed: ${err instanceof Error ? err.message : String(err)}`;
+		return analysisError(`Error: vision model call failed: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }
 
@@ -1932,6 +2024,172 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	// ── Virtual model (pi ≥ 0.99) ─────────────────────────────────────────────
+
+	const VIRTUAL_PROVIDER = "multimodal-proxy";
+	const VIRTUAL_MODEL_ID = "auto";
+	let _virtualRegistered = false;
+
+	/** Minimal structural type of the virtual-model route request (pi ≥ 0.99). */
+	interface VirtualRouteRequestLike {
+		reason: "user" | "continuation" | "retry" | "direct";
+		thinkingLevel: string;
+		messages: readonly { role?: string; content?: unknown }[];
+		previous?: { model: unknown; thinkingLevel?: string };
+		failed?: { model: unknown; thinkingLevel?: string };
+	}
+
+	/** Whether the host exposes pi.registerVirtualModel (pi ≥ 0.99). */
+	function virtualModelSupported(): boolean {
+		return typeof (pi as unknown as { registerVirtualModel?: unknown }).registerVirtualModel === "function";
+	}
+
+	/**
+	 * Sync vision-target resolution for route(): honors an explicit pick
+	 * as-is; otherwise walks the same registry-only fallback chain as
+	 * applyDefaultModelFallback (route must not await key probes). Returns
+	 * null when nothing resolves.
+	 */
+	function resolveVisionTarget(ctx: ExtensionContext): { provider: string; modelId: string } | null {
+		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+		const explicit = Boolean(envFlags().model) || config.modelExplicit === true;
+		const chain = explicit
+			? [{ provider: config.provider, modelId: config.modelId }]
+			: [{ provider: config.provider, modelId: config.modelId }, ...DEFAULT_MODEL_FALLBACKS];
+		for (const cand of chain) {
+			if (ctx.modelRegistry.find(cand.provider, cand.modelId)) return cand;
+		}
+		return null;
+	}
+
+	/** True when the pending user input (tail after the last assistant message) carries an image block. */
+	function requestHasMedia(messages: readonly { role?: string; content?: unknown }[]): boolean {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg?.role === "assistant") return false;
+			if (msg?.role === "user" && Array.isArray(msg.content)) {
+				if ((msg.content as { type?: string }[]).some((c) => c && typeof c === "object" && c.type === "image")) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Register/unregister the `multimodal-proxy/auto` virtual model to match
+	 * config (1.19.0). Selecting it in /model routes media-bearing turns
+	 * natively to the configured vision model and text turns to the base model
+	 * (pinned via /multimodal-proxy virtual-base, else the physical model that
+	 * handled the session before, else the vision model). Route() resolves
+	 * config per request, so model changes need no re-registration.
+	 */
+	function syncVirtualModelRegistration(config: VisionConfig) {
+		const api = pi as unknown as {
+			registerVirtualModel?: (m: unknown) => void;
+			unregisterVirtualModel?: (provider: string, id: string) => void;
+		};
+		if (typeof api.registerVirtualModel !== "function") return; // pi < 0.99
+		const want = config.virtualModel === "on";
+		if (want && !_virtualRegistered) {
+			api.registerVirtualModel({
+				provider: VIRTUAL_PROVIDER,
+				id: VIRTUAL_MODEL_ID,
+				name: "Multimodal Auto",
+				thinkingLevels: ["off", "low", "medium", "high"],
+				input: ["text", "image"],
+				route: (request: VirtualRouteRequestLike, ctx: ExtensionContext) => {
+					// Sticky routing keeps prompt caches and thinking signatures
+					// valid: continuations stay on the model that handled the turn,
+					// retries on the model that failed (provider-level failover stays
+					// with the vision fallback chain).
+					if (request.reason === "retry" && request.failed) {
+						return {
+							model: request.failed.model,
+							thinkingLevel: request.failed.thinkingLevel ?? request.thinkingLevel,
+						};
+					}
+					if (request.reason !== "user" && request.previous) {
+						return {
+							model: request.previous.model,
+							thinkingLevel: request.previous.thinkingLevel ?? request.thinkingLevel,
+						};
+					}
+
+					const findOrThrow = (provider: string, modelId: string, what: string): unknown => {
+						const model = ctx.modelRegistry.find(provider, modelId);
+						if (!model) {
+							throw new Error(
+								`[multimodal-proxy] virtual model cannot find ${what} "${provider}/${modelId}". Run /multimodal-proxy pick to choose a vision model.`,
+							);
+						}
+						return model;
+					};
+
+					if (requestHasMedia(request.messages)) {
+						// Media turn: route natively to the vision model — the actual
+						// pixels reach a model that can see them, no text fence needed.
+						const target = resolveVisionTarget(ctx);
+						if (!target) {
+							throw new Error(
+								"[multimodal-proxy] no vision model configured for the virtual model — run /multimodal-proxy pick.",
+							);
+						}
+						return {
+							model: findOrThrow(target.provider, target.modelId, "vision model"),
+							thinkingLevel: request.thinkingLevel,
+						};
+					}
+
+					// Text turn: pinned base, else the physical model that handled
+					// the session before, else the vision model.
+					const cfg = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+					if (cfg.virtualBaseProvider && cfg.virtualBaseModelId) {
+						const base = ctx.modelRegistry.find(cfg.virtualBaseProvider, cfg.virtualBaseModelId);
+						if (base) return { model: base, thinkingLevel: request.thinkingLevel };
+					}
+					if (request.previous) {
+						return {
+							model: request.previous.model,
+							thinkingLevel: request.previous.thinkingLevel ?? request.thinkingLevel,
+						};
+					}
+					const target = resolveVisionTarget(ctx);
+					if (!target) {
+							throw new Error(
+								"[multimodal-proxy] no vision model configured for the virtual model — run /multimodal-proxy pick.",
+							);
+					}
+					return {
+							model: findOrThrow(target.provider, target.modelId, "vision model"),
+							thinkingLevel: request.thinkingLevel,
+						};
+				},
+			});
+			_virtualRegistered = true;
+		} else if (!want && _virtualRegistered) {
+			api.unregisterVirtualModel?.(VIRTUAL_PROVIDER, VIRTUAL_MODEL_ID);
+			_virtualRegistered = false;
+		}
+	}
+
+	// Register the virtual model at extension LOAD time (not just session_start)
+	// so it is visible to /model, --model, scoped models, and settings, which
+	// resolve before the first session event fires. The synchronous call uses
+	// defaults + env only (no file I/O) so it lands before CLI model
+	// resolution; the async file-config load then corrects it (unregisters if
+	// the persisted config says 'off'). session_start re-syncs with the full
+	// entry-aware config afterwards.
+	syncVirtualModelRegistration(resolveConfig([], process.env, {}));
+	void readPersistentFile()
+		.then((fileConfig) => {
+			_fileConfig = fileConfig;
+			syncVirtualModelRegistration(resolveConfig([], process.env, _fileConfig));
+		})
+		.catch(() => {
+			// unreadable config file — session_start surfaces the error path
+		});
+
 	/** Register or unregister the analyze_image tool based on config. */
 	function syncToolRegistration(config: VisionConfig) {
 		const shouldHaveTool = config.mode !== "off" && config.tool === "on";
@@ -1946,6 +2204,21 @@ export default function (pi: ExtensionAPI) {
 					"The tool supports cropping - use region, normalized, or pixel coordinates to focus on a specific area.",
 					"Results include image dimensions, filename, and grounding format metadata in the response fence.",
 				],
+				// pi ≥ 0.99 tool API: MCP-style hints (analysis is read-only but sends
+				// image data to the configured vision provider), a namespace grouping
+				// for codemode listings, and a structured output schema so codemode
+				// scripts receive machine-readable results. Older hosts ignore these.
+				annotations: {
+					readOnlyHint: true,
+					destructiveHint: false,
+					idempotentHint: false,
+					openWorldHint: true,
+				},
+				namespace: {
+					name: "multimodal-proxy",
+					description: "pi-multimodal-proxy media analysis (targeted image re-analysis with crop and grounding)",
+				},
+				outputSchema: AnalyzeImageOutput,
 				parameters: AnalyzeImageParams,
 				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
 					const entries = extCtx.sessionManager.getEntries();
@@ -1953,14 +2226,14 @@ export default function (pi: ExtensionAPI) {
 
 					// Runtime check - tool may have been disabled mid-session
 					if (config.tool !== "on" || config.mode === "off") {
-						return { content: [{ type: "text" as const, text: "Error: analyze_image tool is currently disabled. Use /multimodal-proxy tool on to enable." }] };
+						return { content: [{ type: "text" as const, text: "Error: analyze_image tool is currently disabled. Use /multimodal-proxy tool on to enable." }], isError: true };
 					}
 
 					// Rate limit per turn
 					const state = getSessionState(extCtx);
 					state.toolCallCount++;
 					if (state.toolCallCount > MAX_TOOL_CALLS_PER_TURN) {
-						return { content: [{ type: "text" as const, text: `Error: analyze_image call limit reached (${MAX_TOOL_CALLS_PER_TURN} per turn). Rephrase your question or try in the next turn.` }] };
+						return { content: [{ type: "text" as const, text: `Error: analyze_image call limit reached (${MAX_TOOL_CALLS_PER_TURN} per turn). Rephrase your question or try in the next turn.` }], isError: true };
 					}
 
 					// Sync cache size with current config
@@ -1968,8 +2241,15 @@ export default function (pi: ExtensionAPI) {
 						state.toolCache.resize(config.cacheSize);
 					}
 
-					const result = await handleAnalyzeImage(params, extCtx, pi, config);
-					return { content: [{ type: "text" as const, text: result }] };
+					const outcome = await handleAnalyzeImage(params, extCtx, pi, config);
+					return {
+						content: [{ type: "text" as const, text: outcome.text }],
+						// pi ≥ 0.99: `isError` marks failures for the model, and
+						// `structuredContent` carries the outputSchema-shaped result for
+						// codemode scripts. Older hosts ignore both fields.
+						...(outcome.isError ? { isError: true } : {}),
+						...(outcome.structured ? { structuredContent: outcome.structured } : {}),
+					};
 				},
 			});
 			_toolRegistered = true;
@@ -2000,6 +2280,9 @@ export default function (pi: ExtensionAPI) {
 		// Register tool if enabled
 		syncToolRegistration(config);
 
+		// Register the multimodal-proxy/auto virtual model (pi ≥ 0.99)
+		syncVirtualModelRegistration(config);
+
 		// Stack the `#` image-recall autocomplete on the editor
 		registerRecallAutocomplete(ctx);
 	});
@@ -2022,6 +2305,7 @@ export default function (pi: ExtensionAPI) {
 			const rawConfig = resolveConfig(entries, process.env, _fileConfig);
 			const config = await withModelFallback(rawConfig, ctx);
 			notifyDefaultSubstitution(rawConfig, config, ctx);
+			syncVirtualModelRegistration(config);
 			const pathAccess = pathAccessFromConfig(config);
 
 			// Collect images: structured attachments + file paths detected in prompt
@@ -2355,7 +2639,7 @@ export default function (pi: ExtensionAPI) {
 
 							// 1.16.0 — best-effort downscale of oversized joint uploads
 							const jointPayloads = await Promise.all(
-								jointImages.map((img) => downscaleForUpload(img, config)),
+								jointImages.map((img) => downscaleForUpload(img, config, modelImageResizeLimits(jointVisionModel))),
 							);
 
 							const contentParts: Array<{ type: "text"; text: string } | PiAiImage> = [
@@ -2534,8 +2818,10 @@ export default function (pi: ExtensionAPI) {
 		// Restate the recall affordance once per context build (not per image),
 		// so the agent is reminded it can re-query earlier images even on turns
 		// where no new image was attached. Trusted extension text — kept outside
-		// the untrusted description fence.
-		let recallHintInjected = false;
+		// the untrusted description fence. Once the host's context_with_system
+		// event has been observed (pi ≥ 0.87, see the handler below), that
+		// system-layer block owns the affordance and this path stays silent.
+		let recallHintInjected = sessionState.cwsSupported === true;
 
 		let modified = false;
 		let messages = !strip ? event.messages : event.messages.map((msg) => {
@@ -2653,6 +2939,32 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (modified) return { messages };
+	});
+
+	// pi ≥ 0.87: `context_with_system` runs after `context` on the full
+	// transcript (system messages included) and its result is sent verbatim.
+	// The first invocation only probes support — the context-path hint already
+	// covered that request — then a stable system-layer block carries the recall
+	// affordance. Unlike the user-message path it survives compaction and also
+	// reaches vision-capable session models, where the strip path never fired.
+	// The handler never fires on older hosts, so behavior there is unchanged.
+	pi.on("context_with_system", async (event: { messages: unknown[] }, ctx: ExtensionContext) => {
+		const state = getSessionState(ctx);
+		if (!state.cwsSupported) {
+			state.cwsSupported = true;
+			return; // probe-only: the context-path hint covered this request
+		}
+		const entries = ctx.sessionManager.getEntries();
+		const config = resolveConfig(entries, process.env, _fileConfig);
+		if (config.mode === "off" || config.tool !== "on") return;
+		// Only advertise recall once media has actually been described this session.
+		const descriptions = findDescriptions(entries);
+		if (descriptions.size === 0 && findVideoDescriptions(entries).size === 0) return;
+		const messages = event.messages as Array<{ role: string; content?: unknown }>;
+		const hint = `[vision-proxy] ${RECALL_HINT}`;
+		const last = messages[messages.length - 1];
+		if (last?.role === "system" && last.content === hint) return; // already present
+		return { messages: [...messages, { role: "system", content: hint }] };
 	});
 
 	// ── /multimodal-proxy command ─────────────────────────────────────────
@@ -2859,6 +3171,77 @@ export default function (pi: ExtensionAPI) {
 				);
 				// Sync tool registration on mode change
 				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+				return;
+			}
+
+			// ── Virtual model toggle (pi ≥ 0.99) ─────────────────
+			if (sub === "virtual") {
+				if (env.virtual) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_VIRTUAL is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (valueLower === "on" || valueLower === "off") {
+					const next = writePersisted({ ...persisted, virtualModel: valueLower as "on" | "off" });
+					if (!virtualModelSupported() && next.virtualModel === "on") {
+						ctx.ui.notify(
+							"Virtual model: on — but this pi version does not support virtual models (needs pi ≥ 0.99). It will activate after upgrading pi.",
+							"warning",
+						);
+					} else {
+						ctx.ui.notify(
+							next.virtualModel === "on"
+								? "Virtual model: on — select 'Multimodal Auto' (multimodal-proxy/auto) in /model. Media turns route to the vision model, text turns to the base model."
+								: "Virtual model: off",
+								next.virtualModel === "on" ? "info" : "warning",
+						);
+					}
+					syncVirtualModelRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+					return;
+				}
+				ctx.ui.notify(
+					`Virtual model: ${persisted.virtualModel ?? "on"}\nUsage: /multimodal-proxy virtual on|off\nOptionally pin the text-turn model: /multimodal-proxy virtual-base provider/model-id (or 'off' to clear)`,
+					"info",
+				);
+				return;
+			}
+
+			// ── Virtual model base pin ───────────────────────────
+			if (sub === "virtual-base") {
+				if (env.virtualBase) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_VIRTUAL_BASE is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (valueLower === "off" || valueLower === "none" || valueLower === "clear") {
+					writePersisted({ ...persisted, virtualBaseProvider: undefined, virtualBaseModelId: undefined });
+					ctx.ui.notify("Virtual model base: auto (last physical model, else the vision model)", "info");
+					return;
+				}
+				if (!value) {
+					ctx.ui.notify(
+						`Virtual model base: ${persisted.virtualBaseProvider && persisted.virtualBaseModelId ? `${persisted.virtualBaseProvider}/${persisted.virtualBaseModelId}` : "auto (last physical model, else the vision model)"}\nUsage: /multimodal-proxy virtual-base provider/model-id|off`,
+						"info",
+					);
+					return;
+				}
+				const parsed = parseModelString(value);
+				if (!parsed) {
+						ctx.ui.notify(
+							"Usage: /multimodal-proxy virtual-base provider/model-id|off\nExample: /multimodal-proxy virtual-base anthropic/claude-haiku-4-5",
+							"warning",
+						);
+					return;
+				}
+				writePersisted({ ...persisted, virtualBaseProvider: parsed.provider, virtualBaseModelId: parsed.modelId });
+				ctx.ui.notify(
+					`Virtual model base: ${parsed.provider}/${parsed.modelId} (text turns while 'Multimodal Auto' is selected)`,
+					"info",
+					);
 				return;
 			}
 
@@ -3751,7 +4134,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 
 				// 1.16.0 — best-effort downscale of oversized uploads after cropping
 				for (const p of imagePayloads) {
-					p.image = await downscaleForUpload(p.image, descConfig);
+					p.image = await downscaleForUpload(p.image, descConfig, modelImageResizeLimits(descVisionModel));
 				}
 
 				// Get auth
@@ -3875,6 +4258,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
 				env.statusLine && "statusLine", env.pathDetection && "pathDetection",
 			env.retryMax && "retryMax", env.maxUpload && "maxUpload", env.fallbackModel && "fallbackModel",
+			env.virtual && "virtual", env.virtualBase && "virtualBase",
 			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
@@ -3892,6 +4276,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}\n` +
+			`Virtual model: ${effective.virtualModel === "on" ? `on${virtualModelSupported() ? "" : " (needs pi ≥ 0.99)"} — base ${effective.virtualBaseProvider && effective.virtualBaseModelId ? `${effective.virtualBaseProvider}/${effective.virtualBaseModelId}` : "auto"}` : "off"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
 				(activeEnvOverrides ? `Env overrides: ${activeEnvOverrides}\n` : "");
@@ -3899,7 +4284,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | doctor | test`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | virtual on|off | virtual-base provider/model-id|off | doctor | test`,
 					"info",
 				);
 				return;
@@ -3920,6 +4305,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}`,
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}`,
+				`Virtual model: ${effective.virtualModel === "on" ? "on" : "off"}${effective.virtualModel === "on" && effective.virtualBaseProvider && effective.virtualBaseModelId ? ` (base ${effective.virtualBaseProvider}/${effective.virtualBaseModelId})` : ""}`,
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}`,
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}`,
 				"Run diagnostics (doctor)",
@@ -4155,6 +4541,54 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				const nextPathDetection = effective.pathDetection === "on" ? "off" : "on";
 				writePersisted({ ...persisted, pathDetection: nextPathDetection });
 				ctx.ui.notify(`Path detection: ${nextPathDetection === "on" ? "ON" : "OFF"}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("Virtual model")) {
+				if (env.virtual) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for virtual model.", "warning");
+					return;
+				}
+				const virtChoice = await ctx.ui.select(
+					"Virtual model (pi ≥ 0.99): select 'Multimodal Auto' in /model; media turns route to the vision model, text turns to the base",
+					["on", "off", "Set base model…"],
+				);
+				if (virtChoice === "on" || virtChoice === "off") {
+					const next = writePersisted({ ...persisted, virtualModel: virtChoice });
+					if (!virtualModelSupported() && next.virtualModel === "on") {
+						ctx.ui.notify("Virtual model: on — this pi version does not support virtual models (needs pi ≥ 0.99); activates after upgrading.", "warning");
+					} else {
+						ctx.ui.notify(`Virtual model: ${next.virtualModel}`, next.virtualModel === "on" ? "info" : "warning");
+					}
+					syncVirtualModelRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+					return;
+				}
+				if (virtChoice === "Set base model…") {
+					if (env.virtualBase) {
+						ctx.ui.notify("[multimodal-proxy] Env override active for virtual base.", "warning");
+						return;
+					}
+					const val = await ctx.ui.input(
+						"Virtual model base (provider/model-id, or blank for auto)",
+						effective.virtualBaseProvider && effective.virtualBaseModelId
+							? `${effective.virtualBaseProvider}/${effective.virtualBaseModelId}`
+							: "",
+					);
+					if (val === undefined || val === null) return;
+					const trimmed = val.trim();
+					if (!trimmed) {
+						writePersisted({ ...persisted, virtualBaseProvider: undefined, virtualBaseModelId: undefined });
+						ctx.ui.notify("Virtual model base: auto (last physical model, else the vision model)", "info");
+						return;
+					}
+					const parsed = parseModelString(trimmed);
+					if (!parsed) {
+						ctx.ui.notify("Usage: provider/model-id — Example: anthropic/claude-haiku-4-5", "warning");
+						return;
+					}
+					writePersisted({ ...persisted, virtualBaseProvider: parsed.provider, virtualBaseModelId: parsed.modelId });
+					ctx.ui.notify(`Virtual model base: ${parsed.provider}/${parsed.modelId}`, "info");
+					}
 				return;
 			}
 

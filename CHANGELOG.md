@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.19.0] - 2026-10-01
+
+### Added
+
+- **Virtual model — `Multimodal Auto`** (`multimodal-proxy/auto`, Pi ≥ 0.99, feature-detected). The extension registers a virtual model via `pi.registerVirtualModel()`; selecting it in `/model` routes each request: turns whose pending user input carries image blocks go natively to the configured vision model (real pixels, no description fence), everything else goes to the base model — the pinned `virtual-base` model, else the physical model that answered last (`request.previous`), else the vision model. Sticky routing (`retry` → `failed`, `continuation`/`direct` → `previous`) keeps prompt caches and thinking signatures valid. `route()` resolves config per request (no registration churn on model changes) and throws an actionable error pointing at `/multimodal-proxy pick` when no vision model resolves. New commands `/multimodal-proxy virtual on|off` (default on; `unregisterVirtualModel` when off), `/multimodal-proxy virtual-base <provider/model-id>|off`, env overrides `PI_VISION_PROXY_VIRTUAL` / `PI_VISION_PROXY_VIRTUAL_BASE`, status-line `[+virtual]` marker, interactive-menu entry, and summary/help lines. With the virtual model selected, image stripping never applies (it advertises image input); video/audio detection, `analyze_image`, and consent gates are unchanged.
+- **`analyze_image` adopts the Pi 0.99 extension tool API** (older hosts ignore the new fields): results carry `isError: true` for failures instead of "Error: …" text masquerading as content (all ~18 failure paths now route through an `AnalyzeImageOutcome`), successful calls return an `outputSchema`-shaped `structuredContent` — analysis text, `cached`, fallback-aware `provider`/`model`, `latencyMs`, `groundingFormat`, and per-image `id`/`filename`/dimensions/absolute-pixel `crop` — so codemode scripts and other `ctx.executeTool()` callers receive machine-readable results, and MCP-style `annotations` (`readOnlyHint: true`, `openWorldHint: true`) plus a `multimodal-proxy` namespace group the tool in codemode listings.
+- **Model-aware upload downscale** (Pi ≥ 0.87). `modelImageResizeLimits()` reads the vision model catalog entry's `inputLimits.images.resize` (`maxWidth`/`maxHeight`/`maxBytes`/`jpegQuality`, all optional) and `downscaleForUpload()` tightens the user's `maxUploadDim`/`maxUploadBytes`/quality with it — the derived long-edge target is `min(maxWidth, maxHeight)`, the base64 `maxBytes` budget is converted to raw bytes (×0.75) before mixing with the user's raw budget, and a user-disabled downscale (`maxUploadDim: 0`) always wins. `downscaleImage` gained a `quality` parameter threaded through both the worker task and the in-thread path. All four upload paths (auto-proxy, `analyze_image`, joint descriptions, `/describe`) pass the resolved vision model's limits.
+- **Compaction-proof, cache-stable recall hint** (Pi ≥ 0.87). A `context_with_system` handler — probed on first invocation so the affordance never appears twice — takes over the `analyze_image` recall affordance once media has been described: a stable system-layer block replaces the per-user-message restatement. It survives compaction (which summarized the old hint away) and reaches vision-capable session models, where the strip path never fired. Older hosts keep the exact previous behavior.
+
+### Changed
+
+- `envFlags()` reports two new presence flags (`virtual`, `virtualBase`); the config summary, no-UI command list, and interactive menu show the virtual-model state (including a "(needs pi ≥ 0.99)" qualifier when registered on an older host).
+- Six new tests: env override + flag presence for the virtual vars, `modelImageResizeLimits` derivation (null cases, box target, quality default, raw-byte conversion), model-limits tightening vs. user-disabled downscale vs. in-budget images, and sanitize validation of the new fields (494 total, all green).
+
 ## [1.18.1] - 2026-08-30
 
 ### Fixed (post-release review of 1.18.0)

@@ -8,6 +8,15 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+## What's new in 1.19.0
+
+Deep integration with recent Pi releases (0.87 / 0.99):
+
+- **Virtual model — `Multimodal Auto`** (Pi ≥ 0.99, on by default): a new entry in `/model` that routes each request for you — turns whose pending input carries images go **natively** to your configured vision model (real pixels, no text fence), everything else stays on your base model (auto = whatever physical model handled the session before, or pin one with `/multimodal-proxy virtual-base`). Sticky routing keeps prompt caches valid within a turn; the footer shows the routed model and `/session` lists cost per physical model. Disable with `/multimodal-proxy virtual off`.
+- **`analyze_image` speaks the 0.99 tool API** — errors now surface as real tool errors (`isError`) instead of fake text, results carry a machine-readable `structuredContent` (analysis text, provider/model, latency, grounding format, per-image ids/dimensions/crop) so **codemode scripts** can consume them programmatically, and the tool is annotated (`readOnlyHint`) and namespaced (`multimodal-proxy`) for codemode listings.
+- **Model-aware upload downscale** (Pi ≥ 0.87) — when the configured vision model declares `inputLimits.images.resize` in its catalog entry, the proxy derives the downscale target, JPEG quality, and byte budget from it (tightening, never loosening, your `max-upload` settings). No more double-resizing against provider limits.
+- **Compaction-proof recall hint** (Pi ≥ 0.87) — the `analyze_image` recall affordance moves to a stable system-layer block via `context_with_system` once media has been described: it survives compaction (the old per-user-message hint was summarized away) and also reaches vision-capable session models, where the strip path never fired. Older hosts keep the previous behavior.
+
 ## What's new in 1.18.0
 
 - **Key-aware default model resolution** — the implicit vision default now lands on a model you can actually call. If the default (`zai/glm-5.3-flash`) has no API key in your setup, the proxy walks a preference-ordered candidate chain — `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` (new in Pi 0.84.4, cheap, built-in provider) → `anthropic/claude-sonnet-5` — and picks the first candidate that is in the catalog **and keyed**. A keyed legacy default is never traded for an unkeyed model; explicit choices (`/multimodal-proxy model`, `pick`, `PI_VISION_PROXY_MODEL`) are still never rewritten; and when nothing is keyed you get the actionable `pi --login` hint as before. A substitution is announced once per session.
@@ -118,6 +127,24 @@ Both are persisted in `~/.pi/agent/multimodal-proxy.json` and can be set via env
 | **`always`** | Always uses the proxy, even if the active model supports images |
 | **`off`** | Disabled entirely |
 
+## Virtual model (Pi ≥ 0.99)
+
+`Multimodal Auto` (`multimodal-proxy/auto`) is a [virtual model](https://pi.dev/docs/latest/virtual-models) the extension registers on Pi 0.99+ (on by default; `/multimodal-proxy virtual off` removes it). Select it once in `/model` and every request is routed for you:
+
+| Turn | Routed to |
+|------|-----------|
+| Pending input carries an image attachment | Your configured **vision model** — natively, so the model sees the actual pixels |
+| Everything else | Your **base model**: the pinned `/multimodal-proxy virtual-base` model, else the physical model that handled the session before, else the vision model |
+
+Why you'd want it:
+
+- **One selection, automatic escalation** — keep a cheap/fast model for text turns and pay for the vision model only when media actually appears. No manual `/model` switching.
+- **Native vision instead of descriptions** — unlike proxy mode (which converts images to text fences for non-vision models), media turns get real pixel fidelity while `analyze_image` recall stays available for re-querying.
+- **Cost transparency for free** — the footer shows `Multimodal Auto → <routed model>`, and `/session` lists cost per physical model.
+- **Cache-safe** — continuations and retries stay on the model that handled the turn, so prompt caches and thinking signatures survive.
+
+Virtual-model routing is orthogonal to proxy mode: with `Multimodal Auto` selected, image stripping never applies (the virtual model advertises image input), while video/audio path detection, `analyze_image`, and consent gates keep working exactly as before.
+
 ## Configuration
 
 Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environment variables override file settings; in-session commands override both.
@@ -147,6 +174,8 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
                                                          (clear with: /multimodal-proxy fallback-model clear)
 /multimodal-proxy retry <0-5>                          → retries on transient errors (429/5xx/network), default 2
 /multimodal-proxy max-upload <dim | n mb | off>        → downscale uploads larger than this (default 2048 px / 5 MB; off = 8192 px / 20 MB)
+/multimodal-proxy virtual on | off                     → register/remove the 'Multimodal Auto' virtual model (Pi ≥ 0.99, default on)
+/multimodal-proxy virtual-base <provider/model-id>     → pin the text-turn model for the virtual model ('off' clears → auto)
 /multimodal-proxy status on | off                      → show/hide the steady status line
 /multimodal-proxy grounding-models list                → show grounding-capable models
 /multimodal-proxy grounding-models add <provider/id> [--format <fmt>]
@@ -188,6 +217,8 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_MAX_UPLOAD_DIM` | `0` (disable downscaling entirely), or 512–8192 px long-edge threshold | `2048` |
 | `PI_VISION_PROXY_MAX_UPLOAD_MB` | 0.5–20 upload byte budget before downscale | `5` |
 | `PI_VISION_PROXY_FALLBACK_MODEL` | `provider/model-id`, or `none`/`off` to clear | not set |
+| `PI_VISION_PROXY_VIRTUAL` | `on`, `off` — register the `Multimodal Auto` virtual model (Pi ≥ 0.99) | `on` |
+| `PI_VISION_PROXY_VIRTUAL_BASE` | `provider/model-id` pinning the virtual model's text-turn model, or `none` to clear | not set |
 | `PI_VISION_PROXY_STATUS_LINE` | `on`, `off` | `on` |
 | `PI_VISION_PROXY_PATH_DETECTION` | `on`, `off` — `off` disables scanning prompt text for media file paths; structured attachments are always processed | `on` |
 
