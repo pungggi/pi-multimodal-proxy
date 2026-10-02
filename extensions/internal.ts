@@ -2373,6 +2373,68 @@ export function selectVisionModels<T extends VisionModelLike>(
 	return all.filter((m) => m.input.includes("image"));
 }
 
+/** Lowercased bigram set of a string, for Dice-coefficient similarity. */
+function bigrams(s: string): Set<string> {
+	const t = s.toLowerCase();
+	const out = new Set<string>();
+	for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2));
+	return out;
+}
+
+/**
+ * Close-match suggestions for a mistyped identifier, in the spirit of Pi
+ * 1.0's codemode recovery errors ("tools.Bash suggests tools.bash").
+ * Ranks by Dice bigram similarity with a strong exact/substring bonus;
+ * returns at most `limit` candidates above the relevance floor, best first,
+ * ties broken alphabetically so the output is deterministic.
+ */
+export function closeMatches(query: string, candidates: readonly string[], limit = 3): string[] {
+	if (!query || candidates.length === 0) return [];
+	const q = query.toLowerCase();
+	const scored = candidates.map((candidate) => {
+		const c = candidate.toLowerCase();
+		let score: number;
+		if (c === q) score = 2;
+		else if (c.includes(q) || q.includes(c)) score = 1.5;
+		else {
+			const bq = bigrams(q);
+			const bc = bigrams(c);
+			let shared = 0;
+			for (const g of bq) if (bc.has(g)) shared++;
+			score = bq.size === 0 || bc.size === 0 ? 0 : (2 * shared) / (bq.size + bc.size);
+		}
+		return { candidate, score };
+	});
+	return scored
+		.filter((s) => s.score >= 0.3)
+		.sort((a, b) => b.score - a.score || (a.candidate < b.candidate ? -1 : a.candidate > b.candidate ? 1 : 0))
+		.slice(0, limit)
+		.map((s) => s.candidate);
+}
+
+/** Minimal shape for dynamic (registry-provided) vision candidates. */
+export interface DynamicCandidateLike {
+	provider: string;
+	modelId: string;
+	input?: readonly string[];
+}
+
+/** Cheap-tier heuristic for implicit default resolution (Pi 1.0 last resort). */
+const CHEAP_MODEL_RE = /flash|mini|fast|haiku|express|lite/i;
+
+/**
+ * First keyed registry model with image input — the last-resort implicit
+ * vision default when the curated fallback chain is entirely unkeyed
+ * (Pi ≥ 1.0 `getAvailableOfType("chat")`). Cheap-tier ids are preferred so
+ * an implicit default never lands on a frontier-priced model; registry
+ * order breaks remaining ties.
+ */
+export function pickDynamicVisionCandidate<T extends DynamicCandidateLike>(models: readonly T[]): T | undefined {
+	const vision = models.filter((m) => m.input?.includes("image"));
+	if (vision.length === 0) return undefined;
+	return vision.find((m) => CHEAP_MODEL_RE.test(m.modelId)) ?? vision[0];
+}
+
 export function shouldStripImages(config: VisionConfig, modelInput: readonly string[] | undefined): boolean {
 	if (config.mode === "off") return false;
 	if (config.mode === "always") return true;
@@ -2524,12 +2586,20 @@ export function resolveCropEntry(crop: CropEntry, imgWidth: number, imgHeight: n
 	}
 	if ("normalized" in crop) {
 		const result = normalizedToPixels(crop.normalized, imgWidth, imgHeight);
-		if (!result) throw new Error(`Normalized crop has zero area after clamping (image: ${imgWidth}x${imgHeight})`);
+		if (!result)
+			throw new Error(
+				`Normalized crop has zero area after clamping (image: ${imgWidth}x${imgHeight}). ` +
+					`Use fractions of the image: x ≥ 0, y ≥ 0, x + width ≤ 1, y + height ≤ 1.`,
+			);
 		return result;
 	}
 	if ("pixels" in crop) {
 		const result = clampPixels(crop.pixels, imgWidth, imgHeight);
-		if (!result) throw new Error(`Pixel crop has zero area after clamping (image: ${imgWidth}x${imgHeight})`);
+		if (!result)
+			throw new Error(
+				`Pixel crop has zero area after clamping (image: ${imgWidth}x${imgHeight}). ` +
+					`Keep the rectangle inside the image: x ≥ 0, y ≥ 0, x + width ≤ ${imgWidth}, y + height ≤ ${imgHeight}.`,
+			);
 		return result;
 	}
 	throw new Error("Invalid CropEntry: must have exactly one of region, normalized, or pixels");

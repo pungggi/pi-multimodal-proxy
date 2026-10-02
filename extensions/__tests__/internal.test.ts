@@ -79,6 +79,8 @@ import {
 	bufferToPiAiImage,
 	shouldStripImages,
 	selectVisionModels,
+	closeMatches,
+	pickDynamicVisionCandidate,
 	splitSubcommand,
 	stripImagePaths,
 	stripMediaPaths,
@@ -371,6 +373,66 @@ describe("selectVisionModels", () => {
 	it("drops non-image scoped models", () => {
 		const scoped = [{ model: txt("x") }, { model: txt("y") }];
 		assert.deepEqual(selectVisionModels(scoped, [img("a")]).map((m) => m.id), []);
+	});
+});
+
+describe("closeMatches", () => {
+	const catalog = [
+		"anthropic/claude-sonnet-5",
+		"anthropic/claude-sonnet-4-5",
+		"deepseek/deepseek-v4-flash-vision-exp",
+		"zai/glm-5.3-flash",
+		"openai/gpt-5.6",
+	];
+
+	it("ranks a near-typo above unrelated models", () => {
+		assert.deepEqual(closeMatches("anthropic/claude-sont-5", catalog, 2), [
+			"anthropic/claude-sonnet-5",
+			"anthropic/claude-sonnet-4-5",
+		]);
+	});
+
+	it("gives substring matches a strong bonus", () => {
+		assert.deepEqual(closeMatches("glm", catalog, 1), ["zai/glm-5.3-flash"]);
+	});
+
+	it("returns nothing for queries with no reasonable match", () => {
+		assert.deepEqual(closeMatches("banana-pudding", catalog), []);
+	});
+
+	it("is deterministic on ties (alphabetical)", () => {
+		assert.deepEqual(closeMatches("mod", ["mod-b", "mod-a", "mod-c"], 3), ["mod-a", "mod-b", "mod-c"]);
+	});
+
+	it("handles empty input", () => {
+		assert.deepEqual(closeMatches("", catalog), []);
+		assert.deepEqual(closeMatches("x", []), []);
+	});
+});
+
+describe("pickDynamicVisionCandidate", () => {
+	const m = (provider: string, modelId: string, input: readonly string[] = ["text", "image"]) => ({
+		provider,
+		modelId,
+		input,
+	});
+
+	it("prefers a cheap-tier model over registry order", () => {
+		const out = pickDynamicVisionCandidate([
+			m("anthropic", "claude-opus-6"),
+			m("zai", "glm-5.3-flash"),
+		]);
+		assert.equal(out?.modelId, "glm-5.3-flash");
+	});
+
+	it("falls back to the first image-capable model when none is cheap-tier", () => {
+		const out = pickDynamicVisionCandidate([m("anthropic", "claude-opus-6"), m("x", "y")]);
+		assert.equal(out?.modelId, "claude-opus-6");
+	});
+
+	it("skips models without image input and empty lists", () => {
+		assert.equal(pickDynamicVisionCandidate([m("a", "b", ["text"])]), undefined);
+		assert.equal(pickDynamicVisionCandidate([]), undefined);
 	});
 });
 
@@ -1842,6 +1904,21 @@ describe("resolveCropEntry", () => {
 		assert.throws(
 			() => resolveCropEntry({ image_index: 0, pixels: { x: 200, y: 200, width: 10, height: 10 } }, 100, 100),
 			/zero area/,
+		);
+	});
+
+	it("zero-area normalized errors carry a recovery hint (pi 1.0 style)", () => {
+		assert.throws(
+			() =>
+				resolveCropEntry({ image_index: 0, normalized: { x: 1.0, y: 1.0, width: 0, height: 0 } }, 100, 100),
+			/fractions of the image/,
+		);
+	});
+
+	it("zero-area pixel errors carry a recovery hint (pi 1.0 style)", () => {
+		assert.throws(
+			() => resolveCropEntry({ image_index: 0, pixels: { x: 200, y: 200, width: 10, height: 10 } }, 100, 100),
+			/inside the image/,
 		);
 	});
 });
