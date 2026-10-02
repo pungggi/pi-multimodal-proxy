@@ -8,10 +8,21 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+## What's new in 1.20.0
+
+Image generation, riding Pi 1.0's new `models.generateImages()` API:
+
+- **`generate_image` tool** — agent-facing image creation with the session's image-generation models (feature-detected; silently absent on pi < 1.0). Prompt leaves only after the data-egress consent gate; the call reports usage/cost through the normal session accounting.
+- **Generated images join the pipeline** — results return as image blocks (vision base models see the pixels) **and** are persisted in the recall stores, so a text-only base model gets an automatic vision-model description (same as any tool-returned image), `#` recall works once described, and `analyze_image` can re-query or crop them via their `image="<id>"` ids.
+- **Codemode-friendly** — `outputSchema`-shaped `structuredContent` (provider, model, per-image ids/dimensions, `costUSD`) so scripts consume results programmatically; leans into Pi 1.0's leaner codemode with a compact description and recovery-style errors (close-match model suggestions, expected `provider/model-id` format, actionable `pi --login` hint when nothing is keyed).
+- **Shared cost guard** — `generate_image` counts against the same per-turn tool-call budget as `analyze_image`.
+
 ## What's new in 1.19.0
 
 Deep integration with recent Pi releases (0.87 / 0.99):
 
+- **`generate_image` tool (Pi ≥ 1.0)** — the agent can now **create** images, not just understand them. Calls run through `models.generateImages()` with the session's credentials (usage counts toward session cost), the model defaults to the first keyed image-generation model (override per call with `model: "provider/model-id"`), results carry image blocks plus stable `image="<id>"` ids, and the existing pipeline takes over automatically: text-only base models get an auto-description via your vision model, and every generated image is recallable (`#`) and re-analyzable/croppable with `analyze_image` like any attachment. Data-egress consent gates the provider before the first call.
+- **Pi 1.0 alignment (1.19.1)** — leaner `analyze_image` description (~40% smaller — codemode lists tools under a 3000-token budget and drops what doesn't fit), recovery-style errors that name close matches (model typos, recall ids) and expected shapes (crops), and a dynamic implicit-vision-model fallback via `getAvailableOfType()` when the curated chain is entirely unkeyed.
 - **Virtual model — `Multimodal Auto`** (Pi ≥ 0.99, on by default): a new entry in `/model` that routes each request for you — turns whose pending input carries images go **natively** to your configured vision model (real pixels, no text fence), everything else stays on your base model (auto = whatever physical model handled the session before, or pin one with `/multimodal-proxy virtual-base`). Sticky routing keeps prompt caches valid within a turn; the footer shows the routed model and `/session` lists cost per physical model. Disable with `/multimodal-proxy virtual off`.
 - **`analyze_image` speaks the 0.99 tool API** — errors now surface as real tool errors (`isError`) instead of fake text, results carry a machine-readable `structuredContent` (analysis text, provider/model, latency, grounding format, per-image ids/dimensions/crop) so **codemode scripts** can consume them programmatically, and the tool is annotated (`readOnlyHint`) and namespaced (`multimodal-proxy`) for codemode listings.
 - **Model-aware upload downscale** (Pi ≥ 0.87) — when the configured vision model declares `inputLimits.images.resize` in its catalog entry, the proxy derives the downscale target, JPEG quality, and byte budget from it (tightening, never loosening, your `max-upload` settings). No more double-resizing against provider limits.

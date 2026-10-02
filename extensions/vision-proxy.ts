@@ -284,6 +284,7 @@ import {
 	applyDefaultModelFallback,
 	closeMatches,
 	pickDynamicVisionCandidate,
+	resolveImageGenModelChoice,
 	DEFAULT_MODEL_FALLBACKS,
 	applyRecallCompletion,
 	buildRecallItems,
@@ -469,6 +470,52 @@ const TOOL_DESCRIPTION = [
 /** Maximum analyze_image tool calls per agent turn. Prevents cost runaway. */
 const MAX_TOOL_CALLS_PER_TURN = 10;
 
+/**
+ * generate_image parameters (Pi ≥ 1.0). Lean on purpose: pi 1.0's codemode
+ * lists tool declarations under a 3000-token inline budget.
+ */
+const GenerateImageParams = Type.Object({
+	prompt: Type.String({
+		description: "Required, non-empty, max 4000 chars. What to draw; include style and aspect-ratio cues the provider supports.",
+	}),
+	model: Type.Optional(
+		Type.String({
+			description: "Optional; provider/model-id of an image-generation model. Defaults to the first available (keyed) image model.",
+		}),
+	),
+	reason: Type.Optional(Type.String({ description: "Optional; logged for analytics only" })),
+});
+
+/**
+ * outputSchema of generate_image: codemode scripts receive this
+ * structuredContent instead of the text + image blocks.
+ */
+const GenerateImageOutput = Type.Object({
+	ok: Type.Boolean({ description: "Whether generation succeeded." }),
+	error: Type.Optional(Type.String({ description: "Failure message, present when ok is false." })),
+	provider: Type.Optional(Type.String({ description: "Provider that generated the images." })),
+	model: Type.Optional(Type.String({ description: "Model id that generated the images." })),
+	images: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.String({ description: "Stable image id usable for recall (image=\"...\") and analyze_image." }),
+				mimeType: Type.String(),
+				width: Type.Optional(Type.Number()),
+				height: Type.Optional(Type.Number()),
+			}),
+		),
+	),
+	costUSD: Type.Optional(Type.Number({ description: "Reported generation cost, when the provider returned usage." })),
+});
+
+const GENERATE_IMAGE_DESCRIPTION = [
+	"Generate images with the session's image-generation models (Pi ≥ 1.0, request-time credentials).",
+	"",
+	"`prompt` describes what to draw; `model` optionally picks an image-generation model (provider/model-id — defaults to the first available).",
+	"Returns image blocks attached to this result plus stable `image=\"<id>\"` ids that analyze_image can re-analyze or crop like any other image.",
+	"Each call costs money — use it when the user asks for an image to be created, not speculatively.",
+].join("\n");
+
 /** Default tool-result cache size; resized to config.cacheSize on first use. */
 const DEFAULT_TOOL_CACHE_SIZE = 50;
 
@@ -508,6 +555,8 @@ interface SessionState {
 	keyProbe?: Map<string, boolean>;
 	/** Cached dynamic (registry-keyed) vision candidate; null = none or runtime without the API (Pi ≥ 1.0). */
 	dynamicVisionProbe?: { provider: string; modelId: string } | null;
+	/** Cached available (keyed) image-generation models (Pi ≥ 1.0). */
+	imageGenModels?: Array<{ provider: string; modelId: string }>;
 	/** Last implicit-default substitution already notified this session. */
 	notifiedDefaultSub?: string;
 	/**
@@ -1741,6 +1790,188 @@ function recallSuggestions(imageData: ImageDataStore, imageMeta: ImageMetaStore,
 	return closeMatches(query, candidates, limit);
 }
 
+/** Content block shapes a tool result may carry (text and/or image). */
+type ToolContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+/** Structured outcome of one generate_image call (1.20.0). */
+interface GenerateImageOutcome {
+	content: ToolContentBlock[];
+	isError?: boolean;
+	structured?: Record<string, unknown>;
+	usage?: unknown;
+}
+
+/** Wrap a failure message as a GenerateImageOutcome. */
+function generationError(message: string): GenerateImageOutcome {
+	return { content: [{ type: "text", text: message }], isError: true, structured: { ok: false, error: message } };
+}
+
+/**
+ * Available (keyed) image-generation models via getAvailableOfType("image")
+ * (Pi ≥ 1.0, feature-detected). Cached per session; probe failures cache as
+ * an empty list so a transient error cannot wedge the tool.
+ */
+async function availableImageGenModels(ctx: ExtensionContext): Promise<Array<{ provider: string; modelId: string }>> {
+	const state = getSessionState(ctx);
+	if (state.imageGenModels) return state.imageGenModels;
+	let out: Array<{ provider: string; modelId: string }> = [];
+	const reg = ctx.modelRegistry as ModelRegistry & {
+		getAvailableOfType?: (type: string) => Promise<ReadonlyArray<unknown>>;
+	};
+	if (typeof reg.getAvailableOfType === "function") {
+		try {
+			const models = (await reg.getAvailableOfType("image")) as ReadonlyArray<{ provider?: unknown; id?: unknown }>;
+			out = models
+				.filter((m): m is { provider: string; id: string } => typeof m.provider === "string" && typeof m.id === "string")
+				.map((m) => ({ provider: m.provider, modelId: m.id }));
+		} catch {
+			out = [];
+		}
+	}
+	state.imageGenModels = out;
+	return out;
+}
+
+/** Minimal response shape of ModelRegistry.generateImages() (Pi ≥ 1.0). */
+interface GenerateImagesResponseLike {
+	output?: ReadonlyArray<{ type?: unknown; data?: unknown; mimeType?: unknown }>;
+	usage?: { costUSD?: unknown; inputTokens?: unknown; outputTokens?: unknown };
+	stopReason?: unknown;
+	errorMessage?: unknown;
+}
+
+/**
+ * Generate one or more images with the session's image-generation models
+ * (Pi ≥ 1.0 `models.generateImages()`): resolve the model (explicit override
+ * with recovery-style suggestions, else the first keyed image model), gate
+ * on data-egress consent (the prompt leaves), call the registry, and return
+ * image blocks the conversation can see. Generated images are persisted in
+ * the recall stores, so analyze_image (and `#` recall once described) work
+ * on them exactly like attached images — including when the base model sees
+ * the pixels directly and the tool_result auto-description path never fires.
+ */
+async function handleGenerateImage(
+	params: { prompt: string; model?: string; reason?: string },
+	ctx: ExtensionContext,
+	config: VisionConfig,
+): Promise<GenerateImageOutcome> {
+	const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
+	if (!prompt) return generationError("Error: prompt is required and must be non-empty.");
+	if (prompt.length > 4000) return generationError("Error: prompt must be at most 4000 characters.");
+
+	// Resolve the image-generation model.
+	const available = await availableImageGenModels(ctx);
+	const choice = resolveImageGenModelChoice(params.model, available);
+	if (!choice.ok) {
+		return generationError(
+			`Error: ${choice.error}.` +
+				(choice.suggestions.length > 0 ? ` Close matches: ${choice.suggestions.join(", ")}.` : ""),
+		);
+	}
+
+	// Data-egress consent: the prompt leaves for the image provider.
+	const entries = ctx.sessionManager.getEntries();
+	if (!hasConsent(entries, choice.provider, config.allowedProviders, config.deniedProviders)) {
+		return generationError(
+			`Error: consent required before sending the prompt to ${choice.provider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes\n\n(To pre-consent this provider permanently: /multimodal-proxy allowed-providers add ${choice.provider})`,
+		);
+	}
+
+	// Fetch the ImageModel object for the chosen pair (sync registry lookups).
+	const reg = ctx.modelRegistry as ModelRegistry & {
+		getModelsOfType?: (type: string) => ReadonlyArray<unknown>;
+		findOfType?: (type: string, provider: string, modelId: string) => unknown;
+		generateImages?: (
+			model: unknown,
+			context: { input: Array<{ type: "text"; text: string }> },
+			options?: { signal?: AbortSignal },
+		) => Promise<GenerateImagesResponseLike>;
+	};
+	if (typeof reg.generateImages !== "function") {
+		return generationError("Error: this pi runtime does not expose models.generateImages() (needs pi ≥ 1.0). Update pi.");
+	}
+	let imageModel: unknown;
+	if (typeof reg.getModelsOfType === "function") {
+		const all = reg.getModelsOfType("image") as ReadonlyArray<{ provider?: unknown; id?: unknown }>;
+		imageModel = all.find(
+				(m) =>
+					typeof m.provider === "string" &&
+					typeof m.id === "string" &&
+					m.provider === choice.provider &&
+					m.id === choice.modelId,
+		);
+	}
+	if (!imageModel && typeof reg.findOfType === "function") {
+		imageModel = reg.findOfType("image", choice.provider, choice.modelId);
+	}
+	if (!imageModel) {
+		return generationError(
+			`Error: image model "${choice.provider}/${choice.modelId}" could not be resolved in the registry.`,
+		);
+	}
+
+	let response: GenerateImagesResponseLike;
+	try {
+		response = await reg.generateImages(imageModel, { input: [{ type: "text", text: prompt }] }, { signal: ctx.signal });
+	} catch (err) {
+		return generationError(`Error: image generation failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (response.stopReason === "aborted") return generationError("Error: generation was cancelled.");
+	if (response.stopReason === "error") {
+		return generationError(
+			`Error: image generation failed: ${typeof response.errorMessage === "string" ? response.errorMessage : "unknown provider error"}`,
+		);
+	}
+
+	const blocks = (response.output ?? []).filter(
+		(b): b is { type: "image"; data: string; mimeType: string } =>
+			b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string",
+	);
+	if (blocks.length === 0) {
+		return generationError(
+			"Error: the model returned no images (text-only response). Try a different prompt or model.",
+		);
+	}
+
+	// Persist recall data so analyze_image (and # recall, once a description
+	// exists) work on generated images even when the base model sees the
+	// pixels directly and the tool_result auto-description path never fires.
+	const { imageMeta, imageData } = getSessionState(ctx);
+	const structuredImages: Array<Record<string, unknown>> = [];
+	for (const b of blocks) {
+		const hash = hashImageData(b.data);
+		const ext = b.mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "png";
+		storeImageMeta(imageMeta, hash, b.data, `generated-${hash.slice(0, 8)}.${ext}`);
+		storeImageData(imageData, hash, b.data, b.mimeType);
+		const dims = imageMeta.get(hash);
+		structuredImages.push({
+			id: hash,
+			mimeType: b.mimeType,
+			...(dims ? { width: dims.width, height: dims.height } : {}),
+		});
+	}
+
+	const costUSD = typeof response.usage?.costUSD === "number" ? response.usage.costUSD : undefined;
+	const ids = structuredImages.map((i) => `image="${i.id}"`).join(", ");
+	const text =
+		`[generate_image] ${pluralImages(blocks.length)} generated via ${choice.provider}/${choice.modelId}` +
+		(ids ? ` (${ids})` : "") +
+		(costUSD !== undefined ? ` — cost $${costUSD.toFixed(4)}` : "") +
+		". The images are attached as image blocks; their ids can be re-analyzed or cropped with analyze_image.";
+
+	return {
+		content: [{ type: "text", text }, ...blocks],
+		structured: {
+			ok: true,
+			provider: choice.provider,
+			model: choice.modelId,
+			images: structuredImages,
+			...(costUSD !== undefined ? { costUSD } : {}),
+		},
+		...(response.usage ? { usage: response.usage } : {}),
+	};
+}
+
 /**
  * Answer a targeted analyze_image question about one or more images: resolve
  * references (session recall ids or file paths), validate and apply crops,
@@ -2105,6 +2336,7 @@ interface EditorAutocompleteProvider {
 
 export default function (pi: ExtensionAPI) {
 	let _toolRegistered = false;
+	let _generateToolRegistered = false;
 	let _autocompleteRegistered = false;
 
 	/**
@@ -2340,7 +2572,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 	/** Register or unregister the analyze_image tool based on config. */
-	function syncToolRegistration(config: VisionConfig) {
+	function syncToolRegistration(config: VisionConfig, runtimeCtx?: ExtensionContext) {
 		const shouldHaveTool = config.mode !== "off" && config.tool === "on";
 		if (shouldHaveTool && !_toolRegistered) {
 			pi.registerTool({
@@ -2403,6 +2635,82 @@ export default function (pi: ExtensionAPI) {
 			});
 			_toolRegistered = true;
 		}
+		// generate_image (Pi ≥ 1.0 only): registered alongside analyze_image
+		// when the runtime exposes ModelRegistry.generateImages; silently
+		// skipped on older hosts so the tool never appears there.
+		if (
+			shouldHaveTool &&
+			!_generateToolRegistered &&
+			runtimeCtx &&
+			typeof (runtimeCtx.modelRegistry as ModelRegistry & { generateImages?: unknown }).generateImages ===
+				"function"
+		) {
+			pi.registerTool({
+				name: "generate_image",
+				label: "Generate Image",
+				description: GENERATE_IMAGE_DESCRIPTION,
+				promptSnippet: "Generate images with the session's image-generation models",
+				promptGuidelines: [
+					"Use generate_image when the user explicitly asks to create an image; each call costs money.",
+					'Generated images carry image="<id>" ids and can be re-analyzed or cropped with analyze_image like any other image.',
+				],
+				// Cost-incurring content creation: not read-only. openWorldHint — the
+				// prompt leaves for the configured image provider.
+				annotations: {
+					readOnlyHint: false,
+					destructiveHint: false,
+					idempotentHint: false,
+					openWorldHint: true,
+				},
+				namespace: {
+					name: "multimodal-proxy",
+					description: "pi-multimodal-proxy media analysis (targeted image re-analysis with crop and grounding)",
+				},
+				outputSchema: GenerateImageOutput,
+				parameters: GenerateImageParams,
+				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
+					const entries = extCtx.sessionManager.getEntries();
+					const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
+
+					// Runtime check - tool may have been disabled mid-session
+					if (config.tool !== "on" || config.mode === "off") {
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: "Error: generate_image tool is currently disabled. Use /multimodal-proxy tool on to enable.",
+								},
+							],
+							isError: true,
+						};
+					}
+
+					// Share the per-turn cost-runaway budget with analyze_image.
+					const state = getSessionState(extCtx);
+					state.toolCallCount++;
+					if (state.toolCallCount > MAX_TOOL_CALLS_PER_TURN) {
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: `Error: tool call limit reached (${MAX_TOOL_CALLS_PER_TURN} per turn). Try again in the next turn.`,
+								},
+							],
+							isError: true,
+						};
+					}
+
+					const outcome = await handleGenerateImage(params, extCtx, config);
+					return {
+						content: outcome.content,
+						...(outcome.isError ? { isError: true } : {}),
+						...(outcome.structured ? { structuredContent: outcome.structured } : {}),
+						...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
+					};
+				},
+			});
+			_generateToolRegistered = true;
+		}
 		// Note: Pi's extension API doesn't have unregisterTool - tool registration
 		// persists for the session. The tool's execute handler checks the current
 		// config at runtime and returns an error if disabled.
@@ -2418,6 +2726,8 @@ export default function (pi: ExtensionAPI) {
 		clearImageData(state.imageData);
 		state.compaction = undefined;
 		state.keyProbe = undefined;
+		state.dynamicVisionProbe = undefined;
+		state.imageGenModels = undefined;
 		state.notifiedDefaultSub = undefined;
 
 		_fileConfig = await readPersistentFile();
@@ -2427,7 +2737,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("multimodal-proxy", steadyStatusText(config, ctx.modelRegistry));
 
 		// Register tool if enabled
-		syncToolRegistration(config);
+		syncToolRegistration(config, ctx);
 
 		// Register the multimodal-proxy/auto virtual model (pi ≥ 0.99)
 		syncVirtualModelRegistration(config);
@@ -3319,7 +3629,7 @@ export default function (pi: ExtensionAPI) {
 					next.mode === "off" ? "warning" : "info",
 				);
 				// Sync tool registration on mode change
-				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig), ctx);
 				return;
 			}
 
@@ -3731,7 +4041,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				}
 				if (valueLower === "on") {
 					const next = writePersisted({ ...persisted, tool: "on" });
-					syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+					syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig), ctx);
 					ctx.ui.notify(`[multimodal-proxy] analyze_image tool: ON`, "info");
 					return;
 				}
@@ -4472,7 +4782,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				if (modeChoice !== "fallback" && modeChoice !== "always" && modeChoice !== "off") return;
 				const next = writePersisted({ ...persisted, mode: modeChoice });
 				ctx.ui.notify(`Mode set to: ${next.mode}`, "info");
-				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig), ctx);
 				return;
 			}
 
@@ -4501,7 +4811,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				}
 				const nextTool = effective.tool === "on" ? "off" : "on";
 				writePersisted({ ...persisted, tool: nextTool });
-				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig));
+				syncToolRegistration(resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig), ctx);
 				ctx.ui.notify(`Tool: ${nextTool}`, nextTool === "on" ? "info" : "warning");
 				return;
 			}

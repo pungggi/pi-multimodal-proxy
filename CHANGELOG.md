@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.20.0] - 2026-10-02
+
+### Added
+
+- **`generate_image` tool (Pi ≥ 1.0, feature-detected)** — agent-facing image creation through `ModelRegistry.generateImages()` with the session's credentials and request-time auth; usage counts toward session cost. Parameters: `prompt` (1..4000 chars), optional `model` (`provider/model-id` of an image-generation model). Model resolution walks `getAvailableOfType("image")` (cached per session): without an override the first keyed image model wins; a mistyped override errors with recovery-style close matches and a malformed one gets the expected format (Pi 1.0 codemode-error philosophy). The prompt leaves only after the data-egress consent gate (`/multimodal-proxy consent yes` / `allowed-providers`). Results carry the generated image blocks (vision-capable base models see the pixels directly) plus a summary text naming each `image="<id>"` id, and an `outputSchema`-shaped `structuredContent` (provider, model, per-image id/mimeType/dimensions, `costUSD` when the provider reported usage; `usage` passed through on the tool result). Generated images are persisted in the per-session recall stores (`imageData`/`imageMeta`) with `generated-<hash8>.<ext>` filename hints, so the existing pipeline takes over: for text-only base models the `tool_result` hook auto-describes them via the vision model and appends `DescriptionEntry`s (making `#` recall work), and `analyze_image` can re-query or crop them by id regardless of base-model modality. Shares the per-turn tool-call budget with `analyze_image` (10/turn); annotated `readOnlyHint: false` (cost-incurring content creation) and namespaced `multimodal-proxy`. Registered only when the runtime exposes `generateImages` — pi < 1.0 never sees the tool.
+- Five new tests for `resolveImageGenModelChoice` (default-first, exact override, close-match suggestions on typos, expected-format error, actionable hint when nothing is keyed) — 512 total, all green.
+
 ## [1.19.1] - 2026-10-02
 
 ### Changed

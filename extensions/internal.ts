@@ -2435,6 +2435,50 @@ export function pickDynamicVisionCandidate<T extends DynamicCandidateLike>(model
 	return vision.find((m) => CHEAP_MODEL_RE.test(m.modelId)) ?? vision[0];
 }
 
+/** Outcome of image-generation model resolution (generate_image tool). */
+export type ImageGenModelChoice =
+	| { ok: true; provider: string; modelId: string }
+	| { ok: false; error: string; suggestions: readonly string[] };
+
+/**
+ * Resolve the image-generation model for one `generate_image` call (Pi ≥ 1.0).
+ * An explicit `provider/model-id` override must match an available (keyed)
+ * image model exactly — otherwise the error carries recovery-style close
+ * matches. Without an override the first available model wins.
+ */
+export function resolveImageGenModelChoice(
+	override: string | undefined,
+	available: ReadonlyArray<{ provider: string; modelId: string }>,
+): ImageGenModelChoice {
+	const labels = available.map((m) => `${m.provider}/${m.modelId}`);
+	if (override === undefined || override === "") {
+		const first = available[0];
+		if (!first) {
+			return {
+				ok: false,
+				error: "no image-generation model is available (keyed) in this session — add a provider key (e.g. pi --login openrouter)",
+				suggestions: [],
+			};
+		}
+		return { ok: true, provider: first.provider, modelId: first.modelId };
+	}
+	const parsed = parseModelString(override);
+	if (!parsed) {
+		return {
+				ok: false,
+			error: `invalid model string "${override}". Expected format: provider/model-id`,
+			suggestions: [],
+		};
+	}
+	const exact = available.find((m) => m.provider === parsed.provider && m.modelId === parsed.modelId);
+	if (exact) return { ok: true, provider: exact.provider, modelId: exact.modelId };
+	return {
+		ok: false,
+		error: `model "${parsed.provider}/${parsed.modelId}" not found among available image-generation models`,
+		suggestions: closeMatches(`${parsed.provider}/${parsed.modelId}`, labels, 3),
+	};
+}
+
 export function shouldStripImages(config: VisionConfig, modelInput: readonly string[] | undefined): boolean {
 	if (config.mode === "off") return false;
 	if (config.mode === "always") return true;
