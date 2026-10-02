@@ -81,6 +81,7 @@ import {
 	selectVisionModels,
 	closeMatches,
 	pickDynamicVisionCandidate,
+	resolveImageGenModelChoice,
 	splitSubcommand,
 	stripImagePaths,
 	stripMediaPaths,
@@ -433,6 +434,56 @@ describe("pickDynamicVisionCandidate", () => {
 	it("skips models without image input and empty lists", () => {
 		assert.equal(pickDynamicVisionCandidate([m("a", "b", ["text"])]), undefined);
 		assert.equal(pickDynamicVisionCandidate([]), undefined);
+	});
+});
+
+describe("resolveImageGenModelChoice", () => {
+	const available = [
+		{ provider: "openrouter", modelId: "gpt-image-1" },
+		{ provider: "openrouter", modelId: "flux-schnell" },
+		{ provider: "google", modelId: "imagen-4" },
+	];
+
+	it("defaults to the first available model without an override", () => {
+		assert.deepEqual(resolveImageGenModelChoice(undefined, available), {
+			ok: true,
+			provider: "openrouter",
+			modelId: "gpt-image-1",
+		});
+		assert.deepEqual(resolveImageGenModelChoice("", available), {
+			ok: true,
+			provider: "openrouter",
+			modelId: "gpt-image-1",
+		});
+	});
+
+	it("accepts an exact override", () => {
+		assert.deepEqual(resolveImageGenModelChoice("google/imagen-4", available), {
+			ok: true,
+			provider: "google",
+			modelId: "imagen-4",
+		});
+	});
+
+	it("mistyped overrides carry recovery-style close matches", () => {
+		const out = resolveImageGenModelChoice("openrouter/gpt-imge-1", available);
+		assert.equal(out.ok, false);
+		if (!out.ok) {
+			assert.match(out.error, /not found/);
+			assert.ok(out.suggestions.includes("openrouter/gpt-image-1"));
+		}
+	});
+
+	it("rejects malformed model strings with the expected format", () => {
+		const out = resolveImageGenModelChoice("no-slash", available);
+		assert.equal(out.ok, false);
+		if (!out.ok) assert.match(out.error, /Expected format: provider\/model-id/);
+	});
+
+	it("errors with an actionable hint when nothing is keyed", () => {
+		const out = resolveImageGenModelChoice(undefined, []);
+		assert.equal(out.ok, false);
+		if (!out.ok) assert.match(out.error, /pi --login/);
 	});
 });
 
