@@ -282,6 +282,8 @@ import {
 	canonicalYouTubeUrl,
 	youTubeVideoId,
 	applyDefaultModelFallback,
+	closeMatches,
+	pickDynamicVisionCandidate,
 	DEFAULT_MODEL_FALLBACKS,
 	applyRecallCompletion,
 	buildRecallItems,
@@ -450,22 +452,18 @@ const AnalyzeImageOutput = Type.Object({
 });
 
 const TOOL_DESCRIPTION = [
-	"Use `analyze_image` when (a) the cached description of an image lacks a detail you need,",
-	"(b) you need to compare or cross-reference multiple images, or (c) you need to focus on a specific region.",
+	"Targeted image analysis with cropping and model-native grounding support.",
 	"",
-	"**Cropping.** Three forms, in order of preference:",
+	"Use it when (a) a cached image description lacks a detail you need, (b) you must compare or cross-reference images, or (c) you must focus on a region. The result is authoritative for the question asked; the cached generic description stays the default for everything else.",
 	"",
-	"- **`region`** - coarse cut by name. Use when you don't have exact dimensions: `{ image_index: 0, region: \"bottom-right\" }`.",
-	"- **`normalized`** - fractional coordinates 0.0-1.0. Default choice for precise crops without knowing image dimensions: `{ image_index: 0, normalized: { x: 0.5, y: 0.5, width: 0.4, height: 0.4 } }`.",
-	"- **`pixels`** - absolute pixels. Use only when you have authoritative coordinates from a prior `<vision_proxy_description>` or `<vision_proxy_analysis>` (which carry `width` and `height` attributes) or from a previous grounded response. Example: `{ image_index: 0, pixels: { x: 1840, y: 120, width: 840, height: 360 } }`.",
+	"Image references are file paths OR the `image=\"<id>\"` id carried by every `<vision_proxy_description>`/`<vision_proxy_analysis>`/`<vision_proxy_joint_description>` fence — pass an id to re-examine or crop an image the user shared earlier, even if it is no longer attached.",
 	"",
-	"Image dimensions and filenames are available in the `width`, `height`, and `filename` attributes of `<vision_proxy_description>`, `<vision_proxy_analysis>`, and `<vision_proxy_joint_description>` blocks in your context.",
+	"Cropping, in order of preference (one crop per image, keyed by `image_index`):",
+	"- `region` — named cut (`top-left`, `bottom-right`, `center`, `right-half`, …) when you don't know the dimensions: `{ image_index: 0, region: \"bottom-right\" }`.",
+	"- `normalized` — `{ x, y, width, height }` as 0.0-1.0 fractions; the default for precise crops without dimensions.",
+	"- `pixels` — `{ x, y, width, height }` absolute; only with authoritative coordinates from a prior fence's `width`/`height` attributes or a grounded response.",
 	"",
-	"**Recalling an earlier image.** Every such block also carries an `image=\"...\"` id. To re-examine or crop an image the user shared earlier in the session — even if it is no longer attached to the current message (e.g. \"zoom into that screenshot from before\") — pass that id as the image reference instead of a file path. No re-attachment is required.",
-	"",
-	"When a crop is applied, the response fence carries a `crop_origin` attribute (e.g. `crop_origin=\"1840,120\"`). Add the origin's x to any returned x-coordinate and the origin's y to any returned y-coordinate to map coordinates back to the original full image.",
-	"",
-	"The tool result is authoritative for the specific question asked; the cached generic description remains the default for everything else.",
+	"Fences carry `width`, `height`, and `filename`, and a crop adds `crop_origin=\"x,y\"` — add the origin to returned coordinates to map them back to the full image.",
 ].join("\n");
 
 /** Maximum analyze_image tool calls per agent turn. Prevents cost runaway. */
@@ -508,6 +506,8 @@ interface SessionState {
 	compaction?: { reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean };
 	/** Cached "provider/model has an API key" probes (cleared per session). */
 	keyProbe?: Map<string, boolean>;
+	/** Cached dynamic (registry-keyed) vision candidate; null = none or runtime without the API (Pi ≥ 1.0). */
+	dynamicVisionProbe?: { provider: string; modelId: string } | null;
 	/** Last implicit-default substitution already notified this session. */
 	notifiedDefaultSub?: string;
 	/**
@@ -762,7 +762,56 @@ async function withModelFallback(config: VisionConfig, ctx: ExtensionContext): P
 		keys.set(`${pair.provider}/${pair.modelId}`, await probe(pair.provider, pair.modelId));
 	}
 	const hasKey = (p: string, m: string) => keys.get(`${p}/${m}`) === true;
-	return applyDefaultModelFallback(config, hasModel, false, hasKey);
+	const resolved = applyDefaultModelFallback(config, hasModel, false, hasKey);
+	// Pi ≥ 1.0 last resort: the curated chain can be entirely unkeyed while
+	// the user has another keyed vision-capable model (openrouter, google, …).
+	// getAvailableOfType lists exactly those — land the implicit default on
+	// the first one instead of dead-ending on the "No API key" notice.
+	// (Explicit choices returned early above; a keyed chain resolution already
+	// changed provider/modelId, which the equality check skips.)
+	const anyKeyed = [...keys.values()].some(Boolean);
+	if (!anyKeyed && resolved.provider === config.provider && resolved.modelId === config.modelId) {
+		const dyn = await dynamicVisionCandidate(ctx);
+		if (dyn) return { ...resolved, provider: dyn.provider, modelId: dyn.modelId };
+	}
+	return resolved;
+}
+
+/**
+ * Pi ≥ 1.0 dynamic vision-candidate probe (ModelRegistry.getAvailableOfType):
+ * the first keyed chat model with image input, cheap tier preferred
+ * (pickDynamicVisionCandidate). Feature-detected — older runtimes and probe
+ * failures cache as null; the probe runs once per session.
+ */
+async function dynamicVisionCandidate(ctx: ExtensionContext): Promise<{ provider: string; modelId: string } | null> {
+	const state = getSessionState(ctx);
+	if (state.dynamicVisionProbe !== undefined) return state.dynamicVisionProbe;
+	let out: { provider: string; modelId: string } | null = null;
+	const reg = ctx.modelRegistry as ModelRegistry & {
+		getAvailableOfType?: (type: string) => Promise<ReadonlyArray<unknown>>;
+	};
+	if (typeof reg.getAvailableOfType === "function") {
+		try {
+			const available = await reg.getAvailableOfType("chat");
+			const candidates = (
+				available as ReadonlyArray<{ provider?: unknown; id?: unknown; input?: unknown }>
+			)
+				.filter(
+					(m): m is { provider: string; id: string; input: readonly string[] } =>
+						typeof m.provider === "string" &&
+						typeof m.id === "string" &&
+						Array.isArray(m.input) &&
+						m.input.includes("image"),
+				)
+				.map((m) => ({ provider: m.provider, modelId: m.id, input: m.input }));
+			const pick = pickDynamicVisionCandidate(candidates);
+			if (pick) out = { provider: pick.provider, modelId: pick.modelId };
+		} catch {
+			out = null;
+		}
+	}
+	state.dynamicVisionProbe = out;
+	return out;
 }
 
 /**
@@ -1647,6 +1696,52 @@ function analysisError(message: string): AnalyzeImageOutcome {
 }
 
 /**
+ * Close-match vision-model suggestions for recovery-style tool errors, in
+ * the spirit of Pi 1.0's codemode errors ("tools.Bash suggests
+ * tools.bash"). Labels every registry model with image input; no key
+ * probing — error paths must stay cheap.
+ */
+function registryVisionSuggestions(ctx: ExtensionContext, query: string, limit = 3): string[] {
+	try {
+		const models = ctx.modelRegistry.getAll() as unknown as ReadonlyArray<{
+			provider?: unknown;
+			id?: unknown;
+			input?: unknown;
+		}>;
+		const labels = models
+			.filter(
+				(m): m is { provider: string; id: string; input: readonly string[] } =>
+					typeof m.provider === "string" &&
+					typeof m.id === "string" &&
+					Array.isArray(m.input) &&
+					m.input.includes("image"),
+			)
+			.map((m) => `${m.provider}/${m.id}`);
+		return closeMatches(query, labels, limit);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Close-match recall-id suggestions: matches the mistyped id against every
+ * retained image's hash (and filename, when known) and returns full ids the
+ * agent can pass verbatim.
+ */
+function recallSuggestions(imageData: ImageDataStore, imageMeta: ImageMetaStore, query: string, limit = 3): string[] {
+	const candidates: string[] = [];
+	try {
+		for (const hash of imageData.map.keys()) {
+			const meta = imageMeta.get(hash);
+			candidates.push(meta?.filename ? `${hash} (${meta.filename})` : hash);
+		}
+	} catch {
+		return [];
+	}
+	return closeMatches(query, candidates, limit);
+}
+
+/**
  * Answer a targeted analyze_image question about one or more images: resolve
  * references (session recall ids or file paths), validate and apply crops,
  * consult the per-session cache, and call the vision model (with retry and
@@ -1709,7 +1804,12 @@ async function handleAnalyzeImage(
 	// Verify model exists and supports images
 	const visionModel = ctx.modelRegistry.find(visionProvider, visionModelId);
 	if (!visionModel) {
-		return analysisError(`Error: model "${visionProvider}/${visionModelId}" not found in registry. Use /multimodal-proxy pick to choose a vision model.`);
+		const suggestions = registryVisionSuggestions(ctx, `${visionProvider}/${visionModelId}`);
+		return analysisError(
+			`Error: model "${visionProvider}/${visionModelId}" not found in registry.` +
+				(suggestions.length > 0 ? ` Close matches: ${suggestions.join(", ")}.` : "") +
+				" Use /multimodal-proxy pick to choose a vision model.",
+		);
 	}
 	if (!visionModel.input.includes("image")) {
 		return analysisError(`Error: model "${visionModel.name ?? visionModelId}" does not support image input.`);
@@ -1731,7 +1831,12 @@ async function handleAnalyzeImage(
 		if (recallHash) {
 			const stored = getImageData(imageData, recallHash);
 			if (!stored) {
-				return analysisError(`Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed. Ask the user to re-attach it, or pass a file path.`);
+				const suggestions = recallSuggestions(imageData, imageMeta, recallHash);
+				return analysisError(
+					`Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.` +
+						(suggestions.length > 0 ? ` Close ids still retained: ${suggestions.join(", ")}.` : "") +
+						" Ask the user to re-attach it, or pass a file path.",
+				);
 			}
 			const image: PiAiImage = { type: "image", data: stored.data, mimeType: stored.mimeType };
 			// Backfill dimensions if metadata was evicted, so crops still work on recall.

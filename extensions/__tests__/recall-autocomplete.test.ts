@@ -16,6 +16,16 @@ describe("extractRecallToken", () => {
 		assert.deepEqual(extractRecallToken(["#"], 0, 1), { query: "", prefix: "#" });
 	});
 
+	it("matches a # token after leading whitespace (pi #10218 mirror)", () => {
+		// Pi 1.0 fixed slash-command autocomplete not triggering when the input
+		// starts with whitespace; the # recall provider must behave the same.
+		assert.deepEqual(extractRecallToken(["  #shot"], 0, 7), {
+			query: "shot",
+			prefix: "#shot",
+		});
+		assert.deepEqual(extractRecallToken(["   #"], 0, 4), { query: "", prefix: "#" });
+	});
+
 	it("matches a # token after whitespace with a partial query", () => {
 		assert.deepEqual(extractRecallToken(["zoom into #shot"], 0, 15), {
 			query: "shot",

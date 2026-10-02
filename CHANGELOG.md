@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.19.1] - 2026-10-02
+
+### Changed
+
+- **Leaner `analyze_image` description** — the tool description shrinks ~40% (1.7 KB → ~1.0 KB) while keeping every actionable detail (when to use, the three crop forms with shapes, recall ids, fence attributes, `crop_origin` math). Pi 1.0's codemode lists tool declarations under a 3000-token inline budget and drops what doesn't fit, so a long description both costs tokens on every request and risks pushing other tools out of the listing.
+- **Recovery-style errors (Pi 1.0 codemode philosophy: errors say how to recover)** — `analyze_image`'s model-not-found error now names close registry matches (`anthropic/claude-sont-5` → suggests `anthropic/claude-sonnet-5`, `…-sonnet-4-5`), the recall-id-not-found error lists close ids still retained in the session cache, and zero-area crop errors explain the expected shape (fraction/absolute bounds) instead of just "zero area".
+- **Dynamic implicit-vision-model fallback (Pi ≥ 1.0, feature-detected)** — when the curated fallback chain (`zai/glm-5.3-flash` → `deepseek/…-flash-vision-exp` → `anthropic/claude-sonnet-5/4-5`) is entirely unkeyed but another keyed vision-capable chat model exists (openrouter, google, …), `ModelRegistry.getAvailableOfType("chat")` resolves the implicit default to the first one (cheap-tier ids — flash/mini/fast/haiku/express/lite — preferred so an implicit default never lands on a frontier-priced model). Probe cached per session; older runtimes and the "nothing keyed anywhere" notice path are unchanged.
+- **`#` recall autocomplete regression tests** mirroring pi #10218 (autocomplete must trigger when input starts with whitespace) — the `(?:^|\s)#` token regex already handled it; the tests pin it.
+- Six new tests: `closeMatches` (near-typo ranking, substring bonus, relevance floor, deterministic ties), `pickDynamicVisionCandidate` (cheap-tier preference, first-capable fallback, input filtering), zero-area crop recovery hints (507 total, all green).
+
 ## [1.19.0] - 2026-10-01
 
 ### Added
