@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.21.0] - 2026-10-03
+
+### Added
+
+- **Compact transcript rows via `pi.registerToolRenderer()` (Pi ≥ 1.0.1, feature-detected)** — `analyze_image` and `generate_image` calls now render as one compact, themed line each instead of the default JSON-args dump. The `analyze_image` call line shows the question (word-boundary truncated, surrogate-pair safe), image references (recall ids → `image="deadbeef…"`, file paths → file name, `+N more` beyond two shown), a crop summary (`bottom-right@0` / `25%,13% 50%×50%@1` / `128,64 256×256@0` / `crops ×N`), and a model override; `generate_image` shows the prompt and override. Result lines summarize `✓ provider/model · cached · 1.2s` for analyses and `✓ N images via provider/model · $0.0311 · image="<id8>…"` for generations, or `✗ <error>`; expanding a row reveals the full text content. Generated images still render inline from the result's image blocks (independent of `renderResult`), reliable across Kitty/Ghostty/WezTerm/Warp via pi 1.0.1's JPEG/WebP/GIF `Image` fixes.
+- **Renderer coverage for unregistered tools** — registering through `registerToolRenderer` rather than inline `renderCall`/`renderResult` on the tool definitions means the compact rows also apply to calls replayed when the tool is *not registered* at render time: sessions resumed with the tool disabled (`/multimodal-proxy tool off`, mode off), transcript rows rendered before extension load, and HTML exports. Resolver chaining (`next() ?? {}`) preserves other extensions' renderers for the keys we don't set.
+- **Tool-result `details` payloads** — both tools now return a display-sized `details` object (analyze: `ok`/`error`/`cached`/`provider`/`model`/`latencyMs`/`groundingFormat`, with the heavy `text`/`images` stripped; generate: the structured payload as-is — ids/dims/cost) that feeds the renderer and persists in the session log without ever reaching the model.
+- Defensive renderer plumbing: pi-tui's `Text` (ANSI-aware wrapping) is loaded lazily with a plain-lines structural fallback so an unresolvable package can never block extension load; renderers tolerate partial/garbage streaming args and missing result objects (the fake-host smoke test caught one such crash before it shipped).
+- New `tool-render.test.ts` (24 tests: truncation, ref/crop summarization, call and result lines, garbage tolerance, details stripping) plus a fake-host smoke script (`tools/smoke-renderers.mjs`) that loads the real extension module and exercises the resolver contract — 540 tests total, all green; also verified loading under the real pi 1.0.1 RPC loader.
+
+### Changed
+
+- Nothing user-visible on pi < 1.0.1 hosts: registration is gated on `typeof pi.registerToolRenderer === "function"`, so older runtimes keep the default tool rendering with zero behavior change.
+
 ## [1.20.0] - 2026-10-02
 
 ### Added

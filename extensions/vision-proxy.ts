@@ -256,6 +256,12 @@ import {
 	buildVideoProxySection,
 	extractXaiResponsesText,
 	formatXaiSttTranscript,
+	analyzeDetailsForTranscript,
+	formatAnalyzeImageCall,
+	formatAnalyzeImageResult,
+	formatGenerateImageCall,
+	formatGenerateImageResult,
+	type TranscriptSegment,
 	isTranscriptionRequest,
 	isXaiProvider,
 	bufferToPiAiImage,
@@ -2381,6 +2387,173 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	// ── Tool transcript renderers (pi ≥ 1.0.1) ─────────────────────────────
+
+	/** Minimal structural shape of the TUI component the renderers return. */
+	interface ComponentLike {
+		render(width: number): string[];
+		invalidate?(): void;
+	}
+
+	/** Theme subset the renderers use (pi's Theme helpers). */
+	interface RenderThemeLike {
+		fg(token: string, text: string): string;
+		bold(text: string): string;
+	}
+
+	/** ToolRenderContext subset available to renderCall/renderResult. */
+	interface RenderContextLike {
+		isError?: boolean;
+		isPartial?: boolean;
+		expanded?: boolean;
+		showImages?: boolean;
+	}
+
+	/** AgentToolResult subset the result renderer receives. */
+	interface RenderResultLike {
+		content?: ReadonlyArray<{ type?: string; text?: string }>;
+		details?: unknown;
+	}
+
+	type ToolRenderersLike = {
+		renderCall?: (args: unknown, theme: RenderThemeLike, context: RenderContextLike) => ComponentLike;
+		renderResult?: (
+			result: RenderResultLike,
+			options: { expanded: boolean; isPartial: boolean },
+			theme: RenderThemeLike,
+			context: RenderContextLike,
+		) => ComponentLike;
+	};
+
+	/**
+	 * pi-tui's Text (ANSI-aware word wrap), loaded lazily so an unresolvable
+	 * package can never block extension load — the crash-loop lesson from
+	 * 1.16.0. Warmed at registration time, long before the first tool row
+	 * renders.
+	 */
+	let _textCtor: (new (text: string, paddingX?: number, paddingY?: number) => ComponentLike) | undefined;
+	let _textLoadTried = false;
+
+	function preloadTextComponent(): void {
+		if (_textLoadTried) return;
+		_textLoadTried = true;
+		void import("@earendil-works/pi-tui")
+			.then((m) => {
+				const ctor = (
+					m as { Text?: new (text: string, paddingX?: number, paddingY?: number) => ComponentLike }
+				).Text;
+				if (ctor) _textCtor = ctor;
+			})
+			.catch(() => {
+				// pi-tui unreachable — the plain-lines fallback below keeps rendering
+			});
+	}
+
+	/** Fixed-lines component used only when pi-tui's Text cannot load. */
+	function plainLines(text: string): ComponentLike {
+		const lines = text.split("\n");
+		return { render: () => lines, invalidate: () => {} };
+	}
+
+	function textComponent(text: string): ComponentLike {
+		return _textCtor ? new _textCtor(text, 0, 0) : plainLines(text);
+	}
+
+	function styleSegments(segments: readonly TranscriptSegment[], theme: RenderThemeLike): string {
+		let out = "";
+		for (const seg of segments) {
+			out += seg.style === "plain" ? seg.text : theme.fg(seg.style, seg.text);
+		}
+		return out;
+	}
+
+	function firstTextBlock(content: ReadonlyArray<{ type?: string; text?: string }> | undefined): string {
+		if (!content) return "";
+		for (const block of content) {
+			if (block?.type === "text" && typeof block.text === "string") return block.text;
+		}
+		return "";
+	}
+
+	function toolTitle(name: string, theme: RenderThemeLike): string {
+		return theme.fg("toolTitle", theme.bold(`${name}  `));
+	}
+
+	/** Compact result component: summary line, plus the full text content when expanded. */
+	function resultComponent(
+		summary: readonly TranscriptSegment[],
+		result: RenderResultLike,
+		options: { expanded: boolean },
+		theme: RenderThemeLike,
+	): ComponentLike {
+		let text = styleSegments(summary, theme);
+		if (options.expanded) {
+			const body = firstTextBlock(result.content);
+			if (body) {
+				// Re-apply the style per line: pi resets styling after every line.
+				text += `\n${body.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+			}
+		}
+		return textComponent(text);
+	}
+
+	/**
+	 * Register transcript renderers for analyze_image/generate_image (pi ≥
+	 * 1.0.1). Registered through pi.registerToolRenderer — instead of inline
+	 * renderCall/renderResult on the tool definitions — so the compact rows
+	 * also cover tools that are *not registered* at render time: calls
+	 * replayed from a session where the tool is now disabled (`tool off` /
+	 * mode off), resumed sessions rendered before extension load, and HTML
+	 * exports. `next() ?? {}` keeps renderers from later resolvers / the
+	 * registered tool for the keys we don't set. Generated images keep
+	 * rendering inline regardless: pi draws image blocks from the result
+	 * content next to the renderer output, independent of renderResult.
+	 */
+	function registerToolRenderers() {
+		const api = pi as unknown as {
+			registerToolRenderer?: (
+				resolver: (toolName: string, next: () => ToolRenderersLike | undefined) => ToolRenderersLike | undefined,
+			) => void;
+		};
+		if (typeof api.registerToolRenderer !== "function") return; // pi < 1.0.1
+		preloadTextComponent();
+		api.registerToolRenderer((toolName, next) => {
+			if (toolName === "analyze_image") {
+				return {
+					...(next() ?? {}),
+					renderCall: (args, theme) =>
+						textComponent(toolTitle("analyze_image", theme) + styleSegments(formatAnalyzeImageCall(args), theme)),
+					renderResult: (result, options, theme, context) => {
+						if (options.isPartial) return textComponent(theme.fg("warning", "Analyzing…"));
+						return resultComponent(
+							formatAnalyzeImageResult(result?.details, context?.isError === true),
+							result ?? {},
+							options,
+							theme,
+						);
+					},
+				};
+			}
+			if (toolName === "generate_image") {
+				return {
+					...(next() ?? {}),
+					renderCall: (args, theme) =>
+						textComponent(toolTitle("generate_image", theme) + styleSegments(formatGenerateImageCall(args), theme)),
+					renderResult: (result, options, theme, context) => {
+						if (options.isPartial) return textComponent(theme.fg("warning", "Generating…"));
+						return resultComponent(
+							formatGenerateImageResult(result?.details, context?.isError === true),
+							result ?? {},
+							options,
+							theme,
+						);
+					},
+				};
+			}
+			return next();
+		});
+	}
+
 	// ── Virtual model (pi ≥ 0.99) ─────────────────────────────────────────────
 
 	const VIRTUAL_PROVIDER = "multimodal-proxy";
@@ -2571,6 +2744,10 @@ export default function (pi: ExtensionAPI) {
 			// unreadable config file — session_start surfaces the error path
 		});
 
+	// Transcript renderers for analyze_image/generate_image rows (pi ≥ 1.0.1).
+	// Registered once at load; the resolver serves any later session state.
+	registerToolRenderers();
+
 	/** Register or unregister the analyze_image tool based on config. */
 	function syncToolRegistration(config: VisionConfig, runtimeCtx?: ExtensionContext) {
 		const shouldHaveTool = config.mode !== "off" && config.tool === "on";
@@ -2630,6 +2807,9 @@ export default function (pi: ExtensionAPI) {
 						// codemode scripts. Older hosts ignore both fields.
 						...(outcome.isError ? { isError: true } : {}),
 						...(outcome.structured ? { structuredContent: outcome.structured } : {}),
+						// `details` feeds the transcript renderer (pi ≥ 1.0.1) without
+						// the model seeing it; heavy fields (text, images) are stripped.
+						...(outcome.structured ? { details: analyzeDetailsForTranscript(outcome.structured) } : {}),
 					};
 				},
 			});
@@ -2705,6 +2885,9 @@ export default function (pi: ExtensionAPI) {
 						content: outcome.content,
 						...(outcome.isError ? { isError: true } : {}),
 						...(outcome.structured ? { structuredContent: outcome.structured } : {}),
+						// `details` feeds the transcript renderer (pi ≥ 1.0.1); the
+						// structured payload is already display-sized (ids, dims, cost).
+						...(outcome.structured ? { details: outcome.structured } : {}),
 						...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
 					};
 				},
