@@ -3263,6 +3263,201 @@ export function buildToolCacheKey(
 	return `${sortedHashes.join("+")}${cropSig ? "#crop:" + cropSig : ""}?q=${questionHash}&m=${modelId}`;
 }
 
+// ── Tool transcript rendering (pi ≥ 1.0.1 registerToolRenderer) ────────────
+
+/**
+ * Styling hints for one segment of a tool-transcript line, mapped to
+ * theme.fg tokens by the renderer in vision-proxy.ts. Kept as plain data so
+ * these helpers stay pure and unit-testable without a terminal theme.
+ */
+export type TranscriptStyle = "plain" | "accent" | "muted" | "dim" | "success" | "warning" | "error";
+
+export interface TranscriptSegment {
+	text: string;
+	style: TranscriptStyle;
+}
+
+/** Collapse whitespace and truncate on a word boundary (surrogate-pair safe). */
+export function summarizeForTranscript(text: string, max: number): string {
+	const t = text.replace(/\s+/g, " ").trim();
+	if (t.length <= max) return t;
+	let cut = t.slice(0, Math.max(1, max - 1));
+	// Never split a surrogate pair on a hard cut (lone high surrogate → U+FFFD).
+	if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+	const ws = cut.lastIndexOf(" ");
+	if (ws > cut.length * 0.6) cut = cut.slice(0, ws);
+	return `${cut.trimEnd()}…`;
+}
+
+/** Defensive finite-number check for values coming from model-authored args. */
+function isFiniteNumber(v: unknown): v is number {
+	return typeof v === "number" && Number.isFinite(v);
+}
+
+/** Compact percentage for crop summaries: integral values stay integral. */
+function pct(v: number): string {
+	const p = v * 100;
+	return Math.abs(p - Math.round(p)) < 0.05 ? String(Math.round(p)) : String(Math.round(p * 10) / 10);
+}
+
+/** Safe one-line JSON rendering of an arbitrary value (circular-safe). */
+function safeJson(value: unknown, max = 120): string {
+	try {
+		return summarizeForTranscript(JSON.stringify(value) ?? String(value), max);
+	} catch {
+		return String(value);
+	}
+}
+
+/**
+ * Shorten one analyze_image image reference for display: a recall id
+ * (`image="<hash>"`, `sha256:<hash>#…`, or a bare hash) becomes
+ * `image="deadbeef…"`; a file path becomes its file name (Windows or POSIX).
+ */
+export function summarizeImageRef(ref: string): string {
+	const s = ref.trim().replace(/^["']|["']$/g, "");
+	const quoted = /image="?([a-f0-9]{16,64})"?/i.exec(s);
+	if (quoted) return `image="${quoted[1]!.slice(0, 8)}…"`;
+	const bare = parseRecallRef(s);
+	if (bare) return `image="${bare.slice(0, 8)}…"`;
+	const base = s.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? s;
+	return summarizeForTranscript(base, 48);
+}
+
+/**
+ * Compact crop descriptor for the transcript: `bottom-right@0`,
+ * `25%,13% 50%×50%@1`, or `128,64 256×256@0`. Empty string when nothing
+ * recognizable.
+ */
+export function summarizeCrop(crop: unknown): string {
+	if (typeof crop !== "object" || crop === null) return "";
+	const c = crop as Record<string, unknown>;
+	const idx =
+		isFiniteNumber(c.image_index) ? `@${Math.trunc(c.image_index)}` : "";
+	if (typeof c.region === "string" && c.region.trim()) return `${c.region.trim()}${idx}`;
+	const box = (c.normalized ?? c.pixels) as Record<string, unknown> | undefined;
+	if (
+		typeof box === "object" &&
+		box !== null &&
+		isFiniteNumber(box.x) &&
+		isFiniteNumber(box.y) &&
+		isFiniteNumber(box.width) &&
+		isFiniteNumber(box.height)
+	) {
+		if (c.normalized !== undefined) {
+			return `${pct(box.x)}%,${pct(box.y)}% ${pct(box.width)}%×${pct(box.height)}%${idx}`;
+		}
+		return `${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}×${Math.round(box.height)}${idx}`;
+	}
+	return idx ? `crop${idx}` : "";
+}
+
+/** One-line transcript summary of an analyze_image call (pi ≥ 1.0.1 renderer). */
+export function formatAnalyzeImageCall(args: unknown): TranscriptSegment[] {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return [{ text: safeJson(args), style: "muted" }];
+	}
+	const a = args as Record<string, unknown>;
+	const out: TranscriptSegment[] = [];
+	const question = typeof a.question === "string" ? a.question : "";
+	out.push({ text: `"${summarizeForTranscript(question, 120)}"`, style: "accent" });
+	const images = Array.isArray(a.images)
+		? a.images.filter((r): r is string => typeof r === "string" && r.trim() !== "")
+		: [];
+	if (images.length > 0) {
+		const shown = images.slice(0, 2).map(summarizeImageRef);
+		const more = images.length - shown.length;
+		out.push({
+			text:
+				` · ${images.length} image${images.length === 1 ? "" : "s"}` +
+				(shown.length ? ` (${shown.join(", ")}${more > 0 ? ` +${more}` : ""})` : ""),
+			style: "muted",
+		});
+	}
+	const crops = Array.isArray(a.crop) ? a.crop.map(summarizeCrop).filter((s) => s !== "") : [];
+	if (crops.length === 1) out.push({ text: ` · crop ${crops[0]}`, style: "dim" });
+	else if (crops.length > 1) out.push({ text: ` · crops ×${crops.length}`, style: "dim" });
+	const model = typeof a.model === "string" && a.model.trim() ? a.model.trim() : undefined;
+	if (model) out.push({ text: ` · ${summarizeForTranscript(model, 60)}`, style: "muted" });
+	return out;
+}
+
+/** One-line transcript summary of a generate_image call (pi ≥ 1.0.1 renderer). */
+export function formatGenerateImageCall(args: unknown): TranscriptSegment[] {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return [{ text: safeJson(args), style: "muted" }];
+	}
+	const a = args as Record<string, unknown>;
+	const prompt = typeof a.prompt === "string" ? a.prompt : "";
+	const out: TranscriptSegment[] = [{ text: `"${summarizeForTranscript(prompt, 120)}"`, style: "accent" }];
+	const model = typeof a.model === "string" && a.model.trim() ? a.model.trim() : undefined;
+	if (model) out.push({ text: ` · ${summarizeForTranscript(model, 60)}`, style: "muted" });
+	return out;
+}
+
+function recordOf(details: unknown): Record<string, unknown> | undefined {
+	return typeof details === "object" && details !== null && !Array.isArray(details)
+		? (details as Record<string, unknown>)
+		: undefined;
+}
+
+/** One-line transcript summary of an analyze_image result from its `details`. */
+export function formatAnalyzeImageResult(details: unknown, isError: boolean): TranscriptSegment[] {
+	const d = recordOf(details);
+	if (isError || d?.ok === false) {
+		const msg = typeof d?.error === "string" && d.error ? d.error : "analysis failed";
+		return [{ text: `✗ ${summarizeForTranscript(msg, 160)}`, style: "error" }];
+	}
+	const segments: TranscriptSegment[] = [{ text: "✓", style: "success" }];
+	const provider = typeof d?.provider === "string" && d.provider ? d.provider : undefined;
+	const modelId = typeof d?.model === "string" && d.model ? d.model : undefined;
+	if (provider && modelId) segments.push({ text: ` ${summarizeForTranscript(`${provider}/${modelId}`, 80)}`, style: "muted" });
+	else if (modelId) segments.push({ text: ` ${summarizeForTranscript(modelId, 80)}`, style: "muted" });
+	if (d?.cached === true) segments.push({ text: " · cached", style: "dim" });
+	if (isFiniteNumber(d?.latencyMs)) {
+		segments.push({ text: ` · ${(Math.max(0, d.latencyMs) / 1000).toFixed(1)}s`, style: "dim" });
+	}
+	return segments;
+}
+
+/** One-line transcript summary of a generate_image result from its `details`. */
+export function formatGenerateImageResult(details: unknown, isError: boolean): TranscriptSegment[] {
+	const d = recordOf(details);
+	if (isError || d?.ok === false) {
+		const msg = typeof d?.error === "string" && d.error ? d.error : "generation failed";
+		return [{ text: `✗ ${summarizeForTranscript(msg, 160)}`, style: "error" }];
+	}
+	const images = Array.isArray(d?.images)
+		? (d!.images as unknown[]).filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+		: [];
+	const provider = typeof d?.provider === "string" && d.provider ? d.provider : undefined;
+	const modelId = typeof d?.model === "string" && d.model ? d.model : undefined;
+	const count = images.length > 0 ? `${images.length} image${images.length === 1 ? "" : "s"}` : "done";
+	const segments: TranscriptSegment[] =
+		provider && modelId
+			? [{ text: `✓ ${count} via ${summarizeForTranscript(`${provider}/${modelId}`, 80)}`, style: "success" }]
+			: [{ text: `✓ ${count}`, style: "success" }];
+	if (isFiniteNumber(d?.costUSD)) segments.push({ text: ` · $${Math.max(0, d.costUSD).toFixed(4)}`, style: "dim" });
+	const firstId = typeof images[0]?.id === "string" && images[0].id ? images[0].id : undefined;
+	if (firstId) {
+		const more = images.length > 1 ? ` +${images.length - 1}` : "";
+		segments.push({ text: ` · image="${firstId.slice(0, 8)}…"${more}`, style: "dim" });
+	}
+	return segments;
+}
+
+/**
+ * Copy of a structured analyze_image result without the fields the
+ * transcript renderer never reads — `details` must stay small because it is
+ * persisted in the session log alongside the (already stored) text fence.
+ */
+export function analyzeDetailsForTranscript(structured: Record<string, unknown>): Record<string, unknown> {
+	const rest: Record<string, unknown> = { ...structured };
+	delete rest.text;
+	delete rest.images;
+	return rest;
+}
+
 // ── Fence builders ────────────────────────────────────────────────────────
 
 export interface VideoDescriptionEntry {

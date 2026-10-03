@@ -8,6 +8,20 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
 
+**Compact tool rows (Pi ≥ 1.0.1)** — `analyze_image` and `generate_image` calls render as one tidy line each (`analyze_image  "What does the legend say?" · 2 images (image="deadbeef…", shot.png) · crop bottom-right@0`) with themed result summaries (`✓ zai/glm-5.3-flash · cached · 1.2s`, `✓ 1 image via google/imagen-4 · $0.0311`), instead of the default JSON-args dump. Generated images still render inline from the result blocks; expand a row to see the full analysis fence.
+
+## What's new in 1.21.0
+
+Adopting Pi 1.0.1's new `pi.registerToolRenderer()` API:
+
+- **Compact transcript rows for `analyze_image`** — the call line shows the question (truncated on a word boundary), the image refs (recall ids shortened to `image="deadbeef…"`, paths to their file name, `+N more` beyond two), a crop summary (`bottom-right@0`, `25%,13% 50%×50%@1`, `128,64 256×256@0`, or `crops ×N`), and any model override — instead of the raw JSON arguments. The result line summarizes `✓ provider/model · cached · latency` (or `✗ <error>`), and expanding the row reveals the full analysis fence.
+- **Compact transcript rows for `generate_image`** — the call line shows the prompt (and any model override); the result line summarizes `✓ N images via provider/model · $cost · image="<id8>…"`. The generated images themselves keep rendering inline — pi draws image blocks from the result content next to the renderer output — so this is purely a better header/summary, now reliable across Kitty, Ghostty, WezTerm, and Warp thanks to pi 1.0.1's JPEG/WebP/GIF image fixes.
+- **Works even when the tool isn't registered** — registering through `registerToolRenderer` (instead of inline `renderCall`/`renderResult` on the tool definitions) covers rows replayed from a session where the tool is now disabled (`/multimodal-proxy tool off`, mode off), resumed sessions, and HTML exports. `next()` chaining preserves renderers from other extensions for the keys we don't set.
+- **Renderer state via tool `details`** — results now carry a display-sized `details` payload (provider/model, `cached`, `latencyMs`, image ids, `costUSD`; heavy fields stripped) that feeds the renderer but never reaches the model.
+- Fully feature-gated (`typeof pi.registerToolRenderer === "function"`): pi < 1.0.1 hosts keep the default rendering, zero behavior change. pi-tui's `Text` component is loaded lazily with a plain-lines fallback so a missing package can never block extension load.
+
+Also benefits from pi 1.0.1 host fixes (no code needed here): Anthropic prompt caches survive mid-session tool toggles (tools added/redefined mid-conversation are now defined inline), "model at capacity" errors are retried instead of ending the turn, and Bedrock Claude thinking-signature failures after tool/prompt changes are fixed.
+
 ## What's new in 1.20.0
 
 Image generation, riding Pi 1.0's new `models.generateImages()` API:
