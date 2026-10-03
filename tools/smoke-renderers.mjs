@@ -40,11 +40,16 @@ assert(toolRenderers.length === 1, "exactly one tool-renderer resolver registere
 const resolver = toolRenderers[0];
 
 // ── fake theme + render helper ─────────────────────────────────────────────
+// Real ANSI escapes (not pseudo-tags) so width-aware truncation behaves as
+// in production: escapes are zero-width, stripped for the visible-length check.
 const fakeTheme = {
-	fg: (token, text) => `<${token}>${text}</${token}>`,
-	bold: (text) => `**${text}**`,
+	fg: (token, text) => `\x1b[${31 + (token.length % 5)}m${text}\x1b[0m`,
+	bold: (text) => `\x1b[1m${text}\x1b[22m`,
 };
-const render = (comp) => comp.render(80).join("\n");
+const stripAnsi = (line) => line.replace(/\x1b\[[0-9;]*m/g, "");
+// 120 columns: wide enough that content assertions see the whole summary line
+// (narrow-width behavior is covered by the explicit truncation check below).
+const render = (comp) => comp.render(120).join("\n");
 
 // ── resolver contract ──────────────────────────────────────────────────────
 assert(resolver("bash", () => undefined) === undefined, "unknown tools pass through as undefined");
@@ -95,7 +100,7 @@ const errResult = render(analyze.renderResult(
 	{ isError: true },
 ));
 console.log("  analyze error →", errResult);
-assert(errResult.startsWith("<error>✗"), "error line styled error");
+assert(errResult.includes("\x1b[") && stripAnsi(errResult).startsWith("✗"), "error line styled error");
 
 const partial = render(analyze.renderResult({ content: [] }, { expanded: false, isPartial: true }, fakeTheme, {}));
 assert(partial.includes("Analyzing"), "partial shows Analyzing…");
@@ -123,5 +128,22 @@ const garbage1 = analyze.renderCall("half-json{", fakeTheme, {});
 const garbage2 = gen.renderCall([1, 2], fakeTheme, {});
 const garbage3 = analyze.renderResult(undefined, { expanded: true, isPartial: false }, fakeTheme, {});
 assert(true, `garbage args tolerated (${render(garbage1).length + render(garbage2).length + render(garbage3).length} chars)`);
+
+// Fallback component must never exceed the render width (pi stops on overwide
+// lines). pi-tui is unavailable in this sandbox, so plainLines is active here.
+const longCall = analyze.renderCall({ images: ["/a.png"], question: "x".repeat(300) }, fakeTheme, {});
+const ansi = /\x1b\[[0-9;]*m/g;
+const wideOk = longCall.render(40).every((line) => line.replace(ansi, "").length <= 40);
+assert(wideOk, "plainLines truncates to the render width (ANSI-aware)");
+
+// Expanded view must show ALL text blocks (generate rows on text-only base
+// models carry per-image description fences after the header).
+const multiBlock = render(analyze.renderResult(
+	{ content: [{ type: "text", text: "[generate_image] 1 image generated" }, { type: "text", text: "<vision_proxy_description>desc</vision_proxy_description>" }], details: { ok: true } },
+	{ expanded: true, isPartial: false },
+	fakeTheme,
+	{ isError: false },
+));
+assert(multiBlock.includes("1 image generated") && multiBlock.includes("desc"), "expanded shows every text block");
 
 console.log("SMOKE PASS");

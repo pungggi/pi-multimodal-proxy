@@ -2449,10 +2449,60 @@ export default function (pi: ExtensionAPI) {
 			});
 	}
 
-	/** Fixed-lines component used only when pi-tui's Text cannot load. */
+	/**
+	 * Fixed-lines component used only when pi-tui's Text cannot load.
+	 * Truncates each line to the render width (ANSI-aware, rough wcwidth) —
+	 * pi's differential renderer stops on "rendered line exceeds terminal
+	 * width", so an overwide fallback line is worse than an ugly one.
+	 */
 	function plainLines(text: string): ComponentLike {
-		const lines = text.split("\n");
-		return { render: () => lines, invalidate: () => {} };
+		return {
+			render: (width: number) => text.split("\n").map((line) => truncateAnsiLine(line, Math.max(1, width))),
+			invalidate: () => {},
+		};
+	}
+
+	/** Rough wcwidth: 2 for the common wide ranges, 0 for combining marks, else 1. */
+	function codePointWidth(cp: number): number {
+		if (cp >= 0x0300 && cp <= 0x036f) return 0; // combining diacritics
+		if (
+			(cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+			(cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals … Yi
+			(cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+			(cp >= 0xf900 && cp <= 0xfaff) || // CJK compat ideographs
+			(cp >= 0xfe30 && cp <= 0xfe4f) ||
+			(cp >= 0xff00 && cp <= 0xff60) ||
+			(cp >= 0xffe0 && cp <= 0xffe6) ||
+			(cp >= 0x1f300 && cp <= 0x1faff) || // emoji blocks
+			(cp >= 0x20000 && cp <= 0x3fffd) // CJK ext
+		) {
+			return 2;
+		}
+		return 1;
+	}
+
+	/** ANSI-preserving truncation of one styled line to a visible width. */
+	function truncateAnsiLine(line: string, width: number): string {
+		let out = "";
+		let w = 0;
+		let i = 0;
+		while (i < line.length) {
+			if (line[i] === "\x1b") {
+				const m = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
+				const seq = m ? m[0] : line[i]!;
+				out += seq;
+				i += seq.length;
+				continue;
+			}
+			const cp = line.codePointAt(i)!;
+			const s = String.fromCodePoint(cp);
+			const cw = codePointWidth(cp);
+			if (w + cw > width) break;
+			out += s;
+			w += cw;
+			i += s.length;
+		}
+		return out;
 	}
 
 	function textComponent(text: string): ComponentLike {
@@ -2467,12 +2517,13 @@ export default function (pi: ExtensionAPI) {
 		return out;
 	}
 
-	function firstTextBlock(content: ReadonlyArray<{ type?: string; text?: string }> | undefined): string {
-		if (!content) return "";
+	function textBlocks(content: ReadonlyArray<{ type?: string; text?: string }> | undefined): string[] {
+		if (!content) return [];
+		const out: string[] = [];
 		for (const block of content) {
-			if (block?.type === "text" && typeof block.text === "string") return block.text;
+			if (block?.type === "text" && typeof block.text === "string" && block.text) out.push(block.text);
 		}
-		return "";
+		return out;
 	}
 
 	function toolTitle(name: string, theme: RenderThemeLike): string {
@@ -2488,7 +2539,10 @@ export default function (pi: ExtensionAPI) {
 	): ComponentLike {
 		let text = styleSegments(summary, theme);
 		if (options.expanded) {
-			const body = firstTextBlock(result.content);
+			// All text blocks: a generate_image result on a text-only base model
+			// carries the header plus per-image description fences that replaced
+			// the image blocks — the first block alone would hide them.
+			const body = textBlocks(result.content).join("\n\n");
 			if (body) {
 				// Re-apply the style per line: pi resets styling after every line.
 				text += `\n${body.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n")}`;

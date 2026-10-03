@@ -42,10 +42,12 @@ describe("summarizeForTranscript", () => {
 
 	it("never splits a surrogate pair", () => {
 		const emoji = "😀".repeat(60); // each emoji is a surrogate pair
-		const out = summarizeForTranscript(emoji, 21);
-		assert.ok(out.length <= 21);
-		// No lone high surrogate at the cut: the string still round-trips as text
-		assert.ok(!/[\uD800-\uDBFF]$/.test(out));
+		const out = summarizeForTranscript(emoji, 20); // odd max → cut lands mid-pair
+		assert.ok(out.length <= 20);
+		// No lone high surrogate anywhere: the string still round-trips as text.
+		// (With the guard removed, the hard cut leaves an unpaired high surrogate
+		// right before the ellipsis, which this regex detects.)
+		assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out));
 	});
 });
 
