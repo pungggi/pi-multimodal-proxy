@@ -7,7 +7,7 @@ Media understanding for [Pi](https://pi.dev): images, video, audio, and YouTube 
 - **Video, audio & YouTube** — paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`) or a local file path and a multimodal model (default: Grok 4.3) transcribes speech with speaker diarization, describes visual scenes, reads on-screen text, and reasons about the content in a single call. Almost no chat model or agent ingests video natively: this is the package's deepest capability.
 - **Vision for text-only models** — a large slice of Pi's catalog (DeepSeek, GLM, Nemotron, Devstral, gpt-oss, …) still has no image input. When an image reaches such a model, the extension describes it via your configured vision model, persists the description in the session, and injects it into context. The model "sees" images across turns, cached by content hash.
 - **Cheaper vision for multimodal models** — select `Multimodal Auto` and media turns escalate natively to the vision model (real pixels, no text fence; prompt caches survive the routing) while text turns stay on your base model. Pin it with `/multimodal-proxy virtual-base` to keep the cheap model after media turns too: unpinned, a text turn reuses whatever physical model handled the turn before, which after a media turn is the vision model. Or proxy every image through a flash-priced describer with mode `always`.
-- **Media memory that outlives the turn** — every proxied image gets a stable `image="<id>"`, so the agent can re-query or crop an earlier screenshot without a re-attachment ("zoom into that screenshot from before"), `#` autocompletes image ids in the prompt, and descriptions survive compaction via a recall digest. `analyze_image` answers targeted questions with locally applied crops; `generate_image` creates images that flow straight back through the same pipeline. (Recall applies to described images: text-only base models or mode `always`. Images passed through natively to a vision-capable base model stay in context as pixels and are not duplicated into recall.)
+- **Media memory that outlives the turn** — every image the agent can re-query gets a stable `image="<id>"`: described images (text-only base models, mode `always`, or explicit `analyze_image` calls) carry a description snippet, and pasted attachments on a vision-capable base model are retained in the recall store without a description. The agent can re-query or crop an earlier screenshot without a re-attachment ("zoom into that screenshot from before"), `#` autocompletes image ids in the prompt, and descriptions survive compaction via a recall digest. `analyze_image` answers targeted questions with locally applied crops; `generate_image` creates images that flow straight back through the same pipeline.
 - **Governed by default** — first-use data-egress consent per provider, persisted pre-consent lists, crops applied locally before upload, upload downscaling, decode-bomb protection, and recall bytes kept in memory only. See [Privacy & security](#privacy--security).
 
 Media routing is automatic: content sniffing and path detection feed a pipeline with transient-error retry and model fallback on the image path (the native xAI video path is one-shot), plus compact transcript rows for `analyze_image`/`generate_image` (Pi ≥ 1.0.1).
@@ -206,7 +206,10 @@ Every `<vision_proxy_description>`, `<vision_proxy_analysis>`, and
 can pass that id back to `analyze_image` (or `/multimodal-proxy describe`) to
 re-examine or crop an image the user shared earlier in the session — even once
 it is no longer attached to the current message (e.g. *"zoom into that
-screenshot from before"*). The image bytes are retained **in memory only** for
+screenshot from before"*). Pasted attachments on a vision-capable base model
+are also retained (no description; labeled by filename, or by hash prefix when
+the paste carries no filename), so `#` recall works in every mode except `off`.
+The image bytes are retained **in memory only** for
 the life of the session, never written to the session log or disk, and are
 evicted oldest-first once the recall budget (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`,
 default 64 MB) is exceeded.

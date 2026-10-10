@@ -318,16 +318,28 @@ export function extractRecallToken(
 }
 
 /**
- * Collect recall candidates from persisted descriptions, most recent first.
+ * Collect recall candidates for the `#` autocomplete, most recent first.
  * `metaLookup` supplies in-memory filename/dimensions when still available.
+ * `recallableHashes` (keys of the in-session image-data store) adds images
+ * that are re-queryable by id but were never described: pass-through
+ * attachments on vision-capable base models and analyze_image results.
+ * Described images win on collision (they carry description text).
  */
 export function collectRecallCandidates(
 	descriptions: ReadonlyMap<string, string>,
 	metaLookup: (hash: string) => ImageMeta | undefined,
+	recallableHashes?: Iterable<string>,
 ): RecallCandidate[] {
-	return [...descriptions]
-		.reverse()
-		.map(([hash, description]) => ({ hash, description, filename: metaLookup(hash)?.filename }));
+	const out = new Map<string, RecallCandidate>();
+	for (const [hash, description] of [...descriptions].reverse()) {
+		out.set(hash, { hash, description, filename: metaLookup(hash)?.filename });
+	}
+	if (recallableHashes) {
+		for (const hash of [...recallableHashes].reverse()) {
+			if (!out.has(hash)) out.set(hash, { hash, description: undefined, filename: metaLookup(hash)?.filename });
+	}
+	}
+	return [...out.values()];
 }
 
 /** One-line dropdown snippet (no fence markers, single line, hard cap). */

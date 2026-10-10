@@ -2366,9 +2366,14 @@ export default function (pi: ExtensionAPI) {
 						const entries = ctx.sessionManager.getEntries();
 						const config = resolveConfig(entries, process.env, _fileConfig);
 						if (config.mode !== "off") {
+							// Candidates = described images ∪ everything retained in the
+							// in-memory recall store (pass-through attachments, analyze_image
+							// results) — anything analyze_image can resolve by id.
+							const sessionState = getSessionState(ctx);
 							const candidates = collectRecallCandidates(
 								findDescriptions(entries),
-								(hash) => getSessionState(ctx).imageMeta.get(hash),
+								(hash) => sessionState.imageMeta.get(hash),
+								sessionState.imageData.map.keys(),
 							);
 							const items = buildRecallItems(candidates, token.query);
 							if (items.length > 0) return { items, prefix: token.prefix };
@@ -3242,8 +3247,28 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!shouldStripImages(config, ctx.model)) {
-				// off, or fallback + model supports images → pass through unchanged
-				// But still inject video descriptions if we have them
+				// fallback + model supports images → pass through unchanged (mode
+				// "off" retains nothing: the extension is disabled by intent).
+				// Retain the attachments in the in-memory recall store (no vision
+				// call, no description, bytes were already in process as message
+				// attachments; the store is memory-only and LRU-bounded) so `#`
+				// autocomplete and analyze_image can re-query them by id later in
+				// the session. Path-detected images were already stored on read.
+				// storeImageData runs unconditionally so a re-attached image
+				// refreshes its LRU recency (attach A, B, A, C must evict B, not A).
+				if (config.mode !== "off") {
+					for (const raw of images) {
+						try {
+							const img = toPiAiImage(raw);
+							const hash = hashImageData(img.data);
+							if (!imageMeta.has(hash)) storeImageMeta(imageMeta, hash, img.data);
+							storeImageData(imageData, hash, img.data, img.mimeType);
+						} catch {
+							// Undecodable attachment — pass it through untouched.
+						}
+					}
+				}
+				// Still inject video descriptions if we have them
 				if (videoDescriptionFence) {
 					return {
 						systemPrompt:

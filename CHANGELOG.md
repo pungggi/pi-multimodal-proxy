@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.23.0] - 2026-10-10
+
+### Fixed
+
+- **`#` image-recall autocomplete never fired on vision-capable base models** — two compounding defects, found live while dogfooding the 1.22.1 README claims. First, the dropdown drew candidates **only** from persisted `DescriptionEntry`s, so images analyzed via the `analyze_image` tool (which stores bytes in the in-session recall store but appends no description entry) and images retained in the store were invisible to it. Second, in the most common modern configuration (multimodal base model + default `fallback` mode) pasted/attached images pass through as pixels and entered **no** store at all — no description, no bytes, no meta — leaving the autocomplete permanently empty no matter what the user did. Fixes: `collectRecallCandidates` now unions described images with the recall store's keys (described entries win on collision, store-only candidates show the filename or hash-prefix label); and the `before_agent_start` pass-through branch retains attachment bytes+meta in the existing in-memory LRU store (no vision call, no description, no new persistence — the bytes were already in process as message attachments). Net effect: `#` and `analyze_image` recall now work in every mode except `off` (where the extension is disabled by intent and retains nothing), matching the README's "media memory" pillar. Two review fixes folded in (PR #40): retention is skipped entirely in `off` mode, and `storeImageData` runs unconditionally on re-attachment so the LRU refreshes recency (attach A, B, A, C evicts B, not A). Verified against pi 1.1.0's `AutocompleteItem`/`AutocompleteProvider` shapes (no API drift involved).
+
 ## [1.22.1] - 2026-10-10
 
 ### Changed
