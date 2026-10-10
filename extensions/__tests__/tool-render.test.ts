@@ -196,6 +196,30 @@ describe("formatAnalyzeImageResult", () => {
 		assert.equal(segs[0]!.style, "success");
 		assert.equal(segs[1]!.style, "muted");
 	});
+
+	describe("durationMs fallback (pi ≥ 1.1.0 render context)", () => {
+		it("uses the host durationMs when details carry no latencyMs", () => {
+			assert.equal(
+				plain(formatAnalyzeImageResult({ ok: true, provider: "zai", model: "m" }, false, 2500)),
+				"✓ zai/m · 2.5s",
+			);
+			// rows with no details at all (replayed foreign sessions, HTML exports)
+			assert.equal(plain(formatAnalyzeImageResult(undefined, false, 987)), "✓ · 1.0s");
+		});
+
+		it("prefers details.latencyMs over the host durationMs", () => {
+			const segs = formatAnalyzeImageResult(
+				{ ok: true, provider: "zai", model: "glm-5.3-flash", latencyMs: 1234 },
+				false,
+				99999,
+			);
+			assert.equal(plain(segs), "✓ zai/glm-5.3-flash · 1.2s");
+		});
+
+		it("ignores non-finite durationMs", () => {
+			assert.equal(plain(formatAnalyzeImageResult({ ok: true }, false, Number.NaN)), "✓");
+		});
+	});
 });
 
 describe("formatGenerateImageResult", () => {

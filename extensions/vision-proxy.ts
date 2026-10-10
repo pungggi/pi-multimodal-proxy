@@ -2407,6 +2407,8 @@ export default function (pi: ExtensionAPI) {
 		isPartial?: boolean;
 		expanded?: boolean;
 		showImages?: boolean;
+		/** pi ≥ 1.1.0: recorded execute() duration from the final result. */
+		durationMs?: number;
 	}
 
 	/** AgentToolResult subset the result renderer receives. */
@@ -2580,7 +2582,7 @@ export default function (pi: ExtensionAPI) {
 					renderResult: (result, options, theme, context) => {
 						if (options.isPartial) return textComponent(theme.fg("warning", "Analyzing…"));
 						return resultComponent(
-							formatAnalyzeImageResult(result?.details, context?.isError === true),
+							formatAnalyzeImageResult(result?.details, context?.isError === true, context?.durationMs),
 							result ?? {},
 							options,
 							theme,

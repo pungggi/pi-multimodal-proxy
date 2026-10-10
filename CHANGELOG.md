@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.22.0] - 2026-10-10
+
+### Added
+
+- **Claude Haiku 5.5 in the implicit-model candidate chain** — `DEFAULT_MODEL_FALLBACKS` now reads `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` → `anthropic/claude-haiku-5-5` (Pi ≥ 1.1.0 catalog) → `anthropic/claude-sonnet-5` → `anthropic/claude-sonnet-4-5`. An anthropic-keyed setup whose cheaper candidates are unkeyed lands on Haiku 5.5 ($0.1/M in, $0.5/M out, vision-capable, 1M context; above 100K input tokens $0.5/$2.5 — output still 4× cheaper than Sonnet's flat rate) instead of Sonnet 5 ($2/M in, $10/M out) — 20× cheaper output at typical description-prompt sizes, same API key. Description prompts (a few images + instructions) sit far below the tier threshold. Haiku's catalog `inputLimits.images.resize` (2000 px / q80) feeds the existing model-aware upload downscale. Pre-1.1.0 catalogs simply don't contain Haiku, so the registry check skips it and behavior is unchanged; explicit model choices are never rewritten.
+- **`durationMs` fallback in the `analyze_image` result row (Pi ≥ 1.1.0, feature-detected)** — the pi 1.1.0 tool render context carries `durationMs`, the monotonic-clock `execute()` time recorded with the final result. `formatAnalyzeImageResult` accepts it as a display fallback when `details` carry no `latencyMs`, so rows replayed from foreign sessions, HTML exports, and results recorded before `details` existed still render `✓ … · 1.2s`. `details.latencyMs` (the vision call itself, also reported to codemode scripts via `structuredContent`) always wins — the host duration covers consent checks and crop encoding too, so the two measure different things. Older hosts pass no `durationMs` and rendering is unchanged.
+- **Per-invocation tool toggling documented** — pi 1.1.0's `--tools +name/-name` entries change the default tool selection instead of replacing it. README now shows `pi -t -analyze_image` (one-shot session without the re-query tool) and `pi -t +analyze_image` (add it back to a trimmed selection) alongside the existing persistent toggles (`/multimodal-proxy tool off`, `PI_VISION_PROXY_TOOL=off`). Privacy section updated to spell out the full current default-model chain.
+- Six new tests (546 total, all green): Haiku placement/ordering in the chain, key-aware preference of Haiku over Sonnet, catalog-without-Haiku skip, `durationMs` fallback/preference/finite-guard in the result formatter. Syntax check clean (8 files).
+
 ## [1.21.0] - 2026-10-03
 
 ### Added

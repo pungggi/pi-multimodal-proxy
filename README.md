@@ -10,6 +10,14 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 
 **Compact tool rows (Pi ≥ 1.0.1)** — `analyze_image` and `generate_image` calls render as one tidy line each (`analyze_image  "What does the legend say?" · 2 images (image="deadbeef…", shot.png) · crop bottom-right@0`) with themed result summaries (`✓ zai/glm-5.3-flash · cached · 1.2s`, `✓ 1 image via google/imagen-4 · $0.0311`), instead of the default JSON-args dump. Generated images still render inline from the result blocks; expand a row to see the full analysis fence.
 
+## What's new in 1.22.0
+
+Borrowing from Pi 1.1.0:
+
+- **Claude Haiku 5.5 joins the implicit-model candidate chain** — `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` → `anthropic/claude-haiku-5-5` (new, Pi ≥ 1.1.0) → `anthropic/claude-sonnet-5` → `anthropic/claude-sonnet-4-5`. When your cheaper candidates have no API key, an anthropic-keyed setup now lands on Haiku 5.5 instead of Sonnet 5 for image descriptions — $0.1/M in, $0.5/M out vs $2/M, $10/M (20× cheaper output at typical description-prompt sizes; above 100K input tokens Haiku is $0.5/$2.5, still 4× cheaper output). Same key, still vision-capable, and its catalog `inputLimits.images.resize` feeds the model-aware upload downscale. Catalogs without Haiku (pi < 1.1.0) skip it and behave exactly as before; explicit choices are never rewritten.
+- **Result rows show a duration even without `details`** — pi 1.1.0's render context carries `durationMs` (the recorded `execute()` time of a final tool result). The `analyze_image` result line now falls back to it when its `details` have no `latencyMs`, so rows replayed from foreign/HTML-exported sessions still show `✓ … · 1.2s`. Our own `latencyMs` (the vision call itself, reported to codemode scripts via `structuredContent`) always wins.
+- **Per-invocation tool toggling documented** — pi 1.1.0's `--tools +name/-name` entries modify the default tool selection instead of replacing it, so `pi -t -analyze_image` runs a one-shot session without the re-query tool while keeping everything else (see [Slash commands](#slash-commands)).
+
 ## What's new in 1.21.0
 
 Adopting Pi 1.0.1's new `pi.registerToolRenderer()` API:
@@ -249,6 +257,8 @@ Legacy alias: /vision-proxy <args> works identically.
 
 When an env var is set, the matching `/multimodal-proxy` subcommand is locked.
 
+For one-shot sessions you can also toggle tools per invocation (Pi ≥ 1.1.0): `pi -t -analyze_image` removes the re-query tool from the default selection, `pi -t +analyze_image` adds it back to a trimmed one. This complements the persistent `/multimodal-proxy tool off` and `PI_VISION_PROXY_TOOL=off`, which survive across sessions.
+
 ## How it works — Images
 
 ```
@@ -375,7 +385,7 @@ When a model is in the grounding registry, a format-specific instruction is appe
 
 ## Privacy & security
 
-This extension **sends data to a third-party provider**. By default that is `zai/glm-5.3-flash` for images (`anthropic/claude-sonnet-5` on older Pi versions without GLM 5.3 Flash in the catalog, then `anthropic/claude-sonnet-4-5`) and `xai/grok-4.3` for video/audio. Be aware:
+This extension **sends data to a third-party provider**. By default that is `zai/glm-5.3-flash` for images, falling back through `deepseek/deepseek-v4-flash-vision-exp` → `anthropic/claude-haiku-5-5` (Pi ≥ 1.1.0) → `anthropic/claude-sonnet-5` → `anthropic/claude-sonnet-4-5` to the first candidate in your catalog **and keyed** (`xai/grok-4.3` for video/audio). Be aware:
 
 1. **Image and video data is uploaded** to the configured provider on every proxied request. Crop coordinates are applied locally before upload — only the cropped region is sent.
 2. **Recent conversation context** (last 8 messages, truncated) is uploaded with the image unless you set `/multimodal-proxy context off` or `PI_VISION_PROXY_INCLUDE_CONTEXT=false`. Disable it for sensitive sessions.
