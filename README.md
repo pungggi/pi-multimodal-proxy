@@ -207,8 +207,9 @@ can pass that id back to `analyze_image` (or `/multimodal-proxy describe`) to
 re-examine or crop an image the user shared earlier in the session — even once
 it is no longer attached to the current message (e.g. *"zoom into that
 screenshot from before"*). Pasted attachments on a vision-capable base model
-are also retained (no description, filename label only), so `#` recall works
-in every mode. The image bytes are retained **in memory only** for
+are also retained (no description; labeled by filename, or by hash prefix when
+the paste carries no filename), so `#` recall works in every mode except `off`.
+The image bytes are retained **in memory only** for
 the life of the session, never written to the session log or disk, and are
 evicted oldest-first once the recall budget (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`,
 default 64 MB) is exceeded.

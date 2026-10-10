@@ -3247,22 +3247,25 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!shouldStripImages(config, ctx.model)) {
-				// off, or fallback + model supports images → pass through unchanged.
+				// fallback + model supports images → pass through unchanged (mode
+				// "off" retains nothing: the extension is disabled by intent).
 				// Retain the attachments in the in-memory recall store (no vision
 				// call, no description, bytes were already in process as message
 				// attachments; the store is memory-only and LRU-bounded) so `#`
 				// autocomplete and analyze_image can re-query them by id later in
 				// the session. Path-detected images were already stored on read.
-				for (const raw of images) {
-					try {
-						const img = toPiAiImage(raw);
-						const hash = hashImageData(img.data);
-						if (!imageData.map.has(hash)) {
-							storeImageMeta(imageMeta, hash, img.data);
+				// storeImageData runs unconditionally so a re-attached image
+				// refreshes its LRU recency (attach A, B, A, C must evict B, not A).
+				if (config.mode !== "off") {
+					for (const raw of images) {
+						try {
+							const img = toPiAiImage(raw);
+							const hash = hashImageData(img.data);
+							if (!imageMeta.has(hash)) storeImageMeta(imageMeta, hash, img.data);
 							storeImageData(imageData, hash, img.data, img.mimeType);
+						} catch {
+							// Undecodable attachment — pass it through untouched.
 						}
-					} catch {
-						// Undecodable attachment — pass it through untouched.
 					}
 				}
 				// Still inject video descriptions if we have them
