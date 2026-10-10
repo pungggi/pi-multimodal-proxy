@@ -3312,6 +3312,41 @@ describe("1.18.0 key-aware default model resolution", () => {
 		assert.equal(DEFAULT_MODEL_FALLBACKS[0]!.modelId, "deepseek-v4-flash-vision-exp");
 	});
 
+	it("places Claude Haiku 5.5 between DeepSeek and Sonnet 5 (pi ≥ 1.1.0 catalogs)", () => {
+		const haiku = DEFAULT_MODEL_FALLBACKS.find((m) => m.modelId === "claude-haiku-5-5")!;
+		assert.equal(haiku.provider, "anthropic");
+		const deepseekIdx = DEFAULT_MODEL_FALLBACKS.findIndex((m) => m.provider === "deepseek");
+		const sonnetIdx = DEFAULT_MODEL_FALLBACKS.findIndex((m) => m.modelId === "claude-sonnet-5");
+		assert.ok(deepseekIdx < DEFAULT_MODEL_FALLBACKS.indexOf(haiku));
+		assert.ok(DEFAULT_MODEL_FALLBACKS.indexOf(haiku) < sonnetIdx);
+	});
+
+	it("prefers Haiku 5.5 over Sonnet 5 when both are keyed anthropic candidates", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(
+				`${builtin.provider}/${builtin.modelId}`,
+			"anthropic/claude-haiku-5-5",
+				"anthropic/claude-sonnet-5",
+			),
+			false,
+			keyWith("anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5"),
+		);
+		assert.equal(out.provider, "anthropic");
+		assert.equal(out.modelId, "claude-haiku-5-5");
+	});
+
+	it("skips Haiku 5.5 on pre-1.1.0 catalogs and still lands on Sonnet 5", () => {
+		const out = applyDefaultModelFallback(
+			builtin,
+			registryWith(`${builtin.provider}/${builtin.modelId}`, "anthropic/claude-sonnet-5"),
+			false,
+			keyWith("anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5"),
+		);
+		assert.equal(out.provider, "anthropic");
+		assert.equal(out.modelId, "claude-sonnet-5");
+	});
+
 	it("keeps the default when it is in the catalog and keyed", () => {
 		const out = applyDefaultModelFallback(
 			builtin,

@@ -1318,6 +1318,7 @@ export function resolveConfig(
  */
 export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId: string }> = [
 	{ provider: "deepseek", modelId: "deepseek-v4-flash-vision-exp" }, // Pi ≥ 0.84.4, cheap, common key
+	{ provider: "anthropic", modelId: "claude-haiku-5-5" }, // Pi ≥ 1.1.0, vision-capable, $0.1/$0.5 per M
 	{ provider: "anthropic", modelId: "claude-sonnet-5" },
 	{ provider: "anthropic", modelId: "claude-sonnet-4-5" },
 ];
@@ -3401,8 +3402,19 @@ function recordOf(details: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
-/** One-line transcript summary of an analyze_image result from its `details`. */
-export function formatAnalyzeImageResult(details: unknown, isError: boolean): TranscriptSegment[] {
+/**
+ * One-line transcript summary of an analyze_image result from its `details`.
+ * `durationMs` (pi ≥ 1.1.0 host render context) is a display fallback for rows
+ * whose `details` carry no `latencyMs` — replayed sessions, foreign/HTML
+ * exports, results recorded before `details` existed. Details always win:
+ * `latencyMs` measures the vision call itself, while the host's `durationMs`
+ * covers the whole `execute()` (consent checks, crop encoding included).
+ */
+export function formatAnalyzeImageResult(
+	details: unknown,
+	isError: boolean,
+	durationMs?: number,
+): TranscriptSegment[] {
 	const d = recordOf(details);
 	if (isError || d?.ok === false) {
 		const msg = typeof d?.error === "string" && d.error ? d.error : "analysis failed";
@@ -3414,8 +3426,9 @@ export function formatAnalyzeImageResult(details: unknown, isError: boolean): Tr
 	if (provider && modelId) segments.push({ text: ` ${summarizeForTranscript(`${provider}/${modelId}`, 80)}`, style: "muted" });
 	else if (modelId) segments.push({ text: ` ${summarizeForTranscript(modelId, 80)}`, style: "muted" });
 	if (d?.cached === true) segments.push({ text: " · cached", style: "dim" });
-	if (isFiniteNumber(d?.latencyMs)) {
-		segments.push({ text: ` · ${(Math.max(0, d.latencyMs) / 1000).toFixed(1)}s`, style: "dim" });
+	const latency = isFiniteNumber(d?.latencyMs) ? d.latencyMs : isFiniteNumber(durationMs) ? durationMs : undefined;
+	if (latency !== undefined) {
+		segments.push({ text: ` · ${(Math.max(0, latency) / 1000).toFixed(1)}s`, style: "dim" });
 	}
 	return segments;
 }
