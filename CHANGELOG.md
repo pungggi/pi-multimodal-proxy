@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.22.1] - 2026-10-10
+
+### Changed
+
+- **Capability-first README** — the new "What it's for" section leads with the durable differentiators (video/audio/YouTube, vision for text-only models, cost-routed vision, session media recall, governance-by-default) instead of the text-only-fallback narrative; ~103 lines of release history (What's new 1.21.0 → 1.4.0) collapsed into a `CHANGELOG.md` pointer with only the current release summarized; mode `always` reframed around its cost motivation; `package.json` description aligned. Three intro claims tightened for accuracy after review (PR #39, Augment): virtual-model text-turn routing (an unpinned base reuses the previous turn's physical model, i.e. the vision model after a media turn — pin with `/multimodal-proxy virtual-base`), recall scoped to proxied images (natively passed-through images are not duplicated into recall), and retry/fallback scoped to the image path (the native xAI video route is one-shot). Docs-only; no code changes.
+
 ## [1.22.0] - 2026-10-10
 
 ### Added
