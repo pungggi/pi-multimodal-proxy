@@ -1,14 +1,16 @@
 # pi-multimodal-proxy
 
-Automatic **image, video, and audio** description for any model in [Pi](https://pi.dev).
+Media understanding for [Pi](https://pi.dev): images, video, audio, and YouTube links, for any model. Even one that can't see.
 
-When images are sent, this extension routes them to a **vision-capable model**, collects descriptions, persists them in the session, and injects them into the agent's context — so even text-only models can "see" your images across turns.
+## What it's for
 
-When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
+- **Video, audio & YouTube** — paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`) or a local file path and a multimodal model (default: Grok 4.3) transcribes speech with speaker diarization, describes visual scenes, reads on-screen text, and reasons about the content in a single call. Almost no chat model or agent ingests video natively: this is the package's deepest capability.
+- **Vision for text-only models** — a large slice of Pi's catalog (DeepSeek, GLM, Nemotron, Devstral, gpt-oss, …) still has no image input. When an image reaches such a model, the extension describes it via your configured vision model, persists the description in the session, and injects it into context. The model "sees" images across turns, cached by content hash.
+- **Cheaper vision for multimodal models** — select `Multimodal Auto` once and text turns stay on your cheap base model while media turns escalate natively to the vision model (real pixels, no text fence; prompt caches survive the routing). Or proxy every image through a flash-priced describer with mode `always`.
+- **Media memory that outlives the turn** — every image gets a stable `image="<id>"`, so the agent can re-query or crop an earlier screenshot without a re-attachment ("zoom into that screenshot from before"), `#` autocompletes image ids in the prompt, and descriptions survive compaction via a recall digest. `analyze_image` answers targeted questions with locally applied crops; `generate_image` creates images that flow straight back through the same pipeline.
+- **Governed by default** — first-use data-egress consent per provider, persisted pre-consent lists, crops applied locally before upload, upload downscaling, decode-bomb protection, and recall bytes kept in memory only. See [Privacy & security](#privacy--security).
 
-**YouTube links** are detected too: paste a URL (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`, etc.) and the video is downloaded with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and analyzed exactly like a local file.
-
-**Compact tool rows (Pi ≥ 1.0.1)** — `analyze_image` and `generate_image` calls render as one tidy line each (`analyze_image  "What does the legend say?" · 2 images (image="deadbeef…", shot.png) · crop bottom-right@0`) with themed result summaries (`✓ zai/glm-5.3-flash · cached · 1.2s`, `✓ 1 image via google/imagen-4 · $0.0311`), instead of the default JSON-args dump. Generated images still render inline from the result blocks; expand a row to see the full analysis fence.
+Media routing is automatic: content sniffing and path detection feed a pipeline with transient-error retry, model fallback, and compact transcript rows for `analyze_image`/`generate_image` (Pi ≥ 1.0.1).
 
 ## What's new in 1.22.0
 
@@ -18,108 +20,9 @@ Borrowing from Pi 1.1.0:
 - **Result rows show a duration even without `details`** — pi 1.1.0's render context carries `durationMs` (the recorded `execute()` time of a final tool result). The `analyze_image` result line now falls back to it when its `details` have no `latencyMs`, so rows replayed from foreign/HTML-exported sessions still show `✓ … · 1.2s`. Our own `latencyMs` (the vision call itself, reported to codemode scripts via `structuredContent`) always wins.
 - **Per-invocation tool toggling documented** — pi 1.1.0's `--tools +name/-name` entries modify the default tool selection instead of replacing it, so `pi -t -analyze_image` runs a one-shot session without the re-query tool while keeping everything else (see [Slash commands](#slash-commands)).
 
-## What's new in 1.21.0
+## Release notes
 
-Adopting Pi 1.0.1's new `pi.registerToolRenderer()` API:
-
-- **Compact transcript rows for `analyze_image`** — the call line shows the question (truncated on a word boundary), the image refs (recall ids shortened to `image="deadbeef…"`, paths to their file name, `+N more` beyond two), a crop summary (`bottom-right@0`, `25%,13% 50%×50%@1`, `128,64 256×256@0`, or `crops ×N`), and any model override — instead of the raw JSON arguments. The result line summarizes `✓ provider/model · cached · latency` (or `✗ <error>`), and expanding the row reveals the full analysis fence.
-- **Compact transcript rows for `generate_image`** — the call line shows the prompt (and any model override); the result line summarizes `✓ N images via provider/model · $cost · image="<id8>…"`. The generated images themselves keep rendering inline — pi draws image blocks from the result content next to the renderer output — so this is purely a better header/summary, now reliable across Kitty, Ghostty, WezTerm, and Warp thanks to pi 1.0.1's JPEG/WebP/GIF image fixes.
-- **Works even when the tool isn't registered** — registering through `registerToolRenderer` (instead of inline `renderCall`/`renderResult` on the tool definitions) covers rows replayed from a session where the tool is now disabled (`/multimodal-proxy tool off`, mode off), resumed sessions, and HTML exports. `next()` chaining preserves renderers from other extensions for the keys we don't set.
-- **Renderer state via tool `details`** — results now carry a display-sized `details` payload (provider/model, `cached`, `latencyMs`, image ids, `costUSD`; heavy fields stripped) that feeds the renderer but never reaches the model.
-- Fully feature-gated (`typeof pi.registerToolRenderer === "function"`): pi < 1.0.1 hosts keep the default rendering, zero behavior change. pi-tui's `Text` component is loaded lazily with a plain-lines fallback so a missing package can never block extension load.
-
-Also benefits from pi 1.0.1 host fixes (no code needed here): Anthropic prompt caches survive mid-session tool toggles (tools added/redefined mid-conversation are now defined inline), "model at capacity" errors are retried instead of ending the turn, and Bedrock Claude thinking-signature failures after tool/prompt changes are fixed.
-
-## What's new in 1.20.0
-
-Image generation, riding Pi 1.0's new `models.generateImages()` API:
-
-- **`generate_image` tool** — agent-facing image creation with the session's image-generation models (feature-detected; silently absent on pi < 1.0). Prompt leaves only after the data-egress consent gate; the call reports usage/cost through the normal session accounting.
-- **Generated images join the pipeline** — results return as image blocks (vision base models see the pixels) **and** are persisted in the recall stores, so a text-only base model gets an automatic vision-model description (same as any tool-returned image), `#` recall works once described, and `analyze_image` can re-query or crop them via their `image="<id>"` ids.
-- **Codemode-friendly** — `outputSchema`-shaped `structuredContent` (provider, model, per-image ids/dimensions, `costUSD`) so scripts consume results programmatically; leans into Pi 1.0's leaner codemode with a compact description and recovery-style errors (close-match model suggestions, expected `provider/model-id` format, actionable `pi --login` hint when nothing is keyed).
-- **Shared cost guard** — `generate_image` counts against the same per-turn tool-call budget as `analyze_image`.
-
-## What's new in 1.19.0
-
-Deep integration with recent Pi releases (0.87 / 0.99):
-
-- **`generate_image` tool (Pi ≥ 1.0)** — the agent can now **create** images, not just understand them. Calls run through `models.generateImages()` with the session's credentials (usage counts toward session cost), the model defaults to the first keyed image-generation model (override per call with `model: "provider/model-id"`), results carry image blocks plus stable `image="<id>"` ids, and the existing pipeline takes over automatically: text-only base models get an auto-description via your vision model, and every generated image is recallable (`#`) and re-analyzable/croppable with `analyze_image` like any attachment. Data-egress consent gates the provider before the first call.
-- **Pi 1.0 alignment (1.19.1)** — leaner `analyze_image` description (~40% smaller — codemode lists tools under a 3000-token budget and drops what doesn't fit), recovery-style errors that name close matches (model typos, recall ids) and expected shapes (crops), and a dynamic implicit-vision-model fallback via `getAvailableOfType()` when the curated chain is entirely unkeyed.
-- **Virtual model — `Multimodal Auto`** (Pi ≥ 0.99, on by default): a new entry in `/model` that routes each request for you — turns whose pending input carries images go **natively** to your configured vision model (real pixels, no text fence), everything else stays on your base model (auto = whatever physical model handled the session before, or pin one with `/multimodal-proxy virtual-base`). Sticky routing keeps prompt caches valid within a turn; the footer shows the routed model and `/session` lists cost per physical model. Disable with `/multimodal-proxy virtual off`.
-- **`analyze_image` speaks the 0.99 tool API** — errors now surface as real tool errors (`isError`) instead of fake text, results carry a machine-readable `structuredContent` (analysis text, provider/model, latency, grounding format, per-image ids/dimensions/crop) so **codemode scripts** can consume them programmatically, and the tool is annotated (`readOnlyHint`) and namespaced (`multimodal-proxy`) for codemode listings.
-- **Model-aware upload downscale** (Pi ≥ 0.87) — when the configured vision model declares `inputLimits.images.resize` in its catalog entry, the proxy derives the downscale target, JPEG quality, and byte budget from it (tightening, never loosening, your `max-upload` settings). No more double-resizing against provider limits.
-- **Compaction-proof recall hint** (Pi ≥ 0.87) — the `analyze_image` recall affordance moves to a stable system-layer block via `context_with_system` once media has been described: it survives compaction (the old per-user-message hint was summarized away) and also reaches vision-capable session models, where the strip path never fired. Older hosts keep the previous behavior.
-
-## What's new in 1.18.0
-
-- **Key-aware default model resolution** — the implicit vision default now lands on a model you can actually call. If the default (`zai/glm-5.3-flash`) has no API key in your setup, the proxy walks a preference-ordered candidate chain — `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` (new in Pi 0.84.4, cheap, built-in provider) → `anthropic/claude-sonnet-5` — and picks the first candidate that is in the catalog **and keyed**. A keyed legacy default is never traded for an unkeyed model; explicit choices (`/multimodal-proxy model`, `pick`, `PI_VISION_PROXY_MODEL`) are still never rewritten; and when nothing is keyed you get the actionable `pi --login` hint as before. A substitution is announced once per session.
-- **Content-sniffed image validation** (Pi ≥ 0.84.4, graceful on older) — image files are validated by magic bytes via Pi's exported `detectSupportedImageMimeTypeFromFile()`: a `notes.png` that is really a PDF is rejected with a clear `invalid-image` reason instead of being shipped to the vision model, mis-typed extensions are **corrected** (a JPEG named `.png` uploads as `image/jpeg`), extensionless files with recognizable contents are accepted, and formats outside the sniffer's coverage (tiff/ico/avif) keep the extension-only path. APNG still passes as `image/png`.
-- **`/multimodal-proxy doctor`** — one-shot setup diagnostics: effective model (explicit / implicit / substituted), catalog presence, API keys, consent state, fallback + video model, yt-dlp & ffmpeg availability, path access, and recall-store usage.
-- **`/multimodal-proxy test`** — end-to-end self-test: synthesizes a tiny gradient image locally and describes it through the full pipeline (model resolution → key → consent → retry → upload), reporting the model, latency, and result. No fixture files, no extra setup.
-
-## What's new in 1.17.0
-
-- **Default vision model is now GLM 5.3 Flash** (`zai/glm-5.3-flash`) — fast, cheap image description ($0.075/M input, $0.25/M output) with a 1M-token context window. Models you never chose explicitly track the package default: configs that merely inherited the old default (`anthropic/claude-sonnet-5`) are upgraded when GLM 5.3 Flash is in the catalog, and on Pi versions without it the default falls back to `anthropic/claude-sonnet-5` (then `anthropic/claude-sonnet-4-5` on the oldest catalogs). Models chosen explicitly — via `/multimodal-proxy model`, `pick`, or `PI_VISION_PROXY_MODEL` — are never rewritten. **Heads-up:** the default provider is now Z.ai — you need a `zai` API key and will be asked for first-use data-egress consent unless you pin a different model (e.g. `/multimodal-proxy model anthropic/claude-sonnet-5`).
-
-## What's new in 1.16.0
-
-Reliability features borrowed from a survey of [atlas-vision-mcp](https://github.com/QuangThai/vision-bridge-mcp) (ideas worth stealing, implementation our own):
-
-- **Transient-error retry with backoff** — vision calls that fail with rate limits (429), transient server errors (5xx), or network hiccups are retried up to a configurable number of times (default 2) with exponential backoff + jitter (1s → 2s → 4s, capped at 8s, 0–30% jitter). User aborts and hard errors (401/403/413…) are never retried. Configure with `/multimodal-proxy retry <0-5>` or `PI_VISION_PROXY_RETRY_MAX`.
-- **Downscale oversized uploads before sending** — images larger than 2048 px on the long edge or 5 MB raw bytes are downscaled locally (ImageScript, JPEG q88, off-thread in the same terminable worker as cropping) before upload, protecting against provider payload limits and token waste. Hashes, caching, and session recall still key on the original bytes. Configure with `/multimodal-proxy max-upload <dim|n mb|off>` or `PI_VISION_PROXY_MAX_UPLOAD_DIM` (`0` disables entirely) / `PI_VISION_PROXY_MAX_UPLOAD_MB`.
-- **Fallback vision model** — when the primary vision model fails after retries (or hard-fails, e.g. quota exhausted), the call re-runs once with a configured fallback model. The fallback only ever runs when it resolves in the registry, supports the input kind, has an API key, **and its provider has data-egress consent** — failure handling can never bypass the consent gate. Configure with `/multimodal-proxy fallback-model <provider/model-id>|clear` or `PI_VISION_PROXY_FALLBACK_MODEL`.
-
-## What's new in 1.12.1
-
-- **Fix: downloaded videos now save to your real Downloads folder.** The "Save downloaded video?" prompt hardcoded `~/Downloads` and wrapped the copy in a silent `catch`. If you relocated Downloads (e.g. to `D:\Downloads`) or use OneDrive redirection, that path doesn't exist — so clicking **Yes** silently failed with no file and no error. The proxy now resolves the real Downloads folder via the Windows Shell known-folder API (`FOLDERID_Downloads`, respects relocation + OneDrive), creates it if missing, and surfaces any save error with the target path. The success toast now shows the full saved path.
-- **Configurable yt-dlp auth (defeats YouTube 403s).** YouTube increasingly rejects unauthenticated media fetches with `HTTP 403`, even on the latest `yt-dlp`. Two opt-in knobs satisfy the check: `/multimodal-proxy ytdlp cookies <browser>` reuses a logged-in browser session (`chrome`, `firefox`, `edge`, `brave`, …), and `/multimodal-proxy ytdlp extractor-args "<args>"` forwards arbitrary `--extractor-args` (e.g. `youtube:player_client=web_safari,web`). A 403 failure now also hints at the cookies knob. Env overrides: `PI_VISION_PROXY_YTDLP_COOKIES_FROM_BROWSER`, `PI_VISION_PROXY_YTDLP_EXTRACTOR_ARGS`.
-
-## What's new in 1.12.0
-
-- **YouTube video download** — paste a YouTube URL in your prompt and the extension downloads it via `yt-dlp` and analyzes it like any local video file. Gated by path detection (on by default); requires `yt-dlp` on your PATH. See [YouTube videos](#youtube-videos). After successful analysis you are prompted to optionally keep the downloaded file in your Downloads folder.
-- **Save downloaded videos** — after analysis completes, the extension asks whether to save a copy to `~/Downloads` (sanitised filename, opt-in per file).
-
-## What's new in 1.11.0
-
-- **Global consent wildcard** — `/multimodal-proxy allowed-providers add *` (or `all`) grants consent for **all providers** globally, so you can consent once and never be prompted again. The wildcard (`*`) appears in the pre-consented list as "* (all providers)" and can be removed with `/multimodal-proxy allowed-providers remove *`. An explicit in-session `consent no` still beats the wildcard.
-
-## What's new in 1.10.0
-
-- **Configurable allowed folders** — the file-access allowlist is now a persisted setting: `/multimodal-proxy folders add <path>` (also `remove`, `list`, `reset`) grants media reads from custom absolute folders, and `/multimodal-proxy allow-home on|off` is the persisted equivalent of `PI_VISION_PROXY_ALLOW_HOME=1`. Env override: `PI_VISION_PROXY_ALLOWED_FOLDERS`.
-- **Hide-able status line** — `/multimodal-proxy status off` hides the steady-state footer status (`multimodal-proxy: fallback → … | video: …`) once you've set up your providers and models. The setting persists across sessions; the transient analysis progress spinner still shows while a call is in flight. Env override: `PI_VISION_PROXY_STATUS_LINE=on|off`.
-
-## What's new in 1.9.0
-
-- **Pre-consented providers** — consent to data egress for chosen providers once instead of once per session: `/multimodal-proxy allowed-providers add <provider>` (or `consent always` to grant-and-persist in one step). An explicit `/multimodal-proxy consent no` still wins over the list. Env override: `PI_VISION_PROXY_ALLOWED_PROVIDERS`.
-
-## What's new in 1.8.0
-
-- **Media knowledge survives context compaction** — when Pi compacts the conversation, the user messages that carried image attachments (and injected video fences) are summarized away, which previously left the agent blind to all earlier media. The proxy now detects compaction on the active branch and re-injects a **post-compaction recall digest**: truncated image/video descriptions keyed by the same stable `image="..."` ids that `analyze_image` accepts, so the agent can still reason about — and re-query — *"that screenshot from before"* after a `/compact` or auto-compaction.
-- **Overflow-aware sizing** (Pi ≥ 0.79.10) — using the new `reason`/`willRetry` metadata on Pi's compaction events, the digest switches to lean per-item budgets after an overflow-recovery compaction, so restoring descriptions never contributes to a second overflow. On older Pi versions the digest simply uses its normal budgets.
-- The digest caps at the 12 most recent images and 4 most recent video/audio files, restates the UNTRUSTED-content warning, and is injected directly after the compaction summary on every LLM call until the media becomes visible in context again.
-- **`#` image-recall autocomplete** — type `#` in the prompt editor to get a dropdown of images seen earlier in the session (newest first; keep typing to fuzzy-filter by filename or description). Picking one inserts the image's stable `image="..."` recall id, so you can write *"zoom into `#`⇥"* instead of copying ids out of fences. Requires Pi ≥ 0.79.1; silently unavailable in RPC/print modes.
-- **Default vision model is now Claude Sonnet 5** (`anthropic/claude-sonnet-5`, available since Pi 0.80.3). Models you never chose explicitly track the package default: configs that merely inherited the old default (`claude-sonnet-4-5`) are upgraded when Sonnet 5 is in the catalog, and on older Pi versions the default falls back to `claude-sonnet-4-5`. Models chosen explicitly — via `/multimodal-proxy model`, `pick`, or `PI_VISION_PROXY_MODEL` — are never rewritten.
-
-## What's new in 1.7.0
-
-- **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB). A once-per-turn reminder keeps the recall affordance visible to the agent even on turns where no new image was attached.
-- **Live progress indicator** — slow image and video/audio analysis animate a spinner with elapsed seconds on the status line (e.g. `multimodal-proxy ⠙ Analyzing image 2/4… (3s)`) instead of a single static message, then restore the steady-state status when the call finishes.
-
-## What's new in 1.5.0
-
-- **Video/audio support** — automatically detects video files (`.mp4`, `.mkv`, `.webm`, `.avi`, `.mov`, etc.) and audio files (`.mp3`, `.wav`, `.m4a`, `.flac`, etc.) in prompts, routes them to a video-capable model, and injects a rich multimodal description into context.
-- **`/multimodal-proxy video-model`** — configure the video/audio analysis model independently from the image model.
-- **`PI_VISION_PROXY_VIDEO_MODEL`** env var override for video model.
-- **`onPayload` wire-format fixer** — rewrites `image_url` to `video_url` for video/audio content blocks sent through OpenAI-completions providers, without any pi-ai changes.
-- **Renamed from `pi-vision-proxy`** — the `/vision-proxy` command still works as a legacy alias.
-
-## What's new in 1.4.0
-
-- **`analyze_image` tool** — the agent can re-query images with targeted questions, multi-form crop support (region, normalized, pixels), and optional model-native grounding coordinates. Crops are applied locally before upload — only the cropped region is sent to the vision model.
-- **Multi-image batched comparison** — when ≥2 images arrive together, an adaptive joint vision call produces a comparison description alongside per-image descriptions.
-- **`/multimodal-proxy describe` slash command** — user-facing re-query with extended crop syntax, model override, and `--save` to overwrite the canonical description.
-- **Grounding format registry** — per-model native-format coordinate output (Qwen pixels, Molmo points, DeepSeek bbox, InternVL pixels, Gemini 0–1000) with curated Tier 1 defaults.
-- **ImageScript + imghash** — zero-native-dep image cropping and perceptual hashing (replaces planned `sharp` dependency).
+Only the latest release is summarized above. For everything else, see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Install
 
@@ -157,7 +60,7 @@ Both are persisted in `~/.pi/agent/multimodal-proxy.json` and can be set via env
 | Mode | Behavior |
 |------|----------|
 | **`fallback`** | Only activates when the active model lacks image support (default) |
-| **`always`** | Always uses the proxy, even if the active model supports images |
+| **`always`** | Describe media through the proxy vision model even when the base model supports images — e.g. to cut vision-token costs on an expensive multimodal model |
 | **`off`** | Disabled entirely |
 
 ## Virtual model (Pi ≥ 0.99)
