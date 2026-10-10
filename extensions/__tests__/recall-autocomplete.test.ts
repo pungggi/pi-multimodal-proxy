@@ -64,6 +64,40 @@ describe("collectRecallCandidates", () => {
 			{ hash: "h1", description: "first image", filename: undefined },
 		]);
 	});
+
+	it("merges store-only hashes (pass-through attachments) after described ones", () => {
+		const descriptions = new Map([["h1", "described earlier"]]);
+		const meta = new Map([["h3", { width: 8, height: 6, filename: "paste.png" }]]);
+		const out = collectRecallCandidates(descriptions, (h) => meta.get(h), ["h2", "h3"]);
+		assert.deepEqual(out, [
+			{ hash: "h1", description: "described earlier", filename: undefined },
+			{ hash: "h3", description: undefined, filename: "paste.png" }, // newest store entry first
+			{ hash: "h2", description: undefined, filename: undefined },
+		]);
+	});
+
+	it("descriptions win when a hash appears in both sources", () => {
+		const out = collectRecallCandidates(
+			new Map([["shared", "the description"]]),
+			() => undefined,
+			["shared", "other"],
+		);
+		assert.equal(out.length, 2);
+		assert.equal(out[0]!.description, "the description");
+		assert.equal(out[1]!.hash, "other");
+	});
+
+	it("feeds store-only candidates into buildRecallItems labels", () => {
+		const hash = "c".repeat(32);
+		const candidates = collectRecallCandidates(new Map(), () => ({ width: 2, height: 2, filename: "shot.png" }), [hash]);
+		const items = buildRecallItems(candidates, "");
+		assert.equal(items.length, 1);
+		assert.equal(items[0]!.label, "shot.png");
+		assert.ok(items[0]!.value.endsWith(hash));
+		// no filename → hash-prefix label
+		const bare = buildRecallItems(collectRecallCandidates(new Map(), () => undefined, [hash]), "");
+		assert.equal(bare[0]!.label, `${hash.slice(0, 12)}…`);
+	});
 });
 
 describe("buildRecallItems", () => {
