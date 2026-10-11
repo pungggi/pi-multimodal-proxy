@@ -1,6 +1,6 @@
 {
   "name": "pi-multimodal-proxy",
-  "version": "1.23.0",
+  "version": "1.24.0",
   "description": "Media understanding for any model in Pi: video/audio/YouTube analysis, vision for text-only models, cost-routed vision, and session image recall.",
   "keywords": [
     "pi-package"

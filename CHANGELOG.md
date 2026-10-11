@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.24.0] - 2026-10-11
+
+### Added
+
+- **Interactive YouTube 403 recovery** — a 403 on the media fetch with no cookies configured no longer dead-ends in a hint telling you to type a slash command. The proxy now opens a picker listing only the browsers actually installed on your machine (profile-dir detection per platform: Windows/macOS/Linux); picking one persists `ytdlpCookiesFromBrowser` (same write path as `/multimodal-proxy ytdlp cookies <browser>`, so future sessions just work) and retries the download immediately. Declining, headless sessions (`ctx.hasUI` false), or no detected browser fall back to a one-line notice. yt-dlp failure notifications also no longer echo the full command line: `summarizeYtDlpError` reduces the dump to the actionable `ERROR: …` line, and a 403 that persists *with* cookies now points at the extractor-args knob instead of the cookies knob. Ten new tests (559 total, all green): per-platform profile candidates, env-var fallback, XDG honoring, browser-set containment, and error summarization.
+
 ## [1.23.0] - 2026-10-10
 
 ### Fixed

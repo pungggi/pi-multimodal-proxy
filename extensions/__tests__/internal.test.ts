@@ -53,6 +53,8 @@ import {
 	sanitizeAllowedFolders,
 	sanitizeYtdlpCookiesFromBrowser,
 	sanitizeYtdlpExtractorArgs,
+	browserProfileCandidates,
+	summarizeYtDlpError,
 	sanitizeProviderHeaders,
 	YTDLP_COOKIES_BROWSERS,
 	pathAccessFromConfig,
@@ -345,6 +347,63 @@ describe("yt-dlp config sanitizers", () => {
 		assert.equal(sanitizeYtdlpExtractorArgs(""), "");
 		const long = "x".repeat(600);
 		assert.equal(sanitizeYtdlpExtractorArgs(long).length, 500);
+	});
+});
+
+describe("browserProfileCandidates", () => {
+	it("lists Windows profile dirs from LOCALAPPDATA/APPDATA, without safari", () => {
+		const env = { LOCALAPPDATA: join("C:", "Users", "u", "AppData", "Local"), APPDATA: join("C:", "Users", "u", "AppData", "Roaming") };
+		const map = new Map(browserProfileCandidates("win32", env, join("C:", "Users", "u")).map((c) => [c.browser, c.dirs]));
+		assert.ok(map.get("chrome")![0].endsWith(join("Google", "Chrome", "User Data")));
+		assert.ok(map.get("firefox")![0].endsWith(join("Mozilla", "Firefox", "Profiles")));
+		assert.ok(map.has("edge") && map.has("brave") && map.has("vivaldi") && map.has("chromium") && map.has("whale"));
+		assert.ok(!map.has("safari"));
+	});
+	it("falls back to homedir AppData when env vars are missing", () => {
+		const home = join("C:", "Users", "u");
+		const map = new Map(browserProfileCandidates("win32", {}, home).map((c) => [c.browser, c.dirs]));
+		assert.ok(map.get("chrome")![0].startsWith(join(home, "AppData", "Local")));
+		assert.ok(map.get("firefox")![0].startsWith(join(home, "AppData", "Roaming")));
+	});
+	it("lists macOS profile dirs including safari", () => {
+		const map = new Map(browserProfileCandidates("darwin", {}, "/Users/u").map((c) => [c.browser, c.dirs]));
+		assert.ok(map.get("firefox")![0].endsWith(join("Firefox", "Profiles")));
+		assert.ok(map.get("chrome")![0].endsWith(join("Google", "Chrome")));
+		assert.ok(map.get("safari")![0].endsWith("Safari.app"));
+		assert.ok(!map.has("whale"));
+	});
+	it("honors XDG_CONFIG_HOME on linux", () => {
+		const map = new Map(browserProfileCandidates("linux", { XDG_CONFIG_HOME: "/xdg" }, "/home/u").map((c) => [c.browser, c.dirs]));
+		assert.equal(map.get("chrome")![0], join("/xdg", "google-chrome"));
+		assert.equal(map.get("firefox")![0], join("/home/u", ".mozilla", "firefox"));
+		assert.ok(!map.has("safari"));
+	});
+	it("returns empty for unsupported platforms", () => {
+		assert.deepEqual(browserProfileCandidates("freebsd", {}, "/home/u"), []);
+	});
+	it("only yields browsers yt-dlp supports", () => {
+		for (const platform of ["win32", "darwin", "linux"] as const) {
+			for (const { browser } of browserProfileCandidates(platform, {}, "/home/u")) {
+				assert.ok(YTDLP_COOKIES_BROWSERS.has(browser), `${browser} on ${platform}`);
+			}
+		}
+	});
+});
+
+describe("summarizeYtDlpError", () => {
+	it("extracts the last ERROR line without the prefix", () => {
+		const msg = "Command failed: yt-dlp --no-playlist --no-warnings https://x\nWARNING: something\nERROR: unable to download video data: HTTP Error 403: Forbidden";
+		assert.equal(summarizeYtDlpError(msg), "unable to download video data: HTTP Error 403: Forbidden");
+	});
+	it("prefers the last ERROR line over earlier ones", () => {
+		const msg = "ERROR: first\nnoise\nERROR: second";
+		assert.equal(summarizeYtDlpError(msg), "second");
+	});
+	it("falls back to the last non-empty line", () => {
+		assert.equal(summarizeYtDlpError("Command failed: yt-dlp\n\nsome other failure\n"), "some other failure");
+	});
+	it("returns the message itself when it has no non-empty lines", () => {
+		assert.equal(summarizeYtDlpError(""), "");
 	});
 });
 

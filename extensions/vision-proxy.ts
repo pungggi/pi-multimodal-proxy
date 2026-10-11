@@ -254,6 +254,7 @@ import {
 	buildVideoDescriptionFence,
 	buildVideoEmptyResponseError,
 	buildVideoProxySection,
+	browserProfileCandidates,
 	extractXaiResponsesText,
 	formatXaiSttTranscript,
 	analyzeDetailsForTranscript,
@@ -321,6 +322,7 @@ import {
 	isUncPath,
 	MAX_ALLOWED_FOLDERS,
 	sanitizeYtdlpExtractorArgs,
+	summarizeYtDlpError,
 	YTDLP_COOKIES_BROWSERS,
 
 	readMediaFileWithReason,
@@ -1449,6 +1451,65 @@ interface DownloadedMedia {
 }
 
 /**
+ * Browsers from yt-dlp's --cookies-from-browser set whose profile dir exists
+ * on this machine (1.24.0). Drives the interactive 403 picker so it only
+ * offers browsers that can actually work.
+ */
+async function detectCookieBrowsers(): Promise<string[]> {
+	const found: string[] = [];
+	for (const { browser, dirs } of browserProfileCandidates(os.platform(), process.env, os.homedir())) {
+		for (const d of dirs) {
+			if (await pathExists(d)) {
+				found.push(browser);
+				break;
+			}
+		}
+	}
+	return found;
+}
+
+/**
+ * Persist a single config patch outside the slash-command handler (1.24.0).
+ * Mirrors commandHandler's writePersisted: sanitize → session entry → file,
+ * keeping allowedProviders file-scoped. Used by the interactive 403 flow.
+ */
+function persistConfigPatch(pi: ExtensionAPI, ctx: ExtensionContext, patch: Partial<VisionConfig>): void {
+	const validated = sanitize({ ...persistedBase(ctx.sessionManager.getEntries()), ...patch });
+	delete validated.allowedProviders;
+	pi.appendEntry(CUSTOM_TYPE_CONFIG, validated);
+	const fileNext: Partial<VisionConfig> = { ...validated };
+	if (_fileConfig.allowedProviders !== undefined) {
+		fileNext.allowedProviders = normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
+	}
+	writePersistentFile(fileNext);
+	_fileConfig = fileNext;
+}
+
+/**
+ * Interactive half of the 403 flow (1.24.0): offer the installed browsers,
+ * persist the pick (same as `/multimodal-proxy ytdlp cookies <browser>`), and
+ * return it so the caller retries. Returns null when declined, when no UI is
+ * available, or when no supported browser is detected.
+ */
+async function promptForCookieBrowser(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string | null> {
+	if (!ctx.hasUI) return null;
+	const browsers = await detectCookieBrowsers();
+	if (browsers.length === 0) return null;
+	const CANCEL = "Don't retry";
+	const choice = await ctx.ui.select(
+		"YouTube blocked the download (403 — it wants a logged-in session). Retry with cookies from:",
+		[...browsers, CANCEL],
+	);
+	if (!choice || choice === CANCEL || !YTDLP_COOKIES_BROWSERS.has(choice)) return null;
+	persistConfigPatch(pi, ctx, { ytdlpCookiesFromBrowser: choice });
+	ctx.ui.notify(
+		`[multimodal-proxy] Saved: yt-dlp will reuse ${choice} cookies from now on (change via /multimodal-proxy ytdlp cookies). Retrying…`,
+		"info",
+	);
+	return choice;
+}
+
+/**
  * Download a media URL via yt-dlp into a fresh temp dir.
  *
  * Prefers an already-muxed mp4 at <=720p to keep the payload small for the
@@ -1464,6 +1525,7 @@ async function downloadMediaUrl(
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 	ytdlp?: { cookiesFromBrowser?: string; extractorArgs?: string },
+	hooks?: { onForbidden?: () => Promise<string | null> },
 ): Promise<DownloadedMedia | null> {
 	if (!(await checkYtDlp())) {
 		ctx.ui.notify(
@@ -1524,12 +1586,32 @@ async function downloadMediaUrl(
 	} catch (err) {
 		if (signal?.aborted) return null;
 		const msg = err instanceof Error ? err.message : String(err);
-		// A 403 on the media fetch usually means YouTube wants a logged-in
-		// session; point the user at the cookies knob if it isn't already set.
-		const hint = /403|forbidden/i.test(msg) && !ytdlp?.cookiesFromBrowser
-			? " (a 403 often means YouTube wants a logged-in session — try /multimodal-proxy ytdlp cookies <browser>)"
+		const forbidden = /403|forbidden/i.test(msg);
+		// A 403 without cookies means YouTube wants a logged-in session. Offer to
+		// reuse a browser's cookies interactively (1.24.0) and retry once with
+		// them; the hook also persists the choice so later downloads just work.
+		if (forbidden && !ytdlp?.cookiesFromBrowser && hooks?.onForbidden) {
+			let browser: string | null = null;
+			try {
+				browser = await hooks.onForbidden();
+			} catch {
+				browser = null;
+			}
+			if (signal?.aborted) return null;
+			if (browser) {
+				return downloadMediaUrl(url, signal, ctx, { ...ytdlp, cookiesFromBrowser: browser });
+			}
+			// Declined (or nothing to offer): keep the notice to one line.
+			ctx.ui.notify(`[multimodal-proxy] YouTube download failed: ${summarizeYtDlpError(msg)}`, "warning");
+			return null;
+		}
+		// Point the user at the right knob depending on what is already set.
+		const hint = forbidden
+			? ytdlp?.cookiesFromBrowser
+				? " (still blocked with cookies — try /multimodal-proxy ytdlp extractor-args \"youtube:player_client=android\")"
+				: " (a 403 often means YouTube wants a logged-in session — try /multimodal-proxy ytdlp cookies <browser>)"
 			: "";
-		ctx.ui.notify(`[multimodal-proxy] YouTube download failed for ${url}: ${msg}${hint}`, "warning");
+		ctx.ui.notify(`[multimodal-proxy] YouTube download failed for ${url}: ${summarizeYtDlpError(msg)}${hint}`, "warning");
 		return null;
 	}
 }
@@ -3091,6 +3173,10 @@ export default function (pi: ExtensionAPI) {
 						() => downloadMediaUrl(watch, ctx.signal, ctx, {
 							cookiesFromBrowser: config.ytdlpCookiesFromBrowser,
 							extractorArgs: config.ytdlpExtractorArgs,
+						}, {
+							// 403 without cookies → offer to reuse an installed browser's
+							// session, persist the pick, and retry (1.24.0).
+							onForbidden: () => promptForCookieBrowser(pi, ctx),
 						}),
 					);
 					if (!dl) continue;
