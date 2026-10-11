@@ -1164,6 +1164,68 @@ export function sanitizeYtdlpExtractorArgs(value: unknown): string {
 }
 
 /**
+ * Well-known profile-dir candidates per browser, per platform (1.24.0). Pure:
+ * the caller does the fs checks and keeps only browsers whose dir exists.
+ * Drives the interactive 403 picker so it offers browsers that can actually
+ * work instead of listing all nine yt-dlp values blindly.
+ */
+export function browserProfileCandidates(
+	platform: NodeJS.Platform,
+	env: NodeJS.ProcessEnv,
+	homedir: string,
+): Array<{ browser: string; dirs: string[] }> {
+	const out: Array<{ browser: string; dirs: string[] }> = [];
+	const push = (browser: string, dirs: string[]) => out.push({ browser, dirs });
+	if (platform === "win32") {
+		const local = env.LOCALAPPDATA ?? join(homedir, "AppData", "Local");
+		const roaming = env.APPDATA ?? join(homedir, "AppData", "Roaming");
+		push("chrome", [join(local, "Google", "Chrome", "User Data")]);
+		push("firefox", [join(roaming, "Mozilla", "Firefox", "Profiles")]);
+		push("edge", [join(local, "Microsoft", "Edge", "User Data")]);
+		push("brave", [join(local, "BraveSoftware", "Brave-Browser", "User Data")]);
+		push("opera", [join(roaming, "Opera Software", "Opera Stable")]);
+		push("vivaldi", [join(local, "Vivaldi", "User Data")]);
+		push("chromium", [join(local, "Chromium", "User Data")]);
+		push("whale", [join(local, "Naver", "Naver Whale", "User Data")]);
+	} else if (platform === "darwin") {
+		const appSupport = join(homedir, "Library", "Application Support");
+		push("chrome", [join(appSupport, "Google", "Chrome")]);
+		push("firefox", [join(appSupport, "Firefox", "Profiles")]);
+		push("edge", [join(appSupport, "Microsoft Edge")]);
+		push("brave", [join(appSupport, "BraveSoftware", "Brave-Browser")]);
+		push("opera", [join(appSupport, "com.operasoftware.Opera")]);
+		push("vivaldi", [join(appSupport, "Vivaldi")]);
+		push("chromium", [join(appSupport, "Chromium")]);
+		push("safari", [join("/", "Applications", "Safari.app")]);
+	} else if (platform === "linux") {
+		const config = env.XDG_CONFIG_HOME ?? join(homedir, ".config");
+		push("chrome", [join(config, "google-chrome")]);
+		push("firefox", [join(homedir, ".mozilla", "firefox")]);
+		push("edge", [join(config, "microsoft-edge")]);
+		push("brave", [join(config, "BraveSoftware", "Brave-Browser")]);
+		push("opera", [join(config, "opera")]);
+		push("vivaldi", [join(config, "vivaldi")]);
+		push("chromium", [join(config, "chromium")]);
+		push("whale", [join(config, "naver-whale")]);
+	}
+	return out;
+}
+
+/**
+ * Reduce an execFile failure dump to the single actionable yt-dlp line: the
+ * last `ERROR: …` from stderr, else the last non-empty line. Keeps user-facing
+ * notifications to one line instead of echoing the full command (1.24.0).
+ */
+export function summarizeYtDlpError(message: string): string {
+	const lines = message.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const m = /^ERROR:\s*(.+)$/i.exec(lines[i]);
+		if (m) return m[1].trim();
+	}
+	return lines[lines.length - 1] ?? message;
+}
+
+/**
  * Drop `null` header values from a `ProviderHeaders` map. Since pi 0.84.0,
  * `ModelRegistry.getApiKeyAndHeaders()` returns `Record<string, string | null>`
  * where `null` marks a header for deletion. Raw `fetch()` calls (the xAI STT /

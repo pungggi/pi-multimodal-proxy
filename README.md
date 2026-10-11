@@ -47,9 +47,10 @@ winget install yt-dlp.yt-dlp        # Windows
 
 #### 403 Forbidden / download failures
 
-YouTube periodically rejects unauthenticated media fetches with `HTTP Error 403: Forbidden`, even on the latest `yt-dlp`. The proxy can't fix YouTube's backend, but you can satisfy the auth check:
+YouTube periodically rejects unauthenticated media fetches with `HTTP Error 403: Forbidden`, even on the latest `yt-dlp`. The proxy can't fix YouTube's backend, but it can satisfy the auth check:
 
-- **Reuse a logged-in browser session** — `/multimodal-proxy ytdlp cookies chrome` (also `firefox`, `edge`, `brave`, `opera`, `safari`, `vivaldi`, `chromium`, `whale`). yt-dlp reads that browser's YouTube cookies. This fixes most 403s.
+- **Interactive fix (default)** — when a download 403s and no cookies are configured, a picker offers the browsers actually installed on your machine. Pick one and the download retries immediately with that browser's YouTube cookies; the choice is persisted, so it only happens once.
+- **Manual setup** — `/multimodal-proxy ytdlp cookies chrome` (also `firefox`, `edge`, `brave`, `opera`, `safari`, `vivaldi`, `chromium`, `whale`). Same effect as the picker, for headless setups or pre-configuration.
 - **Try alternate player clients** — `/multimodal-proxy ytdlp extractor-args "youtube:player_client=web_safari,web"`.
 - Show current settings with `/multimodal-proxy ytdlp`; turn either off with `... off`.
 
