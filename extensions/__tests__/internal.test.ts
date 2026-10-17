@@ -36,6 +36,7 @@ import {
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
 	extractCandidateMediaUrls,
+	extractCustomMessageImages,
 	canonicalYouTubeUrl,
 	youTubeVideoId,
 	extractDimensions,
@@ -110,6 +111,23 @@ import {
 	isTransientVisionError,
 	retryDelayMs,
 	sleepWithAbort,
+	applySchedules,
+	applyScheduleOverrides,
+	describeScheduleState,
+	isValidTimeZone,
+	matchSchedule,
+	nextBoundary,
+	nextOccurrence,
+	overrideAlive,
+	parseHHMM,
+	sanitizeSchedules,
+	scheduleDropWarning,
+	scheduleMatches,
+	scheduleOverrideExpiry,
+	wallClockInZone,
+	SCHEDULE_SLOTS,
+	type ScheduleEntry,
+	type ScheduleOverrides,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -284,18 +302,18 @@ describe("readEnvOverrides", () => {
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false, schedule: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: false, allowedFolders: false, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false, schedule: false },
 		);
 		assert.deepEqual(
 			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
-			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false },
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowedProviders: false, allowHome: true, allowedFolders: true, statusLine: false, pathDetection: false, ytdlpCookies: false, ytdlpExtractorArgs: false, retryMax: false, maxUpload: false, fallbackModel: false, virtual: false, virtualBase: false, schedule: false },
 		);
 		assert.equal(envFlags({ PI_VISION_PROXY_ALLOWED_PROVIDERS: "" }).allowedProviders, true);
 		// An unrecognized ALLOW_HOME value is not an override and must not lock the command
@@ -1111,6 +1129,30 @@ describe("allowedProviders config plumbing", () => {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("round-trips schedules through the persistent file into resolveConfig", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vision-proxy-sched-"));
+		try {
+			await writePersistentFile(
+				{
+					schedule: "on",
+					schedules: { model: [{ days: ["mon"], from: "08:00", to: "16:00", model: "flat/rate" }] },
+				},
+				dir,
+			);
+			const fileConfig = await readPersistentFile(dir);
+			assert.equal(fileConfig.schedule, "on");
+			assert.equal(fileConfig.schedules!.model!.length, 1);
+			// The file boundary keeps the keys (PERSISTED_CONFIG_KEYS) and
+			// resolveConfig resolves them at the injected time.
+			const monday = resolveConfig([], {}, fileConfig, new Date(2026, 9, 19, 10, 0));
+			assert.equal(`${monday.provider}/${monday.modelId}`, "flat/rate");
+			const sunday = resolveConfig([], {}, fileConfig, new Date(2026, 9, 18, 10, 0));
+			assert.equal(`${sunday.provider}/${sunday.modelId}`, `${DEFAULT_CONFIG.provider}/${DEFAULT_CONFIG.modelId}`);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("toPiAiImage", () => {
@@ -1317,6 +1359,48 @@ describe("extractCandidateMediaUrls (YouTube)", () => {
 
 	it("ignores non-YouTube URLs", () => {
 		assert.deepEqual(extractCandidateMediaUrls("see https://vimeo.com/123456 and https://example.com"), []);
+	});
+});
+
+describe("extractCustomMessageImages (Pi ≥ 1.2.0 custom-run events)", () => {
+	const img = (data: string, mimeType = "image/png") => ({ type: "image", data, mimeType });
+
+	it("returns [] for string content (no image blocks)", () => {
+		assert.deepEqual(extractCustomMessageImages("just text"), []);
+	});
+
+	it("returns [] for missing/garbage content", () => {
+		assert.deepEqual(extractCustomMessageImages(undefined), []);
+		assert.deepEqual(extractCustomMessageImages(null), []);
+		assert.deepEqual(extractCustomMessageImages(42), []);
+		assert.deepEqual(extractCustomMessageImages({ type: "image" }), []);
+	});
+
+	it("collects image blocks and skips text blocks", () => {
+		const content = [
+			{ type: "text", text: "what is in this screenshot?" },
+			img("aW1hZ2Ux"),
+			{ type: "text", text: "and this one" },
+			img("aW1hZ2Uy", "image/jpeg"),
+		];
+		const out = extractCustomMessageImages(content);
+		assert.equal(out.length, 2);
+		assert.equal(out[0].data, "aW1hZ2Ux");
+		assert.equal(out[1].mimeType, "image/jpeg");
+	});
+
+	it("skips malformed image blocks (missing data/mimeType)", () => {
+		const content = [
+			{ type: "image" },
+			{ type: "image", data: "aW1hZ2Uz" },
+			{ type: "image", mimeType: "image/png" },
+			null,
+			"image",
+			img("aW1hZ2U0"),
+		];
+		const out = extractCustomMessageImages(content);
+		assert.equal(out.length, 1);
+		assert.equal(out[0].data, "aW1hZ2U0");
 	});
 });
 
@@ -3902,3 +3986,356 @@ describe("CodeRabbit round-2 fixes (PR #27)", () => {
 		assert.equal(downscaleTargetDim({ width: 800, height: 600 }, 100, cfg), null);
 	});
 });
+
+// ── Scheduled model slots (1.25.0, issue #42) ──────────────────────────────
+
+describe("schedule: parseHHMM", () => {
+	it("parses valid HH:MM and rejects the rest", () => {
+		assert.equal(parseHHMM("08:00"), 480);
+		assert.equal(parseHHMM("23:59"), 1439);
+		assert.equal(parseHHMM("00:00"), 0);
+		assert.equal(parseHHMM("24:00"), null);
+		assert.equal(parseHHMM("7:00"), null);
+		assert.equal(parseHHMM("08:60"), null);
+		assert.equal(parseHHMM("0800"), null);
+	});
+});
+
+describe("schedule: wallClockInZone", () => {
+	it("renders midnight as 00:xx (hourCycle h23, no legacy 24)", () => {
+		// 2026-10-17T22:00Z is 2026-10-18 00:00 in Europe/Rome (CEST, UTC+2)
+		const wc = wallClockInZone(new Date("2026-10-17T22:00:00Z"), "Europe/Rome");
+		assert.equal(wc.minutes, 0);
+		assert.equal(wc.weekday, 0); // Sunday
+	});
+	it("converts the same instant across zones", () => {
+		const t = new Date("2026-10-17T07:30:00Z");
+		assert.deepEqual(wallClockInZone(t, "Europe/Rome"), { weekday: 6, minutes: 9 * 60 + 30 });
+		assert.deepEqual(wallClockInZone(t, "America/New_York"), { weekday: 6, minutes: 3 * 60 + 30 });
+	});
+	it("is DST-aware across the US spring-forward transition (2026-03-08)", () => {
+		assert.equal(wallClockInZone(new Date("2026-03-08T06:30:00Z"), "America/New_York").minutes, 90); // 01:30 EST
+		assert.equal(wallClockInZone(new Date("2026-03-08T07:30:00Z"), "America/New_York").minutes, 210); // 03:30 EDT (02:xx skipped)
+	});
+	it("is DST-aware across the US fall-back transition (2026-11-01)", () => {
+		assert.equal(wallClockInZone(new Date("2026-11-01T05:30:00Z"), "America/New_York").minutes, 90); // 01:30 EDT
+		assert.equal(wallClockInZone(new Date("2026-11-01T06:30:00Z"), "America/New_York").minutes, 90); // 01:30 EST
+	});
+	it("local default matches Date fields for a locally-built Date", () => {
+		const d = new Date(2026, 9, 19, 10, 30);
+		const wc = wallClockInZone(d);
+		assert.equal(wc.minutes, 10 * 60 + 30);
+		assert.equal(wc.weekday, d.getDay());
+	});
+});
+
+describe("schedule: scheduleMatches", () => {
+	const entry = (over: Partial<ScheduleEntry>): ScheduleEntry => ({ provider: "p", modelId: "m", ...over });
+	it("half-open window: from inclusive, to exclusive", () => {
+		const e = entry({ from: "08:00", to: "16:00" });
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 8, 0)), true);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 10, 0)), true);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 15, 59)), true);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 16, 0)), false);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 7, 59)), false);
+	});
+	it("wraps midnight: from 22:00 to 06:00", () => {
+		const e = entry({ from: "22:00", to: "06:00" });
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 23, 0)), true);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 20, 5, 0)), true); // next calendar day, same night
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 21, 59)), false);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 20, 6, 0)), false);
+	});
+	it("filters by days (mon-fri)", () => {
+		const e = entry({ days: ["mon", "tue", "wed", "thu", "fri"], from: "08:00", to: "16:00" });
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 10, 0)), true); // Monday
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 17, 10, 0)), false); // Saturday
+	});
+	it("wrap-midnight windows honor the start day (mon 22:00-06:00)", () => {
+		const e = entry({ days: ["mon"], from: "22:00", to: "06:00" });
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 23, 0)), true); // Monday night
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 20, 5, 0)), true); // Tuesday early = Monday's window
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 25, 5, 0)), false); // Sunday early = Saturday's window
+	});
+	it("matches every day and all day without constraints", () => {
+		const e = entry({});
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 19, 0, 0)), true);
+		assert.equal(scheduleMatches(e, new Date(2026, 9, 25, 23, 59)), true);
+	});
+	it("matches in the entry's zone, not the host's", () => {
+		const e = entry({ from: "08:00", to: "16:00", tz: "Europe/Rome" });
+		assert.equal(scheduleMatches(e, new Date("2026-10-19T07:30:00Z")), true); // 09:30 in Rome
+		assert.equal(scheduleMatches(e, new Date("2026-10-19T15:30:00Z")), false); // 17:30 in Rome
+	});
+});
+
+describe("schedule: matchSchedule", () => {
+	it("first match wins", () => {
+		const entries: ScheduleEntry[] = [
+			{ provider: "a", modelId: "1", from: "00:00", to: "12:00" },
+			{ provider: "b", modelId: "2" },
+		];
+		const hit = matchSchedule(entries, new Date(2026, 9, 19, 10, 0))!;
+		assert.equal(hit.index, 0);
+		assert.equal(hit.entry.provider, "a");
+		assert.equal(matchSchedule(entries, new Date(2026, 9, 19, 14, 0))!.index, 1);
+		assert.equal(matchSchedule([], new Date()), null);
+	});
+});
+
+describe("schedule: applySchedules", () => {
+	const base = { ...DEFAULT_CONFIG, provider: "zai", modelId: "glm-5.3-flash", videoProvider: "xai", videoModelId: "grok-4.3" };
+	const always = (p: string, m: string): ScheduleEntry => ({ provider: p, modelId: m });
+	it("rewrites all four slots from matching entries and marks the vision slot explicit", () => {
+		const cfg = {
+			...base,
+			schedules: {
+				model: [always("sche", "d-vision")],
+				videoModel: [always("sche", "d-video")],
+				fallbackModel: [always("sche", "d-fb")],
+				virtualBase: [always("sche", "d-base")],
+			},
+		} as typeof base;
+		const out = applySchedules(cfg, new Date());
+		assert.equal(`${out.provider}/${out.modelId}`, "sche/d-vision");
+		assert.equal(out.modelExplicit, true);
+		assert.equal(`${out.videoProvider}/${out.videoModelId}`, "sche/d-video");
+		assert.equal(`${out.fallbackProvider}/${out.fallbackModelId}`, "sche/d-fb");
+		assert.equal(`${out.virtualBaseProvider}/${out.virtualBaseModelId}`, "sche/d-base");
+	});
+	it("keeps base values when nothing matches", () => {
+		const cfg = { ...base, schedules: { model: [{ provider: "sche", modelId: "d", days: ["mon"] }] } } as typeof base;
+		const out = applySchedules(cfg, new Date(2026, 9, 18, 10, 0)); // Sunday
+		assert.equal(out.provider, "zai");
+		assert.equal(out.modelId, "glm-5.3-flash");
+	});
+	it("schedule off disables matching", () => {
+		const cfg = { ...base, schedule: "off" as const, schedules: { model: [always("sche", "d")] } } as typeof base;
+		assert.equal(applySchedules(cfg, new Date()).provider, "zai");
+	});
+	it("leaves modelExplicit untouched when the vision slot does not match", () => {
+		const cfg = { ...base, schedules: { model: [{ provider: "sche", modelId: "d", days: ["mon"] }] } } as typeof base;
+		const out = applySchedules(cfg, new Date(2026, 9, 18, 10, 0));
+		assert.notEqual(out.modelExplicit, true);
+	});
+});
+
+describe("schedule: applyScheduleOverrides", () => {
+	const cfg = {
+		...DEFAULT_CONFIG,
+		provider: "sche",
+		modelId: "scheduled",
+		modelExplicit: true,
+		schedules: { model: [{ provider: "sche", modelId: "scheduled" }] },
+	};
+	it("shadows the active entry with the manual pick", () => {
+		const overrides: ScheduleOverrides = { model: { provider: "manual", modelId: "pick", entryIndex: 0 } };
+		const out = applyScheduleOverrides(cfg, overrides, new Date(2026, 9, 19, 10, 0));
+		assert.equal(`${out.provider}/${out.modelId}`, "manual/pick");
+		assert.equal(out.modelExplicit, true);
+	});
+	it("ignores an expired override (entry index changed)", () => {
+		// Work-hours entry 0 is inactive on Sunday; entry 1 (default) is active.
+		// An override pinned to entry 0 must not apply over the resolved config.
+		const sunday = new Date(2026, 9, 18, 10, 0);
+		const base = {
+			...DEFAULT_CONFIG,
+			schedules: { model: [{ provider: "sche", modelId: "work", from: "08:00", to: "16:00", days: ["mon"] }, { provider: "sche", modelId: "default" }] },
+		};
+		const scheduled = applySchedules(base, sunday);
+		assert.equal(scheduled.modelId, "default");
+		const overrides: ScheduleOverrides = { model: { provider: "manual", modelId: "pick", entryIndex: 0 } };
+		const out = applyScheduleOverrides(scheduled, overrides, sunday);
+		assert.equal(out.modelId, "default");
+	});
+	it("no-op when matching is off", () => {
+		assert.equal(applyScheduleOverrides({ ...DEFAULT_CONFIG, schedule: "off" }, {}, new Date()).provider, DEFAULT_CONFIG.provider);
+	});
+	it("dies with the window: a Monday pick does not shadow Tuesday's occurrence (PR #43)", () => {
+		// Mon–Fri 08:00–16:00 entry; override recorded Monday 10:00.
+		const entry: ScheduleEntry = { provider: "sche", modelId: "work", from: "08:00", to: "16:00", days: ["mon", "tue", "wed", "thu", "fri"] };
+		const monday = new Date(2026, 9, 19, 10, 0);
+		const expiresAt = scheduleOverrideExpiry(entry, monday)!;
+		assert.equal(expiresAt, new Date(2026, 9, 19, 16, 0).getTime());
+		const base = { ...DEFAULT_CONFIG, schedules: { model: [entry] } };
+		const overrides: ScheduleOverrides = { model: { provider: "manual", modelId: "pick", entryIndex: 0, expiresAt } };
+		// Same wall-clock window next day: index matches, time doesn't.
+		const tuesday = new Date(2026, 9, 20, 10, 0);
+		const scheduled = applySchedules(base, tuesday);
+		assert.equal(scheduled.modelId, "work");
+		const out = applyScheduleOverrides(scheduled, overrides, tuesday);
+		assert.equal(`${out.provider}/${out.modelId}`, "sche/work");
+		// And while the window is live, the override still wins.
+		const mondayOut = applyScheduleOverrides(applySchedules(base, monday), overrides, monday);
+		assert.equal(`${mondayOut.provider}/${mondayOut.modelId}`, "manual/pick");
+	});
+	it("days-only entries expire at end of day; always-on entries never expire by time", () => {
+		const daysOnly: ScheduleEntry = { provider: "sche", modelId: "d", days: ["mon"] };
+		assert.equal(scheduleOverrideExpiry(daysOnly, new Date(2026, 9, 19, 10, 0)), new Date(2026, 9, 20, 0, 0).getTime());
+		assert.equal(scheduleOverrideExpiry({ provider: "sche", modelId: "a" }, new Date(2026, 9, 19, 10, 0)), undefined);
+	});
+	it("overrideAlive combines index and window liveness", () => {
+		const entry: ScheduleEntry = { provider: "sche", modelId: "work", from: "08:00", to: "16:00" };
+		const hit = matchSchedule([entry], new Date(2026, 9, 19, 10, 0))!;
+		assert.ok(overrideAlive({ provider: "m", modelId: "p", entryIndex: 0, expiresAt: new Date(2026, 9, 19, 16, 0).getTime() }, hit, new Date(2026, 9, 19, 15, 59)));
+		assert.equal(overrideAlive({ provider: "m", modelId: "p", entryIndex: 0, expiresAt: new Date(2026, 9, 19, 16, 0).getTime() }, hit, new Date(2026, 9, 19, 16, 0)), false);
+		assert.equal(overrideAlive({ provider: "m", modelId: "p", entryIndex: 1 }, hit, new Date(2026, 9, 19, 10, 0)), false);
+	});
+});
+
+describe("schedule: sanitizeSchedules", () => {
+	it("drops invalid entries, keeps valid ones", () => {
+		const out = sanitizeSchedules({
+			model: [
+				{ model: "good/one" },
+				{ model: "noslash" },
+				{ provider: "also-good", modelId: "two" },
+				{ model: "bad/time", from: "25:00" },
+				{ model: "bad/day", days: ["funday"] },
+				{ model: "bad/tz", tz: "Not/AZone" },
+				"not-an-object",
+			],
+		})!;
+		assert.equal(out.model!.length, 2);
+		assert.deepEqual(out.model![0], { provider: "good", modelId: "one" });
+		assert.deepEqual(out.model![1], { provider: "also-good", modelId: "two" });
+	});
+	it("canonicalizes x-ai to xai and validates tz via Intl", () => {
+		assert.equal(isValidTimeZone("Europe/Rome"), true);
+		assert.equal(isValidTimeZone("Not/AZone"), false);
+		const out = sanitizeSchedules({ videoModel: [{ model: "x-ai/grok-4.3", from: "08:00", to: "16:00", tz: "Europe/Rome" }] })!;
+		assert.equal(out.videoModel![0]!.provider, "xai");
+		assert.equal(out.videoModel![0]!.from, "08:00");
+		assert.equal(out.videoModel![0]!.tz, "Europe/Rome");
+	});
+	it("expands the bare-array shorthand to all four slots", () => {
+		const out = sanitizeSchedules([{ model: "p/m" }])!;
+		for (const slot of SCHEDULE_SLOTS) assert.equal(out[slot]!.length, 1);
+	});
+	it("drops empty/invalid slot lists and returns undefined when nothing valid remains", () => {
+		assert.equal(sanitizeSchedules({ model: [] }), undefined);
+		assert.equal(sanitizeSchedules({ model: [{ model: "nope" }] }), undefined);
+		assert.equal(sanitizeSchedules("garbage"), undefined);
+		assert.equal(sanitizeSchedules(undefined), undefined);
+	});
+	it("caps entries per slot at 32", () => {
+		const many = Array.from({ length: 40 }, (_, i) => ({ model: `p/m${i}` }));
+		assert.equal(sanitizeSchedules({ model: many })!.model!.length, 32);
+	});
+	it("empty days array means every day (key dropped)", () => {
+		const out = sanitizeSchedules({ model: [{ model: "p/m", days: [] }] })!;
+		assert.equal(out.model![0]!.days, undefined);
+	});
+	it("sanitize integration: defaults the toggle, drops invalid schedules, keeps valid ones", () => {
+		const out = sanitize({ ...DEFAULT_CONFIG, schedules: { model: [{ model: "x" }] }, schedule: "bogus" as unknown as "on" });
+		assert.equal(out.schedule, "on");
+		assert.equal(out.schedules, undefined);
+		const kept = sanitize({ ...DEFAULT_CONFIG, schedules: { fallbackModel: [{ model: "openai/gpt-5-mini" }] } });
+		assert.equal(kept.schedules!.fallbackModel![0]!.provider, "openai");
+	});
+});
+
+describe("schedule: resolveConfig (now injection + precedence)", () => {
+	const fileConfig = {
+		schedules: {
+			model: [{ from: "08:00", to: "16:00", model: "flat/rate" }],
+		},
+	};
+	it("applies a matching schedule at request time", () => {
+		const out = resolveConfig([], {}, fileConfig, new Date(2026, 9, 19, 10, 0));
+		assert.equal(`${out.provider}/${out.modelId}`, "flat/rate");
+		assert.equal(out.modelExplicit, true);
+	});
+	it("keeps the persisted model outside the window", () => {
+		const out = resolveConfig([], {}, fileConfig, new Date(2026, 9, 19, 17, 0));
+		assert.equal(`${out.provider}/${out.modelId}`, `${DEFAULT_CONFIG.provider}/${DEFAULT_CONFIG.modelId}`);
+	});
+	it("env beats schedule (hard pin semantics)", () => {
+		const out = resolveConfig([], { PI_VISION_PROXY_MODEL: "openai/gpt-4o" }, fileConfig, new Date(2026, 9, 19, 10, 0));
+		assert.equal(`${out.provider}/${out.modelId}`, "openai/gpt-4o");
+	});
+	it("schedule beats session-entry config", () => {
+		const entries = [customEntry(CUSTOM_TYPE_CONFIG, { provider: "zai", modelId: "glm-5.3-flash", modelExplicit: true })];
+		const out = resolveConfig(entries, {}, fileConfig, new Date(2026, 9, 19, 10, 0));
+		assert.equal(`${out.provider}/${out.modelId}`, "flat/rate");
+	});
+	it("PI_VISION_PROXY_SCHEDULE=off disables matching without deleting entries", () => {
+		const out = resolveConfig([], { PI_VISION_PROXY_SCHEDULE: "off" }, fileConfig, new Date(2026, 9, 19, 10, 0));
+		assert.equal(out.schedule, "off");
+		assert.equal(out.schedules!.model!.length, 1);
+		assert.equal(`${out.provider}/${out.modelId}`, `${DEFAULT_CONFIG.provider}/${DEFAULT_CONFIG.modelId}`);
+	});
+	it("readEnvOverrides parses the schedule toggle only for recognized values", () => {
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_SCHEDULE: "off" }).schedule, "off");
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_SCHEDULE: "bogus" }).schedule, undefined);
+	});
+});
+
+describe("schedule: describeScheduleState + nextBoundary", () => {
+	it("reports active/until/overridden per slot", () => {
+		const cfg = {
+			...DEFAULT_CONFIG,
+			schedules: { model: [{ from: "08:00", to: "16:00", model: "p/m" }] },
+		};
+		const now = new Date(2026, 9, 19, 10, 0);
+		const info = describeScheduleState(cfg, now);
+		assert.equal(info.model!.active, true);
+		assert.equal(info.model!.until, "16:00");
+		assert.equal(Boolean(info.model!.overridden), false);
+		const overridden = describeScheduleState(cfg, now, { model: { provider: "x", modelId: "y", entryIndex: 0 } });
+		assert.equal(overridden.model!.overridden, true);
+		// Window-expired override (same index, later occurrence) no longer counts.
+		const expired = describeScheduleState(cfg, now, {
+			model: { provider: "x", modelId: "y", entryIndex: 0, expiresAt: now.getTime() - 1 },
+		});
+		assert.equal(Boolean(expired.model!.overridden), false);
+		const outside = describeScheduleState(cfg, new Date(2026, 9, 19, 17, 0));
+		assert.equal(outside.model!.active, false);
+	});
+	it("appends a foreign tz to until only when it differs from the host zone", () => {
+		const cfg = { ...DEFAULT_CONFIG, schedules: { model: [{ from: "08:00", to: "16:00", tz: "America/New_York", model: "p/m" }] } };
+		const until = describeScheduleState(cfg, new Date("2026-10-19T14:00:00Z")).model!.until!;
+		assert.ok(until.startsWith("16:00"), until);
+		assert.ok(until === "16:00" || until === "16:00 America/New_York", until);
+	});
+	it("nextBoundary lands on the window end in the entry zone", () => {
+		const e: ScheduleEntry = { from: "08:00", to: "16:00", provider: "p", modelId: "m" };
+		const now = new Date(2026, 9, 19, 15, 0);
+		const b = nextBoundary(e, now)!;
+		assert.equal(b.getTime() - now.getTime(), 60 * 60_000);
+		assert.equal(nextBoundary({ provider: "p", modelId: "m" }, now), null);
+	});
+	it("nextOccurrence wraps to the next day at/past the target", () => {
+		const now = new Date(2026, 9, 19, 16, 0);
+		const next = nextOccurrence("16:00", undefined, now);
+		assert.equal(next.getTime() - now.getTime(), 1440 * 60_000);
+	});
+});
+
+describe("schedule: scheduleDropWarning", () => {
+	it("null when nothing was dropped, for both shapes", () => {
+		assert.equal(scheduleDropWarning(null, DEFAULT_CONFIG), null);
+		const arrayValid = sanitizeSchedules([{ model: "a/one" }, { model: "b/two" }])!;
+		assert.equal(scheduleDropWarning({ kind: "array", entries: 2 }, { ...DEFAULT_CONFIG, schedules: arrayValid }), null);
+		const objectValid = sanitizeSchedules({ model: [{ model: "a/one" }] })!;
+		assert.equal(scheduleDropWarning({ kind: "object", entries: 1 }, { ...DEFAULT_CONFIG, schedules: objectValid }), null);
+	});
+	it("counts the bare-array shorthand against one slot, not four (PR #43)", () => {
+		// One valid + one invalid entry: pre-fix validCount was 4×1, hiding the drop.
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules([{ model: "a/one" }, { model: "no-slash" }])! };
+		const warning = scheduleDropWarning({ kind: "array", entries: 2 }, effective);
+		assert.ok(warning?.startsWith("⚠ 1 invalid entry dropped"), warning);
+	});
+	it("per-slot cap cuts are not reported as invalid", () => {
+		const many = Array.from({ length: 40 }, (_, i) => ({ model: `a/m${i}` }));
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules({ model: many })! };
+		assert.equal(effective.schedules!.model!.length, 32);
+		assert.equal(scheduleDropWarning({ kind: "object", entries: 32 }, effective), null);
+	});
+	it("entries under unknown slot keys surface as dropped", () => {
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules({ model: [{ model: "a/one" }] })! };
+		const warning = scheduleDropWarning({ kind: "object", entries: 3 }, effective);
+		assert.ok(warning?.includes("2 invalid entries dropped"), warning);
+	});
+});
+

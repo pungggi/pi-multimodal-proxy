@@ -12,13 +12,13 @@ Media understanding for [Pi](https://pi.dev): images, video, audio, and YouTube 
 
 Media routing is automatic: content sniffing and path detection feed a pipeline with transient-error retry and model fallback on the image path (the native xAI video path is one-shot), plus compact transcript rows for `analyze_image`/`generate_image` (Pi ≥ 1.0.1).
 
-## What's new in 1.22.0
+## What's new in 1.25.0
 
-Borrowing from Pi 1.1.0:
+Two themes: time-based model switching (issue #42) and Pi 1.2.0 run-safety.
 
-- **Claude Haiku 5.5 joins the implicit-model candidate chain** — `zai/glm-5.3-flash` → `deepseek/deepseek-v4-flash-vision-exp` → `anthropic/claude-haiku-5-5` (new, Pi ≥ 1.1.0) → `anthropic/claude-sonnet-5` → `anthropic/claude-sonnet-4-5`. When your cheaper candidates have no API key, an anthropic-keyed setup now lands on Haiku 5.5 instead of Sonnet 5 for image descriptions — $0.1/M in, $0.5/M out vs $2/M, $10/M (20× cheaper output at typical description-prompt sizes; above 100K input tokens Haiku is $0.5/$2.5, still 4× cheaper output). Same key, still vision-capable, and its catalog `inputLimits.images.resize` feeds the model-aware upload downscale. Catalogs without Haiku (pi < 1.1.0) skip it and behave exactly as before; explicit choices are never rewritten.
-- **Result rows show a duration even without `details`** — pi 1.1.0's render context carries `durationMs` (the recorded `execute()` time of a final tool result). The `analyze_image` result line now falls back to it when its `details` have no `latencyMs`, so rows replayed from foreign/HTML-exported sessions still show `✓ … · 1.2s`. Our own `latencyMs` (the vision call itself, reported to codemode scripts via `structuredContent`) always wins.
-- **Per-invocation tool toggling documented** — pi 1.1.0's `--tools +name/-name` entries modify the default tool selection instead of replacing it, so `pi -t -analyze_image` runs a one-shot session without the re-query tool while keeping everything else (see [Slash commands](#slash-commands)).
+- **Scheduled model slots** — the vision, video, fallback, and virtual-base models can now resolve by wall-clock schedule, evaluated at request time. Built for flat-rate time-block subscriptions (e.g. CheapestInference: unlimited inside your 08:00–16:00 block, key errors outside), it also covers off-peak pricing, free-tier windows, and overnight heavyweight models. First match wins, windows wrap midnight, per-entry IANA timezones are DST-aware, and the status line shows `⏱ until 16:00`. See [Scheduled model slots](#scheduled-model-slots).
+- **Manual picks override temporarily** — `/multimodal-proxy model` (or `pick`, `video-model`, …) issued while a slot's schedule is active shadows it until the schedule's window ends, then the schedule resumes on its own.
+- **`before_agent_start` crash fixed on Pi ≥ 1.2.0 custom-message runs** — runs started by `pi.sendMessage(..., { triggerTurn: true })` while idle no longer hit `undefined.matchAll`; their image blocks now go through the normal proxy pipeline (described on text-only models, retained for recall on vision-capable ones).
 
 ## Release notes
 
@@ -82,6 +82,40 @@ Why you'd want it:
 
 Virtual-model routing is orthogonal to proxy mode: with `Multimodal Auto` selected, image stripping never applies (the virtual model advertises image input), while video/audio path detection, `analyze_image`, and consent gates keep working exactly as before.
 
+## Scheduled model slots
+
+Some providers sell flat-rate, time-blocked subscriptions: unlimited usage of a model, but only inside your reserved daily window (e.g. 08:00–16:00). The model you *want* therefore depends on the clock. Scheduled slots resolve that automatically:
+
+- **Four slots, any of them time-based**: `model` (vision), `videoModel`, `fallbackModel`, `virtualBase` — pick which ones follow a schedule.
+- **Request-time resolution** — every request re-evaluates the clock, so a session crossing a block boundary switches on the next request without a restart.
+- **Consent and retry unaffected** — a scheduled model flows through the same data-egress consent gates, retry budget, and fallback-model machinery as a manually picked one.
+
+Configure entries by editing `~/.pi/agent/multimodal-proxy.json` (they are file-managed, like `allowed-providers`):
+
+```jsonc
+{
+  "schedule": "on",
+  "schedules": {
+    "model": [
+      { "days": ["mon","tue","wed","thu","fri"], "from": "08:00", "to": "16:00", "model": "cheapestinference/deepseek-v4.1-flash" },
+      { "model": "openrouter/zai/glm-5.3-flash" }
+    ]
+  }
+}
+```
+
+- **Entry semantics** — first match wins; the window is half-open (`[from, to)`), `from > to` wraps midnight (e.g. `22:00`–`06:00`); omitted `days` means every day; an entry with no constraints always matches (the default fallback).
+- **Timezone** — entries use your local time, DST-aware; an optional IANA `tz` per entry covers providers whose blocks are defined elsewhere.
+- **Shorthand** — a bare array (`"schedules": [ … ]`) applies the same entries to all four slots.
+- **Precedence** — env vars still win (`env > schedule > persisted`), so `PI_VISION_PROXY_MODEL` remains a hard pin for CI/headless runs.
+
+Interaction details:
+
+- **Manual picks override temporarily** — `/multimodal-proxy model`, `pick`, `video-model`, `fallback-model`, or `virtual-base` issued while that slot's schedule is active shadows the schedule until its active entry changes or its window ends, whichever comes first (then the schedule resumes on its own — a Monday pick never leaks into Tuesday's window). Clearing a slot clears its override.
+- **Boundary crossings are announced** — a one-line notice (`schedule: vision model → … (until 16:00)`) fires when a slot flips between turns, and the status line shows `⏱ until 16:00` for the active vision slot.
+- **View and control** — `/multimodal-proxy schedule` lists entries per slot (marking the active one, warning about overlaps and about invalid entries dropped at load), `… schedule off|on` toggles matching without deleting entries, `… schedule clear` removes them.
+- **Scheduled models are explicit** — the implicit-default substitution never rewrites a scheduled model; a missing key fails loudly instead of silently paying per-token elsewhere.
+
 ## Configuration
 
 Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environment variables override file settings; in-session commands override both.
@@ -92,6 +126,8 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
 /multimodal-proxy                                      → opens interactive config menu
 /multimodal-proxy pick                                 → pick vision model (provider → model)
 /multimodal-proxy model <provider/model-id>            → change image vision model
+/multimodal-proxy schedule [on|off|clear]             → view scheduled model slots (active entry, until, overlaps);
+                                                         off/on toggles matching; clear removes entries (see below)
 /multimodal-proxy video-model <provider/model-id>      → change video/audio analysis model (default: xai/grok-4.3)
 /multimodal-proxy fallback | always | off              → set mode
 /multimodal-proxy context on | off                     → include / exclude recent chat in proxy prompt
@@ -148,6 +184,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_ALLOWED_FOLDERS` | list of absolute folder paths, separated by the platform path delimiter (`:` on Unix, `;` on Windows); overrides the persisted `/multimodal-proxy folders` list | not set |
 | `PI_VISION_PROXY_ALLOW_DRIVES` | `0`/`false`/`off` to disable local Windows drive paths; otherwise local drive paths like `D:\Downloads\video.mp4` are allowed | enabled by default |
 | `PI_VISION_PROXY_VIDEO_MODEL` | `provider/model-id` | `xai/grok-4.3` |
+| `PI_VISION_PROXY_SCHEDULE` | `on`, `off` — disables scheduled-slot matching without deleting entries; env model pins (e.g. `PI_VISION_PROXY_MODEL`) still outrank schedules | `on` |
 | `PI_VISION_PROXY_MAX_VIDEO_BYTES` | positive integer | `209715200` (200 MB) |
 | `PI_VISION_PROXY_ALLOWED_PROVIDERS` | comma-separated provider ids pre-consented for data egress (e.g. `anthropic,openai`); set empty to disable a persisted list for this shell/project | not set |
 | `PI_VISION_PROXY_RETRY_MAX` | 0–5 retries on transient vision errors (429/5xx/network) | `2` |
