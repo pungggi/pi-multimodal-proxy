@@ -20,6 +20,8 @@ export type ToolSetting = "on" | "off";
 
 export type StatusLineSetting = "on" | "off";
 
+export type ScheduleToggle = "on" | "off";
+
 export type GroundingFormat =
 	| "qwen_pixels"
 	| "molmo_points"
@@ -103,6 +105,67 @@ export interface VisionConfig {
 	virtualModel: ToolSetting;
 	virtualBaseProvider?: string;
 	virtualBaseModelId?: string;
+	// 1.25.0 — scheduled model slots (issue #42): time-based resolution of the
+	// four model slots, evaluated at request time (see resolveConfig's `now`).
+	// Entries live in the persistent config file only (like allowedProviders,
+	// they are stripped from session-entry configs); "off" disables matching
+	// without deleting the entries.
+	schedule: ScheduleToggle;
+	schedules?: ModelSchedules;
+}
+
+// ── Scheduled model slots (1.25.0, issue #42) ─────────────────────────────
+
+/** The four configurable model slots a schedule can re-resolve by time. */
+export type ScheduleSlotKey = "model" | "videoModel" | "fallbackModel" | "virtualBase";
+
+/** Ordered slot keys (also the canonical expansion of the bare-array shorthand). */
+export const SCHEDULE_SLOTS: readonly ScheduleSlotKey[] = ["model", "videoModel", "fallbackModel", "virtualBase"];
+
+/**
+ * One schedule rule. `days`/`from`/`to` omitted means unconstrained on that
+ * axis; the time window is half-open [from, to) and wraps midnight when
+ * from > to (e.g. 22:00–06:00). `tz` is an IANA zone (default: local,
+ * DST-aware through Intl). The target model may be given as `model:
+ * "provider/id"` (issue example form) or as explicit provider+modelId.
+ */
+export interface ScheduleEntry {
+	days?: string[];
+	from?: string;
+	to?: string;
+	tz?: string;
+	provider: string;
+	modelId: string;
+}
+
+/** Per-slot ordered entry lists; first matching entry wins. */
+export type ModelSchedules = Partial<Record<ScheduleSlotKey, ScheduleEntry[]>>;
+
+/** A session-scoped manual pick shadowing one slot's active schedule entry. */
+export interface ScheduleOverride {
+	provider: string;
+	modelId: string;
+	/** Index of the entry this override shadows; mismatch = expired. */
+	entryIndex: number;
+}
+
+export type ScheduleOverrides = Partial<Record<ScheduleSlotKey, ScheduleOverride>>;
+
+export interface SlotScheduleInfo {
+	active: boolean;
+	/** "HH:MM" (+ zone when foreign) of the active window's end, when known. */
+	until?: string;
+	/** True when a session-scoped manual override shadows the active entry. */
+	overridden?: boolean;
+	/** The active entry's target model, "provider/id". */
+	model?: string;
+}
+
+export type ScheduleInfoMap = Partial<Record<ScheduleSlotKey, SlotScheduleInfo>>;
+
+export interface ScheduleMatch {
+	index: number;
+	entry: ScheduleEntry;
 }
 
 export interface ImageMeta {
@@ -751,6 +814,9 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	// 1.19.0 — virtual model registered on hosts with pi.registerVirtualModel()
 	// (pi ≥ 0.99); feature-detected and skipped on older hosts.
 	virtualModel: "on",
+	// 1.25.0 — scheduled slots: matching enabled by default; entries (when
+	// present) live only in the persistent config file.
+	schedule: "on",
 };
 
 // ── Persistent file storage ────────────────────────────────────────────────
@@ -786,6 +852,8 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"virtualModel",
 	"virtualBaseProvider",
 	"virtualBaseModelId",
+	"schedule",
+	"schedules",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -1007,11 +1075,14 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 			overrides.virtualBaseModelId = virtualBaseEnv.modelId;
 		}
 	}
+	// 1.25.0 schedule toggle — disables slot matching without deleting entries.
+	const scheduleEnv = env.PI_VISION_PROXY_SCHEDULE;
+	if (scheduleEnv === "on" || scheduleEnv === "off") overrides.schedule = scheduleEnv;
 	return overrides;
 }
 
 /** Which env vars actually override a setting — used to lock the matching commands. */
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean; virtual: boolean; virtualBase: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowedProviders: boolean; allowHome: boolean; allowedFolders: boolean; statusLine: boolean; pathDetection: boolean; ytdlpCookies: boolean; ytdlpExtractorArgs: boolean; retryMax: boolean; maxUpload: boolean; fallbackModel: boolean; virtual: boolean; virtualBase: boolean; schedule: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -1043,6 +1114,8 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		// 1.19.0 — only recognized values count as overrides.
 		virtual: env.PI_VISION_PROXY_VIRTUAL === "on" || env.PI_VISION_PROXY_VIRTUAL === "off",
 		virtualBase: parseFallbackModelEnv(env.PI_VISION_PROXY_VIRTUAL_BASE) !== undefined,
+		// 1.25.0 — same rule for the schedule toggle.
+		schedule: env.PI_VISION_PROXY_SCHEDULE === "on" || env.PI_VISION_PROXY_SCHEDULE === "off",
 	};
 }
 
@@ -1363,6 +1436,13 @@ export function sanitize(config: VisionConfig): VisionConfig {
 		delete safe.virtualBaseProvider;
 		delete safe.virtualBaseModelId;
 	}
+	// 1.25.0 schedule fields — validate the toggle, then the entry lists. Like
+	// groundingModels, invalid entries are dropped silently; a slot left with
+	// zero valid entries is removed entirely. See sanitizeSchedules.
+	if (safe.schedule !== "on" && safe.schedule !== "off") safe.schedule = DEFAULT_CONFIG.schedule;
+	const schedules = sanitizeSchedules((safe as { schedules?: unknown }).schedules);
+	if (schedules === undefined) delete safe.schedules;
+	else safe.schedules = schedules;
 	return safe;
 }
 
@@ -1374,13 +1454,344 @@ export function persistedBase(entries: readonly SessionEntry[]): VisionConfig {
  * Resolve the effective config: defaults ← persisted file ← session-entry
  * config ← environment overrides, then sanitize (invalid values fall back to
  * defaults; half-set model pairs are dropped).
+ *
+ * 1.25.0: scheduled model slots (issue #42) sit between the persisted layers
+ * and env — schedules rewrite the four slot fields after the file/session
+ * merge but before env overrides apply, so precedence is
+ * env > schedule > persisted. `now` is injectable for tests; every request
+ * re-resolves, so a session crossing a schedule boundary switches models on
+ * the next request without a restart.
  */
 export function resolveConfig(
 	entries: readonly SessionEntry[],
 	env: NodeJS.ProcessEnv = process.env,
 	fileConfig: Partial<VisionConfig> = {},
+	now: Date = new Date(),
 ): VisionConfig {
-	return sanitize({ ...DEFAULT_CONFIG, ...fileConfig, ...readPersistedConfig(entries), ...readEnvOverrides(env) });
+	const envOverrides = readEnvOverrides(env);
+	const base = sanitize({ ...DEFAULT_CONFIG, ...fileConfig, ...readPersistedConfig(entries) });
+	// The env schedule toggle gates matching itself: PI_VISION_PROXY_SCHEDULE=off
+	// must prevent slot rewrites, not just flip the field afterwards.
+	const gated = envOverrides.schedule !== undefined ? { ...base, schedule: envOverrides.schedule } : base;
+	return sanitize({ ...applySchedules(gated, now), ...envOverrides });
+}
+
+// ── Scheduled model slots: matching (1.25.0, issue #42) ───────────────────
+
+/** Day tokens, indexed like Date.getDay() (0 = Sunday). */
+const SCHEDULE_DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+
+const DAY_TOKEN_TO_INDEX: Readonly<Record<string, number>> = {
+	sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+const ALL_DAYS: readonly string[] = SCHEDULE_DAYS;
+
+const HHMM_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+/** Parse "HH:MM" into minutes since midnight; null when malformed. */
+export function parseHHMM(s: string): number | null {
+	const m = HHMM_PATTERN.exec(s.trim());
+	if (!m) return null;
+	return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/** True when tz is a resolvable IANA zone name. */
+export function isValidTimeZone(tz: string): boolean {
+	try {
+		new Intl.DateTimeFormat("en-US", { timeZone: tz });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Formatter construction is the only expensive step (tens of µs); cache one
+// per zone so per-request matching across four slots × ≤32 entries stays free.
+const _zoneFormatters = new Map<string, Intl.DateTimeFormat>();
+function zoneFormatter(tz?: string): Intl.DateTimeFormat {
+	const key = tz ?? "";
+	let f = _zoneFormatters.get(key);
+	if (!f) {
+		const opts: Intl.DateTimeFormatOptions = {
+			weekday: "short",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23", // avoid the legacy hour12:false "24" pitfall
+		};
+		if (tz) opts.timeZone = tz;
+		f = new Intl.DateTimeFormat("en-US", opts);
+		_zoneFormatters.set(key, f);
+	}
+	return f;
+}
+
+const WEEKDAY_TOKENS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/**
+ * Wall clock (weekday 0–6 like Date.getDay, minutes since midnight) as seen
+ * in `tz` (default: local). DST is handled by the ICU zone tables, so a
+ * window like 08:00–16:00 in America/New_York stays correct across transitions.
+ */
+export function wallClockInZone(now: Date, tz?: string): { weekday: number; minutes: number } {
+	let weekday = -1;
+	let minutes = -1;
+	for (const part of zoneFormatter(tz).formatToParts(now)) {
+		if (part.type === "weekday") weekday = WEEKDAY_TOKENS.indexOf(part.value);
+		else if (part.type === "hour") minutes = Number(part.value) % 24 * 60;
+		else if (part.type === "minute") minutes += Number(part.value);
+	}
+	if (weekday < 0 || minutes < 0) {
+		// Defensive fallback for exotic formatters: local time via Date.
+		return { weekday: now.getDay(), minutes: now.getHours() * 60 + now.getMinutes() };
+	}
+	return { weekday, minutes };
+}
+
+/** Half-open [from, to) window on the 24h circle; from > to wraps midnight. */
+function entryWindow(entry: ScheduleEntry): { from: number; to: number } {
+	const from = entry.from !== undefined ? parseHHMM(entry.from) : 0;
+	const to = entry.to !== undefined ? parseHHMM(entry.to) : 1440;
+	return { from: from ?? 0, to: to ?? 1440 };
+}
+
+function entryDaysOk(entry: ScheduleEntry, weekday: number): boolean {
+	if (!entry.days || entry.days.length === 0) return true;
+	return entry.days.some((d) => DAY_TOKEN_TO_INDEX[d] === weekday);
+}
+
+/** True when `now` (in the entry's zone) falls inside the entry's window. */
+export function scheduleMatches(entry: ScheduleEntry, now: Date): boolean {
+	const { weekday, minutes } = wallClockInZone(now, entry.tz);
+	const { from, to } = entryWindow(entry);
+	const wrapping = entry.from !== undefined && entry.to !== undefined && from > to;
+	if (wrapping) {
+		// Spans midnight: late on the start day, or early on the day after a
+		// start day (e.g. mon 22:00–06:00 is also active tue 00:00–06:00).
+		if (minutes >= from) return entryDaysOk(entry, weekday);
+		if (minutes < to) return entryDaysOk(entry, (weekday + 6) % 7);
+		return false;
+	}
+	return minutes >= from && minutes < to && entryDaysOk(entry, weekday);
+}
+
+/** First matching entry wins; an entry with no constraints always matches. */
+export function matchSchedule(entries: readonly ScheduleEntry[], now: Date): ScheduleMatch | null {
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i]!;
+		if (scheduleMatches(entry, now)) return { index: i, entry };
+	}
+	return null;
+}
+
+function setScheduleSlot(out: VisionConfig, slot: ScheduleSlotKey, provider: string, modelId: string): void {
+	switch (slot) {
+		case "model":
+			out.provider = provider;
+			out.modelId = modelId;
+			// A scheduled model is a deliberate user choice: never let the
+			// implicit-default machinery rewrite it (fail loudly instead).
+			out.modelExplicit = true;
+			break;
+		case "videoModel":
+			out.videoProvider = provider;
+			out.videoModelId = modelId;
+			break;
+		case "fallbackModel":
+			out.fallbackProvider = provider;
+			out.fallbackModelId = modelId;
+			break;
+		case "virtualBase":
+			out.virtualBaseProvider = provider;
+			out.virtualBaseModelId = modelId;
+			break;
+	}
+}
+
+/**
+ * Rewrite the four slot fields from their schedules at `now`. Slots without
+ * a matching entry keep their persisted value; `schedule: "off"` disables
+ * matching entirely. Env locks are honored structurally by resolveConfig's
+ * merge order (env applies after this).
+ */
+export function applySchedules(config: VisionConfig, now: Date): VisionConfig {
+	if (config.schedule === "off" || !config.schedules) return config;
+	let out = config;
+	for (const slot of SCHEDULE_SLOTS) {
+		const entries = config.schedules[slot];
+		if (!entries || entries.length === 0) continue;
+		const hit = matchSchedule(entries, now);
+		if (!hit) continue;
+		if (out === config) out = { ...config };
+		setScheduleSlot(out, slot, hit.entry.provider, hit.entry.modelId);
+	}
+	return out;
+}
+
+/**
+ * Apply session-scoped manual picks over scheduled values. An override only
+ * shadows its slot while the SAME entry is still the active match; once the
+ * active entry changes (or stops matching) the override is dead — callers
+ * prune it (see trackScheduleFlips in vision-proxy).
+ */
+export function applyScheduleOverrides(config: VisionConfig, overrides: ScheduleOverrides, now: Date): VisionConfig {
+	if (config.schedule === "off" || !config.schedules) return config;
+	let out = config;
+	for (const slot of SCHEDULE_SLOTS) {
+		const override = overrides[slot];
+		const entries = config.schedules[slot];
+		if (!override || !entries || entries.length === 0) continue;
+		const hit = matchSchedule(entries, now);
+		if (!hit || hit.index !== override.entryIndex) continue;
+		if (out === config) out = { ...config };
+		setScheduleSlot(out, slot, override.provider, override.modelId);
+	}
+	return out;
+}
+
+/** Cached local IANA zone, for hiding redundant tz suffixes in display. */
+let _localTimeZone: string | undefined;
+function localTimeZone(): string {
+	if (_localTimeZone === undefined) {
+		try {
+			_localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+		} catch {
+			_localTimeZone = "";
+		}
+	}
+	return _localTimeZone;
+}
+
+function tzSuffix(entry: ScheduleEntry): string {
+	if (!entry.tz || entry.tz === localTimeZone()) return "";
+	return ` ${entry.tz}`;
+}
+
+/**
+ * Per-slot schedule state for status lines and the /schedule view: whether a
+ * slot is schedule-resolved right now, when its window ends, and whether a
+ * manual override shadows it.
+ */
+export function describeScheduleState(
+	config: VisionConfig,
+	now: Date = new Date(),
+	overrides?: ScheduleOverrides,
+): ScheduleInfoMap {
+	const out: ScheduleInfoMap = {};
+	if (config.schedule !== "on" || !config.schedules) return out;
+	for (const slot of SCHEDULE_SLOTS) {
+		const entries = config.schedules[slot];
+		if (!entries || entries.length === 0) continue;
+		const hit = matchSchedule(entries, now);
+		if (!hit) {
+			out[slot] = { active: false };
+			continue;
+		}
+		out[slot] = {
+			active: true,
+			until: hit.entry.to ? `${hit.entry.to}${tzSuffix(hit.entry)}` : undefined,
+			overridden: overrides?.[slot]?.entryIndex === hit.index,
+			model: `${hit.entry.provider}/${hit.entry.modelId}`,
+		};
+	}
+	return out;
+}
+
+/**
+ * Timestamp of the next occurrence of `hhmm` in `tz` after `now`. Uses the
+ * offset-guess method: exact except within a DST transition (display-only
+ * tolerance of ±1h twice a year).
+ */
+export function nextOccurrence(hhmm: string, tz: string | undefined, now: Date): Date {
+	const target = parseHHMM(hhmm) ?? 0;
+	const cur = wallClockInZone(now, tz);
+	let delta = target - cur.minutes;
+	if (delta <= 0) delta += 1440;
+	return new Date(now.getTime() + delta * 60_000);
+}
+
+/** Next end-of-window boundary for an entry with a `to`; null when open-ended. */
+export function nextBoundary(entry: ScheduleEntry, now: Date): Date | null {
+	if (!entry.to) return null;
+	return nextOccurrence(entry.to, entry.tz, now);
+}
+
+// ── Scheduled model slots: sanitization ────────────────────────────────────
+
+const MAX_SCHEDULE_ENTRIES_PER_SLOT = 32;
+
+/** Validate one raw entry; null when any present field is malformed. */
+function sanitizeScheduleEntry(raw: unknown): ScheduleEntry | null {
+	if (!raw || typeof raw !== "object") return null;
+	const e = raw as Record<string, unknown>;
+	// Target model: "model": "provider/id" string, or provider+modelId pair.
+	let provider: string | undefined;
+	let modelId: string | undefined;
+	if (typeof e.provider === "string" && typeof e.modelId === "string") {
+		provider = e.provider;
+		modelId = e.modelId;
+	} else if (typeof e.model === "string") {
+		const parsed = parseModelString(e.model);
+		if (parsed) {
+			provider = parsed.provider;
+			modelId = parsed.modelId;
+		}
+	}
+	if (!provider || !modelId) return null;
+	provider = canonicalProvider(provider);
+	if (!PROVIDER_PATTERN.test(provider) || !MODEL_ID_PATTERN.test(modelId)) return null;
+	const entry: ScheduleEntry = { provider, modelId };
+	if (e.days !== undefined) {
+		if (!Array.isArray(e.days)) return null;
+		const days: string[] = [];
+		for (const d of e.days) {
+			if (typeof d !== "string") return null;
+			const token = d.trim().toLowerCase();
+			if (!(SCHEDULE_DAYS as readonly string[]).includes(token)) return null;
+			days.push(token);
+		}
+		if (days.length > 0) entry.days = [...new Set(days)];
+	}
+	for (const key of ["from", "to"] as const) {
+		const v = e[key];
+		if (v === undefined) continue;
+		if (typeof v !== "string" || parseHHMM(v) === null) return null;
+		entry[key] = v.trim();
+	}
+	if (e.tz !== undefined) {
+		if (typeof e.tz !== "string" || !isValidTimeZone(e.tz)) return null;
+		const tz = e.tz.trim();
+		if (tz) entry.tz = tz;
+	}
+	return entry;
+}
+
+/**
+ * Validate raw `schedules` config (object form, or the bare-array shorthand
+ * that applies the same list to all four slots). Invalid entries are dropped;
+ * slots left empty are removed. Returns undefined when nothing valid remains.
+ */
+export function sanitizeSchedules(value: unknown): ModelSchedules | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const sources: Array<[ScheduleSlotKey, unknown]> = Array.isArray(value)
+		? SCHEDULE_SLOTS.map((slot) => [slot, value] as [ScheduleSlotKey, unknown])
+		: SCHEDULE_SLOTS.map((slot) => [slot, (value as Record<string, unknown>)[slot]]).filter((pair) => pair[1] !== undefined);
+	const out: ModelSchedules = {};
+	let any = false;
+	for (const [slot, raw] of sources) {
+		if (!Array.isArray(raw)) continue;
+		const entries: ScheduleEntry[] = [];
+		for (const item of raw) {
+			if (entries.length >= MAX_SCHEDULE_ENTRIES_PER_SLOT) break;
+			const entry = sanitizeScheduleEntry(item);
+			if (entry) entries.push(entry);
+		}
+		if (entries.length > 0) {
+			out[slot] = entries;
+			any = true;
+		}
+	}
+	return any ? out : undefined;
 }
 
 /**
@@ -1950,6 +2361,26 @@ export function extractCandidateMediaUrls(text: string): string[] {
 		if (id && !seen.has(id)) {
 			seen.add(id);
 			out.push(m[0]);
+		}
+	}
+	return out;
+}
+
+/**
+ * Extract image blocks from a custom message's content (Pi ≥ 1.2.0
+ * BeforeAgentStartCustomEvent.message.content: string | (TextContent | ImageContent)[]).
+ * Runs started by pi.sendMessage(..., { triggerTurn: true }) carry no prompt/images
+ * on the event — their images live on the starting message. Tolerates anything:
+ * non-array content and malformed blocks yield nothing.
+ */
+export function extractCustomMessageImages(content: unknown): PiAiImage[] {
+	if (!Array.isArray(content)) return [];
+	const out: PiAiImage[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const b = block as { type?: unknown; data?: unknown; mimeType?: unknown };
+		if (b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string") {
+			out.push(block as PiAiImage);
 		}
 	}
 	return out;

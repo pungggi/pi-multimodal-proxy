@@ -286,6 +286,7 @@ import {
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
 	extractCandidateMediaUrls,
+	extractCustomMessageImages,
 	canonicalYouTubeUrl,
 	youTubeVideoId,
 	applyDefaultModelFallback,
@@ -374,6 +375,16 @@ import {
 	isTransientVisionError,
 	retryDelayMs,
 	sleepWithAbort,
+	applyScheduleOverrides,
+	describeScheduleState,
+	getPersistentConfigPath,
+	matchSchedule,
+	scheduleMatches,
+	SCHEDULE_SLOTS,
+	type ScheduleEntry,
+	type ScheduleInfoMap,
+	type ScheduleOverrides,
+	type ScheduleSlotKey,
 } from "./internal.js";
 
 // ── Tool schema (TypeBox) ──────────────────────────────────────────────────
@@ -573,6 +584,10 @@ interface SessionState {
 	 * per-image user-message path once the system-layer path takes over.
 	 */
 	cwsSupported?: boolean;
+	/** Session-scoped manual picks shadowing active schedule entries (1.25.0). */
+	scheduleOverrides?: ScheduleOverrides;
+	/** Per-slot index of the last matched schedule entry, for flip detection. */
+	lastScheduleMatch?: Partial<Record<ScheduleSlotKey, number>>;
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -892,6 +907,189 @@ function notifyDefaultSubstitution(config: VisionConfig, resolved: VisionConfig,
 	ctx.ui.notify(`[multimodal-proxy] Vision default resolved to ${after} (${before} not usable here). ${hint}`, "info");
 }
 
+// ── Scheduled model slots (1.25.0, issue #42) ──────────────────────────────
+
+/** Human labels for the four slots, matching the command names. */
+const SLOT_LABELS: Readonly<Record<ScheduleSlotKey, string>> = {
+	model: "vision model",
+	videoModel: "video model",
+	fallbackModel: "fallback model",
+	virtualBase: "virtual base",
+};
+
+/**
+ * resolveConfig + session-scoped schedule overrides. Sync: the virtual
+ * model's route() must not await. Schedules themselves are applied inside
+ * resolveConfig (env > schedule > persisted precedence), so request-time
+ * re-resolution is automatic at every existing call site.
+ */
+function scheduledConfigSync(ctx: ExtensionContext, now: Date = new Date()): VisionConfig {
+	const raw = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig, now);
+	const state = getSessionState(ctx);
+	return state.scheduleOverrides ? applyScheduleOverrides(raw, state.scheduleOverrides, now) : raw;
+}
+
+/** Full runtime resolution: schedules + overrides + implicit-default fallback. */
+async function resolveRuntimeConfig(ctx: ExtensionContext, now: Date = new Date()): Promise<VisionConfig> {
+	return withModelFallback(scheduledConfigSync(ctx, now), ctx);
+}
+
+/** Per-slot matched-entry snapshot (undefined = no entry active). */
+function currentScheduleMatches(config: VisionConfig, now: Date): Partial<Record<ScheduleSlotKey, number>> {
+	const out: Partial<Record<ScheduleSlotKey, number>> = {};
+	if (config.schedule === "on" && config.schedules) {
+		for (const slot of SCHEDULE_SLOTS) {
+			const entries = config.schedules[slot];
+			if (!entries || entries.length === 0) continue;
+			const hit = matchSchedule(entries, now);
+			out[slot] = hit ? hit.index : undefined;
+		}
+	}
+	return out;
+}
+
+/**
+ * Detect schedule boundary crossings between turns: updates the per-slot
+ * matched-entry snapshot, expires manual overrides whose entry is no longer
+ * active, and (unless quiet) notifies once per flip + refreshes the status
+ * line. Called from before_agent_start (quiet seeding happens at session_start).
+ */
+function trackScheduleFlips(ctx: ExtensionContext, config: VisionConfig, quiet = false): void {
+	const now = new Date();
+	const current = currentScheduleMatches(config, now);
+	const state = getSessionState(ctx);
+	const prev = state.lastScheduleMatch;
+	state.lastScheduleMatch = current;
+	// Expire manual overrides whose scheduled entry is no longer the active one.
+	if (state.scheduleOverrides) {
+		for (const slot of Object.keys(state.scheduleOverrides) as ScheduleSlotKey[]) {
+			if (current[slot] !== state.scheduleOverrides[slot]?.entryIndex) {
+				delete state.scheduleOverrides[slot]!;
+			}
+		}
+		if (Object.keys(state.scheduleOverrides).length === 0) state.scheduleOverrides = undefined;
+	}
+	if (quiet || !prev) return;
+	const flips: string[] = [];
+	for (const slot of SCHEDULE_SLOTS) {
+		if (!(slot in current) && !(slot in prev)) continue;
+		if (current[slot] === prev[slot]) continue;
+		const hit = current[slot] !== undefined ? matchSchedule(config.schedules?.[slot] ?? [], now) : null;
+		if (hit) {
+			const until = hit.entry.to ? ` (until ${hit.entry.to}${hit.entry.tz && hit.entry.tz !== Intl.DateTimeFormat().resolvedOptions().timeZone ? ` ${hit.entry.tz}` : ""})` : "";
+			flips.push(`${SLOT_LABELS[slot]} → ${hit.entry.provider}/${hit.entry.modelId}${until}`);
+		} else {
+			flips.push(`${SLOT_LABELS[slot]} → schedule default`);
+		}
+	}
+	if (flips.length > 0) {
+		ctx.ui.notify(`[multimodal-proxy] schedule: ${flips.join(" | ")}`, "info");
+		void withModelFallback(config, ctx)
+			.then((resolved) => ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry)))
+			.catch(() => {
+				// Status refresh must never surface as an unhandled rejection.
+			});
+	}
+}
+
+/** "mon–fri" / "mon,wed,fri" / "daily" for a day list. */
+function dayRangeLabel(days?: string[]): string {
+	if (!days || days.length === 0 || days.length === 7) return "daily";
+	const order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+	const tokens = order.filter((d) => days.includes(d));
+	if (tokens.length === 1) return tokens[0]!;
+	const contiguous = tokens.every((d, i) => i === 0 || order.indexOf(d) === order.indexOf(tokens[i - 1]!) + 1);
+	return contiguous ? `${tokens[0]}–${tokens[tokens.length - 1]}` : tokens.join(",");
+}
+
+/** "08:00–16:00" style range; omitted bounds render as open ends. */
+function timeRangeLabel(entry: ScheduleEntry): string {
+	if (!entry.from && !entry.to) return "";
+	return `${entry.from ?? "00:00"}–${entry.to ?? "24:00"}`;
+}
+
+/**
+ * Same-zone day/window overlap for the /schedule view's first-match warning.
+ * Two circular arcs intersect iff an endpoint of one lies inside the other.
+ */
+function entriesOverlap(a: ScheduleEntry, b: ScheduleEntry): boolean {
+	if ((a.tz ?? "") !== (b.tz ?? "")) return false;
+	const da = a.days && a.days.length > 0 ? a.days : undefined;
+	const db = b.days && b.days.length > 0 ? b.days : undefined;
+	if (da && db && !da.some((d) => db.includes(d))) return false;
+	const window = (e: ScheduleEntry): { from: number; to: number } => ({
+		from: e.from ? Number(e.from.slice(0, 2)) * 60 + Number(e.from.slice(3)) : 0,
+		to: e.to ? Number(e.to.slice(0, 2)) * 60 + Number(e.to.slice(3)) : 1440,
+	});
+	const inArc = (x: number, w: { from: number; to: number }): boolean =>
+		w.from <= w.to ? x >= w.from && x < w.to : x >= w.from || x < w.to;
+	const wa = window(a);
+	const wb = window(b);
+	return inArc(wa.from, wb) || inArc(wb.from, wa);
+}
+
+/** Render the /multimodal-proxy schedule view (per-slot table + diagnostics). */
+function renderScheduleView(effective: VisionConfig, ctx: ExtensionContext): string {
+	if (!effective.schedules || Object.keys(effective.schedules).length === 0) {
+		return (
+			`Schedule: no entries configured.\n` +
+			`Add them to ${getPersistentConfigPath()} — see README "Scheduled model slots".\n` +
+			`Usage: /multimodal-proxy schedule [on|off|clear]`
+		);
+	}
+	const now = new Date();
+	const overrides = getSessionState(ctx).scheduleOverrides;
+	const lines: string[] = [`Schedule: ${effective.schedule === "on" ? "ON" : "OFF (matching disabled; entries kept)"}`];
+	for (const slot of SCHEDULE_SLOTS) {
+		const entries = effective.schedules[slot];
+		if (!entries || entries.length === 0) continue;
+		lines.push(`${slot}:`);
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i]!;
+			const active = effective.schedule === "on" && scheduleMatches(entry, now);
+			const overridden = active && overrides?.[slot]?.entryIndex === i;
+			const when = [dayRangeLabel(entry.days), timeRangeLabel(entry), entry.tz ? `(${entry.tz})` : ""]
+				.filter(Boolean)
+				.join(" ");
+			const marks = [
+				active ? "◀ active" : "",
+				active && entry.to ? `until ${entry.to}` : "",
+				overridden ? "manual override" : "",
+			]
+				.filter(Boolean)
+				.join(" · ");
+			lines.push(`  ${i + 1}. ${when || "always"} → ${entry.provider}/${entry.modelId}${marks ? `  (${marks})` : ""}`);
+		}
+		for (let a = 0; a < entries.length; a++) {
+			for (let b = a + 1; b < entries.length; b++) {
+				if (entriesOverlap(entries[a]!, entries[b]!)) {
+					lines.push(`  ⚠ entries ${a + 1} and ${b + 1} overlap — first match wins`);
+				}
+			}
+		}
+	}
+	lines.push("Usage: /multimodal-proxy schedule [on|off|clear] — entries are edited in the JSON file above");
+	return lines.join("\n");
+}
+
+/**
+ * Count raw (pre-sanitize) schedule entries in the persistent file so the
+ * view can flag hand-editing mistakes that sanitize silently dropped.
+ */
+async function countRawScheduleEntries(): Promise<number> {
+	try {
+		const raw = JSON.parse(await readFile(getPersistentConfigPath(), "utf8")) as { schedules?: unknown };
+		const s = raw?.schedules;
+		if (Array.isArray(s)) return s.length;
+		if (s && typeof s === "object") {
+			return Object.values(s).reduce<number>((acc, v) => acc + (Array.isArray(v) ? v.length : 0), 0);
+		}
+	} catch {
+		// unreadable/missing file — the sanitized view still renders
+	}
+	return -1;
+}
+
 // ── Content sniffing (Pi ≥ 0.84.4) ───────────────────────────────────────
 
 /**
@@ -962,10 +1160,19 @@ function friendlyModelLabel(
 function steadyStatusText(
 	config: VisionConfig,
 	registry: ExtensionContext["modelRegistry"],
+	scheduleInfo: ScheduleInfoMap = describeScheduleState(config),
 ): string | undefined {
 	if (config.statusLine === "off") return undefined;
+	// Schedule marker on the vision slot only — the other slots stay readable;
+	// /multimodal-proxy schedule shows the full table.
+	const sched = scheduleInfo.model;
+	const marker = sched?.active
+		? sched.overridden
+			? " [⏱ manual]"
+			: ` [⏱${sched.until ? ` until ${sched.until}` : ""}]`
+		: "";
 	return (
-		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)} ` +
+		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)}${marker} ` +
 		`| video: ${config.videoProvider}/${config.videoModelId}` +
 		`${config.tool === "on" && config.mode !== "off" ? " [+tool]" : ""}` +
 		`${config.virtualModel === "on" ? " [+virtual]" : ""}`
@@ -2724,7 +2931,7 @@ export default function (pi: ExtensionAPI) {
 	 * null when nothing resolves.
 	 */
 	function resolveVisionTarget(ctx: ExtensionContext): { provider: string; modelId: string } | null {
-		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+		const config = scheduledConfigSync(ctx);
 		const explicit = Boolean(envFlags().model) || config.modelExplicit === true;
 		const chain = explicit
 			? [{ provider: config.provider, modelId: config.modelId }]
@@ -2839,7 +3046,7 @@ export default function (pi: ExtensionAPI) {
 
 					// Text turn: pinned base, else the physical model that handled
 					// the session before, else the vision model.
-					const cfg = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+					const cfg = scheduledConfigSync(ctx);
 					if (cfg.virtualBaseProvider && cfg.virtualBaseModelId) {
 						const base = ctx.modelRegistry.find(cfg.virtualBaseProvider, cfg.virtualBaseModelId);
 						if (base) return { model: base, thinkingLevel: request.thinkingLevel };
@@ -2922,8 +3129,7 @@ export default function (pi: ExtensionAPI) {
 				outputSchema: AnalyzeImageOutput,
 				parameters: AnalyzeImageParams,
 				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
-					const entries = extCtx.sessionManager.getEntries();
-					const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
+					const config = await resolveRuntimeConfig(extCtx);
 
 					// Runtime check - tool may have been disabled mid-session
 					if (config.tool !== "on" || config.mode === "off") {
@@ -2992,8 +3198,7 @@ export default function (pi: ExtensionAPI) {
 				outputSchema: GenerateImageOutput,
 				parameters: GenerateImageParams,
 				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
-					const entries = extCtx.sessionManager.getEntries();
-					const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
+					const config = await resolveRuntimeConfig(extCtx);
 
 					// Runtime check - tool may have been disabled mid-session
 					if (config.tool !== "on" || config.mode === "off") {
@@ -3055,11 +3260,16 @@ export default function (pi: ExtensionAPI) {
 		state.dynamicVisionProbe = undefined;
 		state.imageGenModels = undefined;
 		state.notifiedDefaultSub = undefined;
+		state.scheduleOverrides = undefined;
+		state.lastScheduleMatch = undefined;
 
 		_fileConfig = await readPersistentFile();
 		const rawConfig = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
 		const config = await withModelFallback(rawConfig, ctx);
 		notifyDefaultSubstitution(rawConfig, config, ctx);
+		// Seed the per-slot schedule snapshot without notifying — the first
+		// before_agent_start then only reports genuine boundary crossings.
+		trackScheduleFlips(ctx, rawConfig, true);
 		ctx.ui.setStatus("multimodal-proxy", steadyStatusText(config, ctx.modelRegistry));
 
 		// Register tool if enabled
@@ -3085,21 +3295,38 @@ export default function (pi: ExtensionAPI) {
 			const imageData = sessionState.imageData;
 
 			// Resolve config up front — file loading below honors the configurable
-			// folder allowlist (allowedFolders / allowHome).
+			// folder allowlist (allowedFolders / allowHome). Scheduled slots
+			// resolve at request time; a boundary crossed since the last turn
+			// flips the slot here (with a one-time notice).
 			const entries = ctx.sessionManager.getEntries();
-			const rawConfig = resolveConfig(entries, process.env, _fileConfig);
-			const config = await withModelFallback(rawConfig, ctx);
-			notifyDefaultSubstitution(rawConfig, config, ctx);
+			const scheduled = scheduledConfigSync(ctx);
+			trackScheduleFlips(ctx, scheduled);
+			const config = await withModelFallback(scheduled, ctx);
+			notifyDefaultSubstitution(scheduled, config, ctx);
 			syncVirtualModelRegistration(config);
 			const pathAccess = pathAccessFromConfig(config);
 
-			// Collect images: structured attachments + file paths detected in prompt
-			// text. The prompt-text scan is a convenience feature gated by the
+			// Pi ≥ 1.2.0 fires this handler for runs started by
+			// pi.sendMessage(..., { triggerTurn: true }) while idle: those events are
+			// messageType "custom" and carry NO prompt/images — the starting custom
+			// message (which may itself contain image blocks) is on event.message.
+			// Check for "custom" — not "user" — so pre-1.2.0 events, which have no
+			// messageType at all, keep the prompt path. With promptText "" every
+			// path/URL extraction below yields nothing, so the event.prompt writes
+			// (guarded by non-empty accepted lists) stay unreachable on custom runs.
+			const isCustomRun = (event as { messageType?: unknown }).messageType === "custom";
+			const promptText = isCustomRun ? "" : (event.prompt ?? "");
+
+			// Collect images: structured attachments (or, on custom runs, the
+			// starting message's image blocks) + file paths detected in prompt text.
+			// The prompt-text scan is a convenience feature gated by the
 			// path-detection setting (security audit issue #2, finding 1); structured
 			// attachments are always processed.
 			const pathDetectionOn = config.pathDetection === "on";
-			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
-			const filePaths = pathDetectionOn ? extractCandidateImagePaths(event.prompt) : [];
+			const images: (PiAiImage | LegacyImage)[] = isCustomRun
+				? extractCustomMessageImages((event as { message?: { content?: unknown } }).message?.content)
+				: [...(event.images ?? [])];
+			const filePaths = pathDetectionOn ? extractCandidateImagePaths(promptText) : [];
 			const acceptedPaths: string[] = [];
 			for (const fp of filePaths) {
 				if (fp.includes("..")) continue; // defense-in-depth: reject traversal
@@ -3120,8 +3347,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// ── Detect video/audio files ───────────────────────────────────────
-			const videoPaths = pathDetectionOn ? extractCandidateVideoPaths(event.prompt) : [];
-			const audioPaths = pathDetectionOn ? extractCandidateAudioPaths(event.prompt) : [];
+			const videoPaths = pathDetectionOn ? extractCandidateVideoPaths(promptText) : [];
+			const audioPaths = pathDetectionOn ? extractCandidateAudioPaths(promptText) : [];
 			const mediaPaths = [...videoPaths, ...audioPaths].filter(
 				(p, i, arr) => p && !p.includes("..") && arr.indexOf(p) === i,
 			);
@@ -3160,7 +3387,7 @@ export default function (pi: ExtensionAPI) {
 				downloadedTempDirs.length = 0;
 			};
 			if (pathDetectionOn) {
-				const mediaUrls = extractCandidateMediaUrls(event.prompt);
+				const mediaUrls = extractCandidateMediaUrls(promptText);
 				const acceptedMediaUrls: string[] = [];
 				for (const url of mediaUrls) {
 					const watch = canonicalYouTubeUrl(url);
@@ -3244,7 +3471,7 @@ export default function (pi: ExtensionAPI) {
 							() => analyzeVideo(
 								mf.file,
 								mf.filename,
-								event.prompt,
+								promptText,
 								conversationContext,
 								config,
 								ctx,
@@ -3381,7 +3608,7 @@ export default function (pi: ExtensionAPI) {
 
 			const results = await analyzeImages(
 				images as readonly (PiAiImage | LegacyImage)[],
-				event.prompt,
+				promptText,
 				conversationContext,
 				config,
 				ctx,
@@ -3430,7 +3657,7 @@ export default function (pi: ExtensionAPI) {
 							hints.push(...generateFilenameHints(filenames));
 						}
 
-						const jointPrompt = buildAdaptiveJointPrompt(jointMetas, event.prompt, hints.length > 0 ? hints : undefined);
+						const jointPrompt = buildAdaptiveJointPrompt(jointMetas, promptText, hints.length > 0 ? hints : undefined);
 						const jointImages = successful.map((r) => {
 							// Reconstruct PiAiImage from the stored data
 							const raw = images.find((img) => {
@@ -3549,6 +3776,17 @@ export default function (pi: ExtensionAPI) {
 	// headroom for the normal budgets.
 	pi.on("turn_end", async (_event: TurnEndEvent, ctx: ExtensionContext) => {
 		getSessionState(ctx).compaction = undefined;
+		// Refresh the steady status line so schedule markers ("⏱ until 16:00")
+		// track boundary crossings between turns. Fire-and-forget: key probing
+		// must never surface as an unhandled rejection in daemons.
+		const eff = scheduledConfigSync(ctx);
+		if (eff.statusLine === "on") {
+			void withModelFallback(eff, ctx)
+				.then((resolved) =>
+					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry, describeScheduleState(eff))),
+				)
+				.catch(() => {});
+		}
 	});
 
 	pi.on("tool_result", async (event: ToolResultEvent, ctx: ExtensionContext) => {
@@ -3561,7 +3799,7 @@ export default function (pi: ExtensionAPI) {
 		if (images.length === 0) return; // fast path: most tool results carry no image
 
 		const entries = ctx.sessionManager.getEntries();
-		const config = await withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
+		const config = await resolveRuntimeConfig(ctx);
 		// Model supports images, or proxy is off → pass the block through unchanged.
 		if (!shouldStripImages(config, ctx.model)) return;
 
@@ -3834,6 +4072,34 @@ export default function (pi: ExtensionAPI) {
 				(videoModel ? "" : " — NOT in catalog") +
 				(videoModel && !videoKeyOk ? ` — no API key (run: pi --login ${resolved.videoProvider})` : ""),
 		);
+		// 1.25.0 — scheduled slots: per-entry catalog/key/consent checks.
+		if (resolved.schedules && SCHEDULE_SLOTS.some((s) => resolved.schedules?.[s]?.length)) {
+			lines.push(`schedule: ${resolved.schedule === "on" ? "ON" : "OFF (matching disabled)"}`);
+			for (const slot of SCHEDULE_SLOTS) {
+				const slotEntries = resolved.schedules[slot];
+				if (!slotEntries?.length) continue;
+				for (const entry of slotEntries) {
+					const m = ctx.modelRegistry.find(entry.provider, entry.modelId);
+				let entryKeyOk = false;
+				try {
+						if (m) {
+							const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+							entryKeyOk = auth.ok && Boolean(auth.apiKey);
+						}
+					} catch {
+						entryKeyOk = false;
+					}
+					const when = [dayRangeLabel(entry.days), timeRangeLabel(entry), entry.tz ?? ""].filter(Boolean).join(" ");
+					lines.push(
+						`  ${slot} ${when || "always"}: ${entry.provider}/${entry.modelId}` +
+							(resolved.schedule === "on" && scheduleMatches(entry, new Date()) ? " [active]" : "") +
+							(m ? "" : " — NOT in catalog") +
+							(m && !entryKeyOk ? " — no API key" : "") +
+							(!hasConsent(entries, entry.provider, resolved.allowedProviders, resolved.deniedProviders) ? " — no data-egress consent" : ""),
+					);
+				}
+			}
+		}
 		const toolVersion = async (bin: string): Promise<string> => {
 			try {
 				const { stdout } = await execFileAsync(bin, ["--version"], { windowsHide: true, timeout: 10_000 });
@@ -3927,20 +4193,28 @@ export default function (pi: ExtensionAPI) {
 				// configs so they can never shadow the file, and carry the file's
 				// list through full-config rewrites.
 				delete validated.allowedProviders;
+				// schedules are file-managed the same way (issue #42): session-entry
+				// configs never carry them, and full-file rewrites carry the file's
+				// entries through so an in-session command can't clobber hand-edited
+				// entries. The schedule on/off toggle IS a normal persisted field.
+				delete validated.schedules;
 				pi.appendEntry(CUSTOM_TYPE_CONFIG, validated);
 				// Persist to file so settings survive new sessions
 				const fileNext: Partial<VisionConfig> = { ...validated };
 				if (_fileConfig.allowedProviders !== undefined) {
 					fileNext.allowedProviders = normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
 				}
+				if (_fileConfig.schedules !== undefined) {
+					fileNext.schedules = _fileConfig.schedules;
+				}
 				writePersistentFile(fileNext);
 				_fileConfig = fileNext;
-				const eff = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
+				const eff = scheduledConfigSync(ctx);
 				// Fire-and-forget: writePersisted stays synchronous for its ~30 call
 				// sites; the status refresh just needs the resolved model eventually.
 				void withModelFallback(eff, ctx)
 				.then((resolved) =>
-					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry)),
+					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry, describeScheduleState(eff, new Date(), getSessionState(ctx).scheduleOverrides))),
 				)
 				.catch(() => {
 					// Key probing must never surface as an unhandled rejection in daemons.
@@ -3963,6 +4237,87 @@ export default function (pi: ExtensionAPI) {
 			// set operations so add/remove/revoke can never miss an alias
 			// (x-ai vs xai) regardless of how _fileConfig was populated.
 			const fileAllowedProviders = () => normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
+
+			// ── Schedule overrides (1.25.0, issue #42) ───────────
+			// A manual slot write issued while that slot's schedule has an active
+			// entry shadows the schedule until the active entry changes (or the
+			// schedule is cleared / the session ends).
+			const noteSlotOverride = (slot: ScheduleSlotKey, provider: string, modelId: string): boolean => {
+				const now = new Date();
+				const cfg = scheduledConfigSync(ctx, now);
+				if (cfg.schedule !== "on" || !cfg.schedules?.[slot] || cfg.schedules[slot]!.length === 0) return false;
+				const hit = matchSchedule(cfg.schedules[slot]!, now);
+				if (!hit) return false;
+				const state = getSessionState(ctx);
+				state.scheduleOverrides ??= {};
+				state.scheduleOverrides[slot] = { provider, modelId, entryIndex: hit.index };
+				return true;
+			};
+			const clearSlotOverride = (slot: ScheduleSlotKey) => {
+				const state = getSessionState(ctx);
+				if (state.scheduleOverrides) {
+					delete state.scheduleOverrides[slot];
+					if (Object.keys(state.scheduleOverrides).length === 0) state.scheduleOverrides = undefined;
+				}
+			};
+			const OVERRIDE_NOTE = " — overrides the schedule until its next flip";
+			// Writer wrapper for vision-model picks: records a session-scoped
+			// override when the vision slot is currently schedule-resolved.
+			const writePicked = (next: VisionConfig): VisionConfig => {
+				const v = writePersisted(next);
+				if (noteSlotOverride("model", v.provider, v.modelId)) {
+					ctx.ui.notify("[multimodal-proxy] Manual pick overrides the scheduled vision model until the schedule's next flip.", "info");
+				}
+				return v;
+			};
+
+			// ── Scheduled model slots (1.25.0, issue #42) ─────────
+			if (sub === "schedule") {
+				if (!value) {
+					let text = renderScheduleView(effective, ctx);
+					const rawCount = await countRawScheduleEntries();
+					const validCount = SCHEDULE_SLOTS.reduce(
+						(acc, slot) => acc + (effective.schedules?.[slot]?.length ?? 0),
+						0,
+					);
+					if (rawCount >= 0 && rawCount > validCount) {
+						text += `\n⚠ ${rawCount - validCount} invalid entr${rawCount - validCount === 1 ? "y" : "ies"} dropped — check days (mon–sun), HH:MM times, IANA tz, and provider/model-id in the JSON file`;
+					}
+					ctx.ui.notify(text, "info");
+					return;
+				}
+				if (valueLower === "on" || valueLower === "off") {
+					if (env.schedule) {
+						ctx.ui.notify(
+							"[multimodal-proxy] PI_VISION_PROXY_SCHEDULE is set - env overrides commands. Unset to change.",
+						"warning",
+						);
+						return;
+					}
+					const next = writePersisted({ ...persisted, schedule: valueLower as "on" | "off" });
+					ctx.ui.notify(
+						next.schedule === "on"
+							? "Schedule: ON — scheduled slots resolve at request time"
+							: "Schedule: OFF — matching disabled (entries kept)",
+						next.schedule === "on" ? "info" : "warning",
+					);
+					return;
+				}
+				if (valueLower === "clear" || valueLower === "none") {
+					const fileNext: Partial<VisionConfig> = { ..._fileConfig };
+					delete fileNext.schedules;
+					writePersistentFile(fileNext);
+					_fileConfig = fileNext;
+					getSessionState(ctx).scheduleOverrides = undefined;
+					ctx.ui.notify("Schedule: all entries cleared (edit the JSON file to add new ones)", "info");
+					return;
+				}
+				ctx.ui.notify(
+					"Usage: /multimodal-proxy schedule [on|off|clear]\nEntries are edited in ~/.pi/agent/multimodal-proxy.json — see README 'Scheduled model slots'.",
+					"warning",
+				);
+				return;
+			}
 
 			// ── Set mode ────────────────────────────────────────
 			if (sub === "fallback" || sub === "always" || sub === "off") {
@@ -4028,6 +4383,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (valueLower === "off" || valueLower === "none" || valueLower === "clear") {
 					writePersisted({ ...persisted, virtualBaseProvider: undefined, virtualBaseModelId: undefined });
+					clearSlotOverride("virtualBase");
 					ctx.ui.notify("Virtual model base: auto (last physical model, else the vision model)", "info");
 					return;
 				}
@@ -4047,8 +4403,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				writePersisted({ ...persisted, virtualBaseProvider: parsed.provider, virtualBaseModelId: parsed.modelId });
+				const vbOv = noteSlotOverride("virtualBase", parsed.provider, parsed.modelId);
 				ctx.ui.notify(
-					`Virtual model base: ${parsed.provider}/${parsed.modelId} (text turns while 'Multimodal Auto' is selected)`,
+					`Virtual model base: ${parsed.provider}/${parsed.modelId} (text turns while 'Multimodal Auto' is selected)` +
+					(vbOv ? OVERRIDE_NOTE : ""),
 					"info",
 					);
 				return;
@@ -4056,7 +4414,7 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Pick from vision-capable registry ───────────────
 			if (sub === "pick") {
-				await pickVisionModel(ctx, persisted, writePersisted, !!env.model);
+				await pickVisionModel(ctx, persisted, writePicked, !!env.model);
 				return;
 			}
 
@@ -4078,7 +4436,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const next = writePersisted({ ...persisted, ...parsed, modelExplicit: true });
-				ctx.ui.notify(`Vision proxy model: ${modelLabel(next)}`, "info");
+				const mOv = noteSlotOverride("model", parsed.provider, parsed.modelId);
+				ctx.ui.notify(`Vision proxy model: ${modelLabel(next)}${mOv ? OVERRIDE_NOTE : ""}`, "info");
 				return;
 			}
 
@@ -4107,7 +4466,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const next = writePersisted({ ...persisted, videoProvider: parsed.provider, videoModelId: parsed.modelId });
-				ctx.ui.notify(`Vision proxy video model: ${next.videoProvider}/${next.videoModelId}`, "info");
+				const vidOv = noteSlotOverride("videoModel", parsed.provider, parsed.modelId);
+				ctx.ui.notify(`Vision proxy video model: ${next.videoProvider}/${next.videoModelId}${vidOv ? OVERRIDE_NOTE : ""}`, "info");
 				return;
 			}
 
@@ -4138,6 +4498,7 @@ export default function (pi: ExtensionAPI) {
 					delete next.fallbackProvider;
 					delete next.fallbackModelId;
 					writePersisted(next);
+					clearSlotOverride("fallbackModel");
 					ctx.ui.notify("Fallback vision model: none", "info");
 					return;
 				}
@@ -4151,6 +4512,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const fb = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 				writePersisted({ ...persisted, fallbackProvider: parsed.provider, fallbackModelId: parsed.modelId });
+				noteSlotOverride("fallbackModel", parsed.provider, parsed.modelId);
 				if (!fb) {
 					ctx.ui.notify(
 						`Fallback vision model: ${parsed.provider}/${parsed.modelId} (warning: not in this Pi's model registry — it will be skipped until available)`,
@@ -5067,7 +5429,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				env.allowHome && "allowHome", env.allowedFolders && "allowedFolders",
 				env.statusLine && "statusLine", env.pathDetection && "pathDetection",
 			env.retryMax && "retryMax", env.maxUpload && "maxUpload", env.fallbackModel && "fallbackModel",
-			env.virtual && "virtual", env.virtualBase && "virtualBase",
+			env.virtual && "virtual", env.virtualBase && "virtualBase", env.schedule && "schedule",
 			].filter(Boolean).join(", ");
 			const summary =
 				`Vision proxy: ${modeLabel(effective.mode)}\n` +
@@ -5085,6 +5447,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				`Allow home: ${effective.allowHome ? "ON" : "OFF"}\n` +
 				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Path detection: ${effective.pathDetection === "on" ? "ON" : "OFF"}\n` +
+				`Schedule: ${effective.schedules && Object.keys(effective.schedules).length > 0 ? (effective.schedule === "on" ? "on" : "off (entries kept)") : "none"}\n` +
 			`Virtual model: ${effective.virtualModel === "on" ? `on${virtualModelSupported() ? "" : " (needs pi ≥ 0.99)"} — base ${effective.virtualBaseProvider && effective.virtualBaseModelId ? `${effective.virtualBaseProvider}/${effective.virtualBaseModelId}` : "auto"}` : "off"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider, effective.allowedProviders, effective.deniedProviders) ? "granted" : "not granted"}\n` +
 				`Allowed providers: ${(effective.allowedProviders ?? []).length > 0 ? effective.allowedProviders!.join(", ") : "none"}\n` +
@@ -5093,7 +5456,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | virtual on|off | virtual-base provider/model-id|off | doctor | test`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | schedule [on|off|clear] | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | virtual on|off | virtual-base provider/model-id|off | doctor | test`,
 					"info",
 				);
 				return;
@@ -5137,7 +5500,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			}
 
 			if (choice.startsWith("Model:")) {
-				await pickVisionModel(ctx, persisted, writePersisted, !!env.model);
+					await pickVisionModel(ctx, persisted, writePicked, !!env.model);
 				return;
 			}
 
@@ -5233,6 +5596,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					delete next.fallbackProvider;
 					delete next.fallbackModelId;
 					writePersisted(next);
+					clearSlotOverride("fallbackModel");
 					ctx.ui.notify("Fallback model: none", "info");
 					return;
 				}
@@ -5242,6 +5606,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					return;
 				}
 				writePersisted({ ...persisted, fallbackProvider: parsed.provider, fallbackModelId: parsed.modelId });
+				noteSlotOverride("fallbackModel", parsed.provider, parsed.modelId);
 				ctx.ui.notify(`Fallback model: ${parsed.provider}/${parsed.modelId}`, "info");
 				return;
 			}
