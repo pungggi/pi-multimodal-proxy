@@ -337,6 +337,7 @@ import {
 	modelImageResizeLimits,
 	parseProviderList,
 	persistedBase,
+	readPersistedConfig,
 	pluralImages,
 	type ReadImageReason,
 	type SniffImageFile,
@@ -379,8 +380,12 @@ import {
 	describeScheduleState,
 	getPersistentConfigPath,
 	matchSchedule,
-	scheduleMatches,
+	overrideAlive,
+	scheduleDropWarning,
+	scheduleOverrideExpiry,
+	MAX_SCHEDULE_ENTRIES_PER_SLOT,
 	SCHEDULE_SLOTS,
+	type RawScheduleShape,
 	type ScheduleEntry,
 	type ScheduleInfoMap,
 	type ScheduleOverrides,
@@ -960,11 +965,21 @@ function trackScheduleFlips(ctx: ExtensionContext, config: VisionConfig, quiet =
 	const state = getSessionState(ctx);
 	const prev = state.lastScheduleMatch;
 	state.lastScheduleMatch = current;
-	// Expire manual overrides whose scheduled entry is no longer the active one.
+	// Expire manual overrides whose scheduled entry is no longer the active
+	// one, or whose window ended even though the same entry became active
+	// again (e.g. a Monday pick must not shadow Tuesday's window).
+	const timeExpired: ScheduleSlotKey[] = [];
 	if (state.scheduleOverrides) {
 		for (const slot of Object.keys(state.scheduleOverrides) as ScheduleSlotKey[]) {
-			if (current[slot] !== state.scheduleOverrides[slot]?.entryIndex) {
+			const ov = state.scheduleOverrides[slot]!;
+			const pastWindowEnd = ov.expiresAt !== undefined && now.getTime() >= ov.expiresAt;
+			if (current[slot] !== ov.entryIndex) {
 				delete state.scheduleOverrides[slot]!;
+			} else if (pastWindowEnd) {
+				delete state.scheduleOverrides[slot]!;
+				// Same index re-matched: without a notice the schedule would resume
+				// silently and the user's manual pick would vanish unexplained.
+				timeExpired.push(slot);
 			}
 		}
 		if (Object.keys(state.scheduleOverrides).length === 0) state.scheduleOverrides = undefined;
@@ -982,10 +997,21 @@ function trackScheduleFlips(ctx: ExtensionContext, config: VisionConfig, quiet =
 			flips.push(`${SLOT_LABELS[slot]} → schedule default`);
 		}
 	}
+	for (const slot of timeExpired) {
+		const hit = matchSchedule(config.schedules?.[slot] ?? [], now);
+		if (hit) {
+			flips.push(`${SLOT_LABELS[slot]} → ${hit.entry.provider}/${hit.entry.modelId} (manual override expired)`);
+		}
+	}
 	if (flips.length > 0) {
 		ctx.ui.notify(`[multimodal-proxy] schedule: ${flips.join(" | ")}`, "info");
 		void withModelFallback(config, ctx)
-			.then((resolved) => ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry)))
+			.then((resolved) =>
+				ctx.ui.setStatus(
+					"multimodal-proxy",
+					steadyStatusText(resolved, ctx.modelRegistry, describeScheduleState(config, now, getSessionState(ctx).scheduleOverrides)),
+				),
+			)
 			.catch(() => {
 				// Status refresh must never surface as an unhandled rejection.
 			});
@@ -1011,12 +1037,29 @@ function timeRangeLabel(entry: ScheduleEntry): string {
 /**
  * Same-zone day/window overlap for the /schedule view's first-match warning.
  * Two circular arcs intersect iff an endpoint of one lies inside the other.
+ * A wrapping window (from > to) also occupies the early hours of the day
+ * AFTER each of its days, so those days join the intersection check
+ * (mon 22:00–06:00 overlaps tue 01:00–03:00 — PR #43 review).
  */
+function entryActiveDays(entry: ScheduleEntry): string[] {
+	const order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+	const days = entry.days && entry.days.length > 0 ? [...entry.days] : [...order];
+	const from = entry.from ? Number(entry.from.slice(0, 2)) * 60 + Number(entry.from.slice(3)) : 0;
+	const to = entry.to ? Number(entry.to.slice(0, 2)) * 60 + Number(entry.to.slice(3)) : 1440;
+	if (from > to) {
+		for (const d of [...days]) {
+			const next = order[(order.indexOf(d) + 1) % 7]!;
+			if (!days.includes(next)) days.push(next);
+		}
+	}
+	return days;
+}
+
 function entriesOverlap(a: ScheduleEntry, b: ScheduleEntry): boolean {
 	if ((a.tz ?? "") !== (b.tz ?? "")) return false;
-	const da = a.days && a.days.length > 0 ? a.days : undefined;
-	const db = b.days && b.days.length > 0 ? b.days : undefined;
-	if (da && db && !da.some((d) => db.includes(d))) return false;
+	const da = entryActiveDays(a);
+	const db = entryActiveDays(b);
+	if (a.days?.length && b.days?.length && !da.some((d) => db.includes(d))) return false;
 	const window = (e: ScheduleEntry): { from: number; to: number } => ({
 		from: e.from ? Number(e.from.slice(0, 2)) * 60 + Number(e.from.slice(3)) : 0,
 		to: e.to ? Number(e.to.slice(0, 2)) * 60 + Number(e.to.slice(3)) : 1440,
@@ -1043,11 +1086,14 @@ function renderScheduleView(effective: VisionConfig, ctx: ExtensionContext): str
 	for (const slot of SCHEDULE_SLOTS) {
 		const entries = effective.schedules[slot];
 		if (!entries || entries.length === 0) continue;
+		// Only the first-match winner is actually used — mark just that entry
+		// active, not every entry whose window matches (PR #43 review).
+		const winner = effective.schedule === "on" ? matchSchedule(entries, now) : null;
 		lines.push(`${slot}:`);
 		for (let i = 0; i < entries.length; i++) {
 			const entry = entries[i]!;
-			const active = effective.schedule === "on" && scheduleMatches(entry, now);
-			const overridden = active && overrides?.[slot]?.entryIndex === i;
+			const active = winner?.index === i;
+			const overridden = active && winner !== null && overrides?.[slot] !== undefined && overrideAlive(overrides[slot]!, winner, now);
 			const when = [dayRangeLabel(entry.days), timeRangeLabel(entry), entry.tz ? `(${entry.tz})` : ""]
 				.filter(Boolean)
 				.join(" ");
@@ -1073,21 +1119,33 @@ function renderScheduleView(effective: VisionConfig, ctx: ExtensionContext): str
 }
 
 /**
- * Count raw (pre-sanitize) schedule entries in the persistent file so the
- * view can flag hand-editing mistakes that sanitize silently dropped.
+ * Read the raw (pre-sanitize) schedule shape from the persistent file so the
+ * view can flag hand-editing mistakes that sanitize silently dropped. Known
+ * slot lists are clamped to the sanitize cap so cap cuts aren't reported as
+ * invalid entries.
  */
-async function countRawScheduleEntries(): Promise<number> {
+async function readRawSchedules(): Promise<RawScheduleShape | null> {
 	try {
 		const raw = JSON.parse(await readFile(getPersistentConfigPath(), "utf8")) as { schedules?: unknown };
 		const s = raw?.schedules;
-		if (Array.isArray(s)) return s.length;
+		if (Array.isArray(s)) return { kind: "array", entries: Math.min(s.length, MAX_SCHEDULE_ENTRIES_PER_SLOT) };
 		if (s && typeof s === "object") {
-			return Object.values(s).reduce<number>((acc, v) => acc + (Array.isArray(v) ? v.length : 0), 0);
+			let entries = (SCHEDULE_SLOTS as readonly string[]).reduce((acc, slot) => {
+				const v = (s as Record<string, unknown>)[slot];
+				return acc + (Array.isArray(v) ? Math.min(v.length, MAX_SCHEDULE_ENTRIES_PER_SLOT) : 0);
+			}, 0);
+			// Entries under unknown slot keys are dropped outright by sanitize —
+			// count them so they surface as invalid rather than vanishing.
+			for (const [key, v] of Object.entries(s)) {
+				if ((SCHEDULE_SLOTS as readonly string[]).includes(key) || !Array.isArray(v)) continue;
+				entries += v.length;
+			}
+			return { kind: "object", entries };
 		}
 	} catch {
 		// unreadable/missing file — the sanitized view still renders
 	}
-	return -1;
+	return null;
 }
 
 // ── Content sniffing (Pi ≥ 0.84.4) ───────────────────────────────────────
@@ -1681,12 +1739,26 @@ async function detectCookieBrowsers(): Promise<string[]> {
  * keeping allowedProviders file-scoped. Used by the interactive 403 flow.
  */
 function persistConfigPatch(pi: ExtensionAPI, ctx: ExtensionContext, patch: Partial<VisionConfig>): void {
-	const validated = sanitize({ ...persistedBase(ctx.sessionManager.getEntries()), ...patch });
+	const entries = ctx.sessionManager.getEntries();
+	// Same seeding rule as commandHandler's writePersisted: honor a file-level
+	// schedule toggle the session entries don't know about, and keep the
+	// file-managed schedules out of session-entry configs while carrying the
+	// file's entries through the rewrite (PR #43 review — this path previously
+	// deleted every configured schedule from memory and disk).
+	const validated = sanitize({
+		...persistedBase(entries),
+		schedule: readPersistedConfig(entries).schedule ?? _fileConfig.schedule ?? "on",
+		...patch,
+	});
 	delete validated.allowedProviders;
+	delete validated.schedules;
 	pi.appendEntry(CUSTOM_TYPE_CONFIG, validated);
 	const fileNext: Partial<VisionConfig> = { ...validated };
 	if (_fileConfig.allowedProviders !== undefined) {
 		fileNext.allowedProviders = normalizeAllowedProviders(_fileConfig.allowedProviders) ?? [];
+	}
+	if (_fileConfig.schedules !== undefined) {
+		fileNext.schedules = _fileConfig.schedules;
 	}
 	writePersistentFile(fileNext);
 	_fileConfig = fileNext;
@@ -3783,7 +3855,10 @@ export default function (pi: ExtensionAPI) {
 		if (eff.statusLine === "on") {
 			void withModelFallback(eff, ctx)
 				.then((resolved) =>
-					ctx.ui.setStatus("multimodal-proxy", steadyStatusText(resolved, ctx.modelRegistry, describeScheduleState(eff))),
+					ctx.ui.setStatus(
+						"multimodal-proxy",
+						steadyStatusText(resolved, ctx.modelRegistry, describeScheduleState(eff, new Date(), getSessionState(ctx).scheduleOverrides)),
+					),
 				)
 				.catch(() => {});
 		}
@@ -3872,7 +3947,12 @@ export default function (pi: ExtensionAPI) {
 
 		let modified = false;
 		let messages = !strip ? event.messages : event.messages.map((msg) => {
-			if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
+			// "custom" messages (pi.sendMessage …, { triggerTurn: true }, pi ≥ 1.2.0)
+			// carry image blocks like user messages do. Without this branch their
+			// description would live only in the starting run's system appendix and
+			// later turns on a text-only model would see unreadable raw blocks
+			// (PR #43 review).
+			if ((msg.role !== "user" && msg.role !== "custom") || !Array.isArray(msg.content)) return msg;
 
 			const hasImageBlock = msg.content.some((c) => c.type === "image");
 			const hasFilePaths = msg.content.some(
@@ -4078,7 +4158,11 @@ export default function (pi: ExtensionAPI) {
 			for (const slot of SCHEDULE_SLOTS) {
 				const slotEntries = resolved.schedules[slot];
 				if (!slotEntries?.length) continue;
-				for (const entry of slotEntries) {
+				// [active] marks the first-match winner only — the entry requests
+				// actually resolve through (PR #43 review).
+				const winner = resolved.schedule === "on" ? matchSchedule(slotEntries, new Date()) : null;
+				for (let i = 0; i < slotEntries.length; i++) {
+					const entry = slotEntries[i]!;
 					const m = ctx.modelRegistry.find(entry.provider, entry.modelId);
 				let entryKeyOk = false;
 				try {
@@ -4092,7 +4176,7 @@ export default function (pi: ExtensionAPI) {
 					const when = [dayRangeLabel(entry.days), timeRangeLabel(entry), entry.tz ?? ""].filter(Boolean).join(" ");
 					lines.push(
 						`  ${slot} ${when || "always"}: ${entry.provider}/${entry.modelId}` +
-							(resolved.schedule === "on" && scheduleMatches(entry, new Date()) ? " [active]" : "") +
+							(winner?.index === i ? " [active]" : "") +
 							(m ? "" : " — NOT in catalog") +
 							(m && !entryKeyOk ? " — no API key" : "") +
 							(!hasConsent(entries, entry.provider, resolved.allowedProviders, resolved.deniedProviders) ? " — no data-egress consent" : ""),
@@ -4179,8 +4263,18 @@ export default function (pi: ExtensionAPI) {
 	// Register both names — /multimodal-proxy (canonical) and /multimodal-proxy (legacy alias)
 	const commandHandler = async (args: string, ctx: ExtensionContext) => {
 			const entries = ctx.sessionManager.getEntries();
-			const persisted = persistedBase(entries);
-			const effective = resolveConfig(entries, process.env, _fileConfig);
+			// Seed the schedule toggle from the file when this session's entries
+			// lack it (fresh session, hand-edited file): persistedBase() alone
+			// defaults "on", so unrelated commands (context off, etc.) would
+			// reactivate schedules the user disabled in the file (PR #43 review).
+			const persisted: VisionConfig = {
+				...persistedBase(entries),
+				schedule: readPersistedConfig(entries).schedule ?? _fileConfig.schedule ?? "on",
+			};
+			// Override-aware: commands (consent, allowed-providers, doctor, menu)
+			// must act on the model requests will actually use — schedule AND any
+			// session-scoped manual override — not just the scheduled value.
+			const effective = scheduledConfigSync(ctx);
 			const env = envFlags();
 			const arg = args.trim();
 			const { sub, value } = splitSubcommand(arg);
@@ -4250,7 +4344,14 @@ export default function (pi: ExtensionAPI) {
 				if (!hit) return false;
 				const state = getSessionState(ctx);
 				state.scheduleOverrides ??= {};
-				state.scheduleOverrides[slot] = { provider, modelId, entryIndex: hit.index };
+				state.scheduleOverrides[slot] = {
+					provider,
+					modelId,
+					entryIndex: hit.index,
+					// Die with the window, not just with an index change: otherwise a
+					// Monday pick survives into Tuesday's occurrence of the window.
+					expiresAt: scheduleOverrideExpiry(hit.entry, now),
+				};
 				return true;
 			};
 			const clearSlotOverride = (slot: ScheduleSlotKey) => {
@@ -4260,13 +4361,13 @@ export default function (pi: ExtensionAPI) {
 					if (Object.keys(state.scheduleOverrides).length === 0) state.scheduleOverrides = undefined;
 				}
 			};
-			const OVERRIDE_NOTE = " — overrides the schedule until its next flip";
+			const OVERRIDE_NOTE = " — overrides the schedule until its window ends";
 			// Writer wrapper for vision-model picks: records a session-scoped
 			// override when the vision slot is currently schedule-resolved.
 			const writePicked = (next: VisionConfig): VisionConfig => {
 				const v = writePersisted(next);
 				if (noteSlotOverride("model", v.provider, v.modelId)) {
-					ctx.ui.notify("[multimodal-proxy] Manual pick overrides the scheduled vision model until the schedule's next flip.", "info");
+					ctx.ui.notify("[multimodal-proxy] Manual pick overrides the scheduled vision model until its window ends.", "info");
 				}
 				return v;
 			};
@@ -4275,14 +4376,8 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "schedule") {
 				if (!value) {
 					let text = renderScheduleView(effective, ctx);
-					const rawCount = await countRawScheduleEntries();
-					const validCount = SCHEDULE_SLOTS.reduce(
-						(acc, slot) => acc + (effective.schedules?.[slot]?.length ?? 0),
-						0,
-					);
-					if (rawCount >= 0 && rawCount > validCount) {
-						text += `\n⚠ ${rawCount - validCount} invalid entr${rawCount - validCount === 1 ? "y" : "ies"} dropped — check days (mon–sun), HH:MM times, IANA tz, and provider/model-id in the JSON file`;
-					}
+					const warning = scheduleDropWarning(await readRawSchedules(), effective);
+					if (warning) text += `\n${warning}`;
 					ctx.ui.notify(text, "info");
 					return;
 				}
@@ -5752,6 +5847,9 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					const trimmed = val.trim();
 					if (!trimmed) {
 						writePersisted({ ...persisted, virtualBaseProvider: undefined, virtualBaseModelId: undefined });
+						// Clearing the slot must also clear its override (README rule);
+						// otherwise a stale override keeps shadowing the schedule.
+						clearSlotOverride("virtualBase");
 						ctx.ui.notify("Virtual model base: auto (last physical model, else the vision model)", "info");
 						return;
 					}
@@ -5761,7 +5859,11 @@ Use "*" or "all" to grant consent for all providers globally.`,
 						return;
 					}
 					writePersisted({ ...persisted, virtualBaseProvider: parsed.provider, virtualBaseModelId: parsed.modelId });
-					ctx.ui.notify(`Virtual model base: ${parsed.provider}/${parsed.modelId}`, "info");
+					// Record the pick as a schedule override like the command path does:
+					// without it, a schedule (or an older override) would silently shadow
+					// the user's menu choice (PR #43 review).
+					const vbOv = noteSlotOverride("virtualBase", parsed.provider, parsed.modelId);
+					ctx.ui.notify(`Virtual model base: ${parsed.provider}/${parsed.modelId}${vbOv ? OVERRIDE_NOTE : ""}`, "info");
 					}
 				return;
 			}

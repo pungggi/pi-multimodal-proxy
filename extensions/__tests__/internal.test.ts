@@ -118,9 +118,12 @@ import {
 	matchSchedule,
 	nextBoundary,
 	nextOccurrence,
+	overrideAlive,
 	parseHHMM,
 	sanitizeSchedules,
+	scheduleDropWarning,
 	scheduleMatches,
+	scheduleOverrideExpiry,
 	wallClockInZone,
 	SCHEDULE_SLOTS,
 	type ScheduleEntry,
@@ -4148,6 +4151,36 @@ describe("schedule: applyScheduleOverrides", () => {
 	it("no-op when matching is off", () => {
 		assert.equal(applyScheduleOverrides({ ...DEFAULT_CONFIG, schedule: "off" }, {}, new Date()).provider, DEFAULT_CONFIG.provider);
 	});
+	it("dies with the window: a Monday pick does not shadow Tuesday's occurrence (PR #43)", () => {
+		// Mon–Fri 08:00–16:00 entry; override recorded Monday 10:00.
+		const entry: ScheduleEntry = { provider: "sche", modelId: "work", from: "08:00", to: "16:00", days: ["mon", "tue", "wed", "thu", "fri"] };
+		const monday = new Date(2026, 9, 19, 10, 0);
+		const expiresAt = scheduleOverrideExpiry(entry, monday)!;
+		assert.equal(expiresAt, new Date(2026, 9, 19, 16, 0).getTime());
+		const base = { ...DEFAULT_CONFIG, schedules: { model: [entry] } };
+		const overrides: ScheduleOverrides = { model: { provider: "manual", modelId: "pick", entryIndex: 0, expiresAt } };
+		// Same wall-clock window next day: index matches, time doesn't.
+		const tuesday = new Date(2026, 9, 20, 10, 0);
+		const scheduled = applySchedules(base, tuesday);
+		assert.equal(scheduled.modelId, "work");
+		const out = applyScheduleOverrides(scheduled, overrides, tuesday);
+		assert.equal(`${out.provider}/${out.modelId}`, "sche/work");
+		// And while the window is live, the override still wins.
+		const mondayOut = applyScheduleOverrides(applySchedules(base, monday), overrides, monday);
+		assert.equal(`${mondayOut.provider}/${mondayOut.modelId}`, "manual/pick");
+	});
+	it("days-only entries expire at end of day; always-on entries never expire by time", () => {
+		const daysOnly: ScheduleEntry = { provider: "sche", modelId: "d", days: ["mon"] };
+		assert.equal(scheduleOverrideExpiry(daysOnly, new Date(2026, 9, 19, 10, 0)), new Date(2026, 9, 20, 0, 0).getTime());
+		assert.equal(scheduleOverrideExpiry({ provider: "sche", modelId: "a" }, new Date(2026, 9, 19, 10, 0)), undefined);
+	});
+	it("overrideAlive combines index and window liveness", () => {
+		const entry: ScheduleEntry = { provider: "sche", modelId: "work", from: "08:00", to: "16:00" };
+		const hit = matchSchedule([entry], new Date(2026, 9, 19, 10, 0))!;
+		assert.ok(overrideAlive({ provider: "m", modelId: "p", entryIndex: 0, expiresAt: new Date(2026, 9, 19, 16, 0).getTime() }, hit, new Date(2026, 9, 19, 15, 59)));
+		assert.equal(overrideAlive({ provider: "m", modelId: "p", entryIndex: 0, expiresAt: new Date(2026, 9, 19, 16, 0).getTime() }, hit, new Date(2026, 9, 19, 16, 0)), false);
+		assert.equal(overrideAlive({ provider: "m", modelId: "p", entryIndex: 1 }, hit, new Date(2026, 9, 19, 10, 0)), false);
+	});
 });
 
 describe("schedule: sanitizeSchedules", () => {
@@ -4251,6 +4284,11 @@ describe("schedule: describeScheduleState + nextBoundary", () => {
 		assert.equal(Boolean(info.model!.overridden), false);
 		const overridden = describeScheduleState(cfg, now, { model: { provider: "x", modelId: "y", entryIndex: 0 } });
 		assert.equal(overridden.model!.overridden, true);
+		// Window-expired override (same index, later occurrence) no longer counts.
+		const expired = describeScheduleState(cfg, now, {
+			model: { provider: "x", modelId: "y", entryIndex: 0, expiresAt: now.getTime() - 1 },
+		});
+		assert.equal(Boolean(expired.model!.overridden), false);
 		const outside = describeScheduleState(cfg, new Date(2026, 9, 19, 17, 0));
 		assert.equal(outside.model!.active, false);
 	});
@@ -4271,6 +4309,33 @@ describe("schedule: describeScheduleState + nextBoundary", () => {
 		const now = new Date(2026, 9, 19, 16, 0);
 		const next = nextOccurrence("16:00", undefined, now);
 		assert.equal(next.getTime() - now.getTime(), 1440 * 60_000);
+	});
+});
+
+describe("schedule: scheduleDropWarning", () => {
+	it("null when nothing was dropped, for both shapes", () => {
+		assert.equal(scheduleDropWarning(null, DEFAULT_CONFIG), null);
+		const arrayValid = sanitizeSchedules([{ model: "a/one" }, { model: "b/two" }])!;
+		assert.equal(scheduleDropWarning({ kind: "array", entries: 2 }, { ...DEFAULT_CONFIG, schedules: arrayValid }), null);
+		const objectValid = sanitizeSchedules({ model: [{ model: "a/one" }] })!;
+		assert.equal(scheduleDropWarning({ kind: "object", entries: 1 }, { ...DEFAULT_CONFIG, schedules: objectValid }), null);
+	});
+	it("counts the bare-array shorthand against one slot, not four (PR #43)", () => {
+		// One valid + one invalid entry: pre-fix validCount was 4×1, hiding the drop.
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules([{ model: "a/one" }, { model: "no-slash" }])! };
+		const warning = scheduleDropWarning({ kind: "array", entries: 2 }, effective);
+		assert.ok(warning?.startsWith("⚠ 1 invalid entry dropped"), warning);
+	});
+	it("per-slot cap cuts are not reported as invalid", () => {
+		const many = Array.from({ length: 40 }, (_, i) => ({ model: `a/m${i}` }));
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules({ model: many })! };
+		assert.equal(effective.schedules!.model!.length, 32);
+		assert.equal(scheduleDropWarning({ kind: "object", entries: 32 }, effective), null);
+	});
+	it("entries under unknown slot keys surface as dropped", () => {
+		const effective = { ...DEFAULT_CONFIG, schedules: sanitizeSchedules({ model: [{ model: "a/one" }] })! };
+		const warning = scheduleDropWarning({ kind: "object", entries: 3 }, effective);
+		assert.ok(warning?.includes("2 invalid entries dropped"), warning);
 	});
 });
 

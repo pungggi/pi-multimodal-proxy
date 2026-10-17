@@ -17,7 +17,7 @@ Media routing is automatic: content sniffing and path detection feed a pipeline 
 Two themes: time-based model switching (issue #42) and Pi 1.2.0 run-safety.
 
 - **Scheduled model slots** — the vision, video, fallback, and virtual-base models can now resolve by wall-clock schedule, evaluated at request time. Built for flat-rate time-block subscriptions (e.g. CheapestInference: unlimited inside your 08:00–16:00 block, key errors outside), it also covers off-peak pricing, free-tier windows, and overnight heavyweight models. First match wins, windows wrap midnight, per-entry IANA timezones are DST-aware, and the status line shows `⏱ until 16:00`. See [Scheduled model slots](#scheduled-model-slots).
-- **Manual picks override temporarily** — `/multimodal-proxy model` (or `pick`, `video-model`, …) issued while a slot's schedule is active shadows it until the schedule's next flip, then the schedule resumes on its own.
+- **Manual picks override temporarily** — `/multimodal-proxy model` (or `pick`, `video-model`, …) issued while a slot's schedule is active shadows it until the schedule's window ends, then the schedule resumes on its own.
 - **`before_agent_start` crash fixed on Pi ≥ 1.2.0 custom-message runs** — runs started by `pi.sendMessage(..., { triggerTurn: true })` while idle no longer hit `undefined.matchAll`; their image blocks now go through the normal proxy pipeline (described on text-only models, retained for recall on vision-capable ones).
 
 ## Release notes
@@ -111,7 +111,7 @@ Configure entries by editing `~/.pi/agent/multimodal-proxy.json` (they are file-
 
 Interaction details:
 
-- **Manual picks override temporarily** — `/multimodal-proxy model`, `pick`, `video-model`, `fallback-model`, or `virtual-base` issued while that slot's schedule is active shadows the schedule until its active entry changes (then the schedule resumes on its own). Clearing a slot clears its override.
+- **Manual picks override temporarily** — `/multimodal-proxy model`, `pick`, `video-model`, `fallback-model`, or `virtual-base` issued while that slot's schedule is active shadows the schedule until its active entry changes or its window ends, whichever comes first (then the schedule resumes on its own — a Monday pick never leaks into Tuesday's window). Clearing a slot clears its override.
 - **Boundary crossings are announced** — a one-line notice (`schedule: vision model → … (until 16:00)`) fires when a slot flips between turns, and the status line shows `⏱ until 16:00` for the active vision slot.
 - **View and control** — `/multimodal-proxy schedule` lists entries per slot (marking the active one, warning about overlaps and about invalid entries dropped at load), `… schedule off|on` toggles matching without deleting entries, `… schedule clear` removes them.
 - **Scheduled models are explicit** — the implicit-default substitution never rewrites a scheduled model; a missing key fails loudly instead of silently paying per-token elsewhere.

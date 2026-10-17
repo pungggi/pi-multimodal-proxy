@@ -147,6 +147,12 @@ export interface ScheduleOverride {
 	modelId: string;
 	/** Index of the entry this override shadows; mismatch = expired. */
 	entryIndex: number;
+	/**
+	 * Epoch ms after which the override is dead even though the same entry is
+	 * still active (its window ended and a later occurrence began). Undefined =
+	 * index expiry only (always-on entry).
+	 */
+	expiresAt?: number;
 }
 
 export type ScheduleOverrides = Partial<Record<ScheduleSlotKey, ScheduleOverride>>;
@@ -1630,9 +1636,10 @@ export function applySchedules(config: VisionConfig, now: Date): VisionConfig {
 
 /**
  * Apply session-scoped manual picks over scheduled values. An override only
- * shadows its slot while the SAME entry is still the active match; once the
- * active entry changes (or stops matching) the override is dead — callers
- * prune it (see trackScheduleFlips in vision-proxy).
+ * shadows its slot while the SAME entry is still the active match AND its
+ * window has not ended (see scheduleOverrideExpiry) — so a Monday pick never
+ * leaks into Tuesday's occurrence of the same window. Callers prune dead
+ * overrides (see trackScheduleFlips in vision-proxy).
  */
 export function applyScheduleOverrides(config: VisionConfig, overrides: ScheduleOverrides, now: Date): VisionConfig {
 	if (config.schedule === "off" || !config.schedules) return config;
@@ -1642,7 +1649,7 @@ export function applyScheduleOverrides(config: VisionConfig, overrides: Schedule
 		const entries = config.schedules[slot];
 		if (!override || !entries || entries.length === 0) continue;
 		const hit = matchSchedule(entries, now);
-		if (!hit || hit.index !== override.entryIndex) continue;
+		if (!hit || !overrideAlive(override, hit, now)) continue;
 		if (out === config) out = { ...config };
 		setScheduleSlot(out, slot, override.provider, override.modelId);
 	}
@@ -1690,7 +1697,7 @@ export function describeScheduleState(
 		out[slot] = {
 			active: true,
 			until: hit.entry.to ? `${hit.entry.to}${tzSuffix(hit.entry)}` : undefined,
-			overridden: overrides?.[slot]?.entryIndex === hit.index,
+			overridden: overrides?.[slot] !== undefined && overrideAlive(overrides[slot]!, hit, now),
 			model: `${hit.entry.provider}/${hit.entry.modelId}`,
 		};
 	}
@@ -1716,9 +1723,27 @@ export function nextBoundary(entry: ScheduleEntry, now: Date): Date | null {
 	return nextOccurrence(entry.to, entry.tz, now);
 }
 
+/**
+ * When a manual override of `entry` should die even though the same entry may
+ * become active again later: the window's end, or end-of-day for `days`-only
+ * entries (an always-on entry never expires by time). Undefined = index
+ * expiry only.
+ */
+export function scheduleOverrideExpiry(entry: ScheduleEntry, now: Date): number | undefined {
+	if (entry.to) return nextOccurrence(entry.to, entry.tz, now).getTime();
+	if (entry.days && entry.days.length > 0) return nextOccurrence("00:00", entry.tz, now).getTime();
+	return undefined;
+}
+
+/** True while `override` still shadows `hit`'s entry (same index, window not over). */
+export function overrideAlive(override: ScheduleOverride, hit: ScheduleMatch, now: Date): boolean {
+	if (hit.index !== override.entryIndex) return false;
+	return override.expiresAt === undefined || now.getTime() < override.expiresAt;
+}
+
 // ── Scheduled model slots: sanitization ────────────────────────────────────
 
-const MAX_SCHEDULE_ENTRIES_PER_SLOT = 32;
+export const MAX_SCHEDULE_ENTRIES_PER_SLOT = 32;
 
 /** Validate one raw entry; null when any present field is malformed. */
 function sanitizeScheduleEntry(raw: unknown): ScheduleEntry | null {
@@ -1792,6 +1817,31 @@ export function sanitizeSchedules(value: unknown): ModelSchedules | undefined {
 		}
 	}
 	return any ? out : undefined;
+}
+
+/** Raw (pre-sanitize) schedule shape as read from the persistent file. */
+export interface RawScheduleShape {
+	/** Bare-array shorthand vs per-slot object. */
+	kind: "array" | "object";
+	/** Raw entry count, already clamped per known slot to the sanitize cap. */
+	entries: number;
+}
+
+/**
+ * Warning line for the /schedule view when the raw file holds more entries
+ * than sanitize kept. Both sides are counted in the same representation so
+ * the bare-array shorthand (expanded to all four slots by sanitize) and the
+ * per-slot cap don't skew the comparison; null when nothing was dropped.
+ */
+export function scheduleDropWarning(raw: RawScheduleShape | null, effective: VisionConfig): string | null {
+	if (!raw) return null;
+	const valid =
+		raw.kind === "array"
+			? (effective.schedules?.model?.length ?? 0)
+			: SCHEDULE_SLOTS.reduce((acc, slot) => acc + (effective.schedules?.[slot]?.length ?? 0), 0);
+	const dropped = raw.entries - valid;
+	if (dropped <= 0) return null;
+	return `⚠ ${dropped} invalid entr${dropped === 1 ? "y" : "ies"} dropped — check days (mon–sun), HH:MM times, IANA tz, and provider/model-id in the JSON file`;
 }
 
 /**
