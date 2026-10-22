@@ -230,6 +230,8 @@ export interface ImageDataStore {
 	diskDir?: string;
 	/** In-flight disk writes; flushed by flushRecallWrites before disk reads. */
 	pending: Set<Promise<void>>;
+	/** Tail of the serialized persist+evict chain (one writer at a time per store). */
+	queue?: Promise<void>;
 	/** Lazily-built disk index (hash → size/mtime); see loadDiskIndex. */
 	diskIndex?: Map<string, { size: number; mtimeMs: number }>;
 	/** Total size of the indexed disk files (disk budget enforcement). */
@@ -360,7 +362,7 @@ function persistImageData(store: ImageDataStore, hash: string, data: string, mim
 	// depth: callers normally pass hashImageData output).
 	if (!isRecallHash(key)) return;
 	let tmp: string | undefined;
-	const write = (async () => {
+	const run = async () => {
 		try {
 			// Owner-only modes: the store holds raw screenshots and pasted images.
 			await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -385,9 +387,16 @@ function persistImageData(store: ImageDataStore, hash: string, data: string, mim
 			// unbounded.
 			if (tmp) await unlink(tmp).catch(() => {});
 		}
-	})();
-	const tracked: Promise<void> = write.finally(() => store.pending.delete(tracked));
+	};
+	// Serialize persist+evict per store: concurrent writers each rebuild the
+	// disk index and evict "oldest first", so two racing evictions could unlink
+	// each other's just-written file and leave nothing persisted. Chained on
+	// `queue`, each writer evicts a deterministic victim (the previous oldest),
+	// matching the in-memory LRU outcome.
+	const tracked: Promise<void> = (store.queue ?? Promise.resolve()).then(run);
+	store.queue = tracked;
 	store.pending.add(tracked);
+	void tracked.finally(() => store.pending.delete(tracked));
 }
 
 /** Wait for all in-flight recall writes (bounded, in case a write queues more). */
@@ -508,6 +517,23 @@ export async function listDiskHashes(store: ImageDataStore): Promise<string[]> {
 	if (!store.diskDir || imageDataMaxBytes() === 0) return [];
 	await flushRecallWrites(store);
 	await loadDiskIndex(store);
+	return [...(store.diskIndex?.keys() ?? [])];
+}
+
+/**
+ * Prime the disk index without touching the in-memory store — called on
+ * session start so sync consumers (`#` autocomplete) can see persisted
+ * images immediately after a resume, before any async recall runs.
+ */
+export async function primeRecallDiskIndex(store: ImageDataStore): Promise<void> {
+	if (!store.diskDir || imageDataMaxBytes() === 0) return;
+	await flushRecallWrites(store);
+	await loadDiskIndex(store);
+}
+
+/** Disk hashes from the primed index, synchronously ([] when not yet primed). */
+export function cachedDiskHashes(store: ImageDataStore): string[] {
+	if (!store.diskDir || imageDataMaxBytes() === 0) return [];
 	return [...(store.diskIndex?.keys() ?? [])];
 }
 

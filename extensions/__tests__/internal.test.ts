@@ -101,6 +101,8 @@ import {
 	resolveRecallDir,
 	flushRecallWrites,
 	listDiskHashes,
+	primeRecallDiskIndex,
+	cachedDiskHashes,
 	diskRecallUsage,
 	clearDiskRecall,
 	parseRecallRef,
@@ -930,6 +932,54 @@ describe("disk-backed recall persistence (1.26.0)", () => {
 			const names = await readdir(dir);
 			assert.ok(!names.includes(staleName));
 			assert.ok(names.includes(foreignName));
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("serializes persist+evict so racing writers cannot delete each other's files", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		try {
+			// Disk budget fits roughly one record: two concurrent writers create
+			// real eviction pressure. Without the per-store queue, each writer's
+			// evictDisk could unlink the other's just-written file, leaving zero.
+			const per = Buffer.byteLength(JSON.stringify({ mimeType: "image/png", data: "AAAAAAAA" }));
+			process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = String(per + 1);
+			const store = createImageDataStore(dir);
+			// Fire both without awaiting in between (mirrors two storeImageData
+			// calls inside one vision turn).
+			storeImageData(store, HASH_A, "AAAAAAAA", "image/png");
+			storeImageData(store, HASH_B, "AAAAAAAA", "image/png");
+			await flushRecallWrites(store);
+
+			// Deterministic LRU outcome: the newest write survives, never zero.
+			const s2 = createImageDataStore(dir);
+			const hashes = await listDiskHashes(s2);
+			assert.deepEqual(hashes, [HASH_B]);
+			assert.equal(await recallImageData(s2, HASH_A), undefined);
+			assert.deepEqual(await recallImageData(s2, HASH_B), { data: "AAAAAAAA", mimeType: "image/png" });
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("primeRecallDiskIndex feeds cachedDiskHashes without touching memory", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		try {
+			const s1 = createImageDataStore(dir);
+			storeImageData(s1, HASH_A, "AAAAAAAA", "image/png");
+			await flushRecallWrites(s1);
+
+			// A resumed session: empty memory, unknown disk state until primed.
+			const s2 = createImageDataStore(dir);
+			assert.deepEqual(cachedDiskHashes(s2), []); // not primed yet
+			await primeRecallDiskIndex(s2);
+			assert.deepEqual(cachedDiskHashes(s2), [HASH_A]);
+			assert.equal(s2.map.size, 0); // memory stays empty — priming is metadata only
+			assert.equal(s2.diskTotalBytes > 0, true);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

@@ -365,6 +365,8 @@ import {
 	diskRecallUsage,
 	clearDiskRecall,
 	listDiskHashes,
+	primeRecallDiskIndex,
+	cachedDiskHashes,
 	clearImageData,
 	createImageDataStore,
 	type ImageDataStore,
@@ -2742,12 +2744,13 @@ export default function (pi: ExtensionAPI) {
 						if (config.mode !== "off") {
 							// Candidates = described images ∪ everything retained in the
 							// in-memory recall store (pass-through attachments, analyze_image
-							// results) — anything analyze_image can resolve by id.
+							// results) ∪ disk-persisted hashes (primed on session start) —
+							// anything analyze_image can resolve by id.
 							const sessionState = getSessionState(ctx);
 							const candidates = collectRecallCandidates(
 								findDescriptions(entries),
 								(hash) => sessionState.imageMeta.get(hash),
-								sessionState.imageData.map.keys(),
+								[...sessionState.imageData.map.keys(), ...cachedDiskHashes(sessionState.imageData)],
 							);
 							const items = buildRecallItems(candidates, token.query);
 							if (items.length > 0) return { items, prefix: token.prefix };
@@ -3340,6 +3343,9 @@ export default function (pi: ExtensionAPI) {
 		state.toolCallCount = 0;
 		state.imageMeta.clear();
 		clearImageData(state.imageData);
+		// Prime the disk index (opt-in persistence) so `#` recall and the
+		// miss-error suggestions see images from before a resume immediately.
+		void primeRecallDiskIndex(state.imageData);
 		state.compaction = undefined;
 		state.keyProbe = undefined;
 		state.dynamicVisionProbe = undefined;
