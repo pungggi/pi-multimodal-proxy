@@ -18,6 +18,7 @@
  *                                                    - persisted pre-consented providers
  *                                                    - use "*" or "all" to consent globally for all providers
  *                 /multimodal-proxy tool on|off     - enable/disable analyze_image tool
+ *                 /multimodal-proxy recall status|clear - opt-in disk recall store (PI_VISION_PROXY_RECALL_PERSIST)
  *                 /multimodal-proxy doctor          - one-shot setup diagnostics
  *                 /multimodal-proxy test            - end-to-end self-test (synthetic image)
  *                 /multimodal-proxy max-images-per-call <n>
@@ -360,7 +361,12 @@ import {
 	writePersistentFile,
 	storeImageMeta,
 	storeImageData,
-	getImageData,
+	recallImageData,
+	diskRecallUsage,
+	clearDiskRecall,
+	listDiskHashes,
+	primeRecallDiskIndex,
+	cachedDiskHashes,
 	clearImageData,
 	createImageDataStore,
 	type ImageDataStore,
@@ -2142,17 +2148,26 @@ function registryVisionSuggestions(ctx: ExtensionContext, query: string, limit =
 /**
  * Close-match recall-id suggestions: matches the mistyped id against every
  * retained image's hash (and filename, when known) and returns full ids the
- * agent can pass verbatim.
+ * agent can pass verbatim. Memory-store keys first, then the opt-in disk store
+ * (1.26.0) — after a resume the in-memory store starts empty but the disk
+ * store still holds the project's images.
  */
-function recallSuggestions(imageData: ImageDataStore, imageMeta: ImageMetaStore, query: string, limit = 3): string[] {
+async function recallSuggestions(imageData: ImageDataStore, imageMeta: ImageMetaStore, query: string, limit = 3): Promise<string[]> {
 	const candidates: string[] = [];
+	const seen = new Set<string>();
 	try {
 		for (const hash of imageData.map.keys()) {
 			const meta = imageMeta.get(hash);
 			candidates.push(meta?.filename ? `${hash} (${meta.filename})` : hash);
+			seen.add(hash);
+		}
+		for (const hash of await listDiskHashes(imageData)) {
+			if (seen.has(hash)) continue;
+			const meta = imageMeta.get(hash);
+			candidates.push(meta?.filename ? `${hash} (${meta.filename})` : hash);
 		}
 	} catch {
-		return [];
+		// Disk listing is best-effort — memory-store candidates still count.
 	}
 	return closeMatches(query, candidates, limit);
 }
@@ -2427,9 +2442,9 @@ async function handleAnalyzeImage(
 	for (const ref of imageRefs) {
 		const recallHash = parseRecallRef(ref);
 		if (recallHash) {
-			const stored = getImageData(imageData, recallHash);
+			const stored = await recallImageData(imageData, recallHash);
 			if (!stored) {
-				const suggestions = recallSuggestions(imageData, imageMeta, recallHash);
+				const suggestions = await recallSuggestions(imageData, imageMeta, recallHash);
 				return analysisError(
 					`Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.` +
 						(suggestions.length > 0 ? ` Close ids still retained: ${suggestions.join(", ")}.` : "") +
@@ -2729,12 +2744,13 @@ export default function (pi: ExtensionAPI) {
 						if (config.mode !== "off") {
 							// Candidates = described images ∪ everything retained in the
 							// in-memory recall store (pass-through attachments, analyze_image
-							// results) — anything analyze_image can resolve by id.
+							// results) ∪ disk-persisted hashes (primed on session start) —
+							// anything analyze_image can resolve by id.
 							const sessionState = getSessionState(ctx);
 							const candidates = collectRecallCandidates(
 								findDescriptions(entries),
 								(hash) => sessionState.imageMeta.get(hash),
-								sessionState.imageData.map.keys(),
+								[...sessionState.imageData.map.keys(), ...cachedDiskHashes(sessionState.imageData)],
 							);
 							const items = buildRecallItems(candidates, token.query);
 							if (items.length > 0) return { items, prefix: token.prefix };
@@ -3327,6 +3343,9 @@ export default function (pi: ExtensionAPI) {
 		state.toolCallCount = 0;
 		state.imageMeta.clear();
 		clearImageData(state.imageData);
+		// Prime the disk index (opt-in persistence) so `#` recall and the
+		// miss-error suggestions see images from before a resume immediately.
+		void primeRecallDiskIndex(state.imageData);
 		state.compaction = undefined;
 		state.keyProbe = undefined;
 		state.dynamicVisionProbe = undefined;
@@ -4202,9 +4221,17 @@ export default function (pi: ExtensionAPI) {
 				` | extra folders: ${resolved.allowedFolders.length}`,
 		);
 		const store = getSessionState(ctx).imageData;
-		lines.push(
-			`recall store: ${store.map.size} image(s), ${(store.totalBytes / 1048576).toFixed(1)} MB retained (in-memory only)`,
-		);
+		if (store.diskDir) {
+			const usage = await diskRecallUsage(store);
+			lines.push(
+				`recall store: ${store.map.size} image(s), ${(store.totalBytes / 1048576).toFixed(1)} MB in memory | ` +
+					`disk: ${usage.count} file(s), ${(usage.bytes / 1048576).toFixed(1)} MB under ${usage.dir}`,
+			);
+		} else {
+			lines.push(
+				`recall store: ${store.map.size} image(s), ${(store.totalBytes / 1048576).toFixed(1)} MB retained (in-memory only; disk persistence off — PI_VISION_PROXY_RECALL_PERSIST=1)`,
+			);
+		}
 		ctx.ui.notify(`[multimodal-proxy] doctor\n  ${lines.join("\n  ")}`, "info");
 	};
 
@@ -5259,6 +5286,50 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				return;
 			}
 
+			// ── Opt-in disk recall store (1.26.0) ────────────────────
+			if (sub === "recall") {
+				const store = getSessionState(ctx).imageData;
+				if (valueLower === "clear") {
+					if (!store.diskDir) {
+						ctx.ui.notify(
+							"[multimodal-proxy] Disk recall is off (the default). Enable it with PI_VISION_PROXY_RECALL_PERSIST=1 or PI_VISION_PROXY_RECALL_DIR=<path>.",
+							"warning",
+						);
+						return;
+					}
+					const ok = await clearDiskRecall(store);
+					ctx.ui.notify(
+						ok
+							? `[multimodal-proxy] Cleared persisted recall images under ${store.diskDir}.`
+							: `[multimodal-proxy] Could not clear ${store.diskDir}.`,
+						ok ? "info" : "warning",
+					);
+					return;
+				}
+				if (valueLower && valueLower !== "status") {
+					ctx.ui.notify("Usage: /multimodal-proxy recall [status|clear]", "warning");
+					return;
+				}
+				const memoryLine = `${store.map.size} image(s), ${(store.totalBytes / 1048576).toFixed(1)} MB in memory`;
+				if (!store.diskDir) {
+					ctx.ui.notify(
+						`[multimodal-proxy] Recall: ${memoryLine}.\n` +
+							"Disk persistence: OFF (recall bytes do not survive a resume or fork).\n" +
+							"Enable with PI_VISION_PROXY_RECALL_PERSIST=1 (default dir) or PI_VISION_PROXY_RECALL_DIR=<path>.",
+						"info",
+					);
+					return;
+				}
+				const usage = await diskRecallUsage(store);
+				ctx.ui.notify(
+					`[multimodal-proxy] Recall: ${memoryLine}.\n` +
+						`Disk: ${usage.count} file(s), ${(usage.bytes / 1048576).toFixed(1)} MB under ${usage.dir}\n` +
+						"Disk bytes are project-scoped and never leave this machine. Clear with /multimodal-proxy recall clear.",
+					"info",
+				);
+				return;
+			}
+
 			// ── describe / redescribe ───────────────────────────
 			// ── Diagnostics ────────────────────────────────────────
 			if (sub === "doctor") {
@@ -5310,7 +5381,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 				for (const ref of parsed.images) {
 					const recallHash = parseRecallRef(ref);
 					if (recallHash) {
-						const stored = getImageData(imageData, recallHash);
+						const stored = await recallImageData(imageData, recallHash);
 						if (!stored) {
 							ctx.ui.notify(`[multimodal-proxy] Image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.`, "error");
 							return;
@@ -5551,7 +5622,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | schedule [on|off|clear] | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | virtual on|off | virtual-base provider/model-id|off | doctor | test`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | schedule [on|off|clear] | context on|off | consent yes|no|always | allowed-providers add|remove <provider>|clear | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | folders list|add|remove|reset | allow-home on|off | status on|off | path-detection on|off | fallback-model provider/model-id|clear | retry <0-5> | max-upload <dim|nmb|off> | virtual on|off | virtual-base provider/model-id|off | recall status|clear | doctor | test`,
 					"info",
 				);
 				return;

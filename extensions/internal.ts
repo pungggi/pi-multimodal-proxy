@@ -4,7 +4,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, parse, relative } from "node:path";
 import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
@@ -210,10 +210,12 @@ function evictImageMeta(meta: ImageMetaStore): void {
 // Retains the actual image bytes (base64) of images seen this session, keyed by
 // hash, so the agent can re-query a previously-seen image with analyze_image
 // even when it is no longer attached to the current turn (e.g. a screenshot the
-// user pasted several turns ago). Storage is in-memory only — image bytes are
-// never written to the session log or disk, keeping the existing data-egress
-// posture intact. Insertion order is used for LRU eviction once the byte budget
-// is exceeded.
+// user pasted several turns ago). Storage is in-memory only by default — image
+// bytes are never written to the session log or disk, keeping the existing
+// data-egress posture intact. Opt-in disk persistence (1.26.0, see
+// `resolveRecallDir`) additionally keeps those bytes readable after a resume or
+// fork, where a fresh in-memory store starts empty. Insertion order is used for
+// LRU eviction once the byte budget is exceeded.
 
 /**
  * Per-session retained-bytes store for image recall: hash → base64 bytes + mime
@@ -224,11 +226,82 @@ function evictImageMeta(meta: ImageMetaStore): void {
 export interface ImageDataStore {
 	map: Map<string, { data: string; mimeType: string }>;
 	totalBytes: number;
+	/** Opt-in disk backing directory (1.26.0); undefined = memory only (default). */
+	diskDir?: string;
+	/** In-flight disk writes; flushed by flushRecallWrites before disk reads. */
+	pending: Set<Promise<void>>;
+	/** Tail of the serialized persist+evict chain (one writer at a time per store). */
+	queue?: Promise<void>;
+	/** Lazily-built disk index (hash → size/mtime); see loadDiskIndex. */
+	diskIndex?: Map<string, { size: number; mtimeMs: number }>;
+	/** Total size of the indexed disk files (disk budget enforcement). */
+	diskTotalBytes: number;
 }
 
-/** Create an empty per-session image-recall byte store. */
-export function createImageDataStore(): ImageDataStore {
-	return { map: new Map(), totalBytes: 0 };
+/** Env literals that explicitly opt in to / out of an opt-in feature. */
+const ENV_TRUE = new Set(["1", "true", "yes", "on"]);
+const ENV_FALSE = new Set(["0", "false", "off", "no", ""]);
+
+/** True for a 32-hex recall id — the only shape ever used to build a file path. */
+function isRecallHash(hash: string): boolean {
+	return new RegExp(`^[a-f0-9]{${HASH_HEX_LEN}}$`, "i").test(hash);
+}
+
+/** True for a temp file this extension writes (`.<hash>.<pid>.<rand>.tmp`). */
+function isOwnedTempFile(name: string): boolean {
+	return new RegExp(`^\\.[a-f0-9]{${HASH_HEX_LEN}}\\.[0-9a-z]+\\.[0-9a-z]+\\.tmp$`, "i").test(name);
+}
+
+/** True for a file this extension owns: a recall record or one of its temp files. */
+function isOwnedRecallFile(name: string): boolean {
+	return (name.endsWith(".json") && isRecallHash(name.slice(0, -".json".length))) || isOwnedTempFile(name);
+}
+
+/**
+ * Resolve the opt-in disk-backed recall directory (1.26.0), or undefined when
+ * persistence is off — the default, which keeps recall bytes memory-only.
+ *
+ * - `PI_VISION_PROXY_RECALL_DIR=<path>`: persist in that directory (`~` is
+ *   expanded). A falsy literal (`0`/`off`/…) explicitly disables persistence.
+ * - `PI_VISION_PROXY_RECALL_PERSIST=1`: persist in the default location
+ *   `~/.pi/agent/multimodal-proxy/recall/<sha1(cwd)16>`. Keying by the project
+ *   path is what makes a resumed or forked session find its images back, while
+ *   keeping unrelated projects from seeing each other's bytes.
+ */
+export function resolveRecallDir(
+	env: Record<string, string | undefined> = process.env,
+	cwd: string = process.cwd(),
+): string | undefined {
+	const rawDir = env.PI_VISION_PROXY_RECALL_DIR;
+	if (rawDir !== undefined) {
+		// An explicit DIR always wins: a path enables it there, a falsy literal
+		// disables persistence outright (no fall-through to the default dir).
+		if (ENV_FALSE.has(rawDir.trim().toLowerCase())) return undefined;
+		return expandLeadingTilde(rawDir.trim());
+	}
+	const flag = env.PI_VISION_PROXY_RECALL_PERSIST?.trim().toLowerCase();
+	if (flag !== undefined && ENV_TRUE.has(flag)) {
+		const projectKey = createHash("sha1").update(cwd).digest("hex").slice(0, 16);
+		return join(os.homedir(), ".pi", "agent", "multimodal-proxy", "recall", projectKey);
+	}
+	return undefined;
+}
+
+/**
+ * Create an empty per-session image-recall byte store.
+ *
+ * `dir` overrides the env-derived disk location: omit it to honor
+ * `resolveRecallDir()`, pass a path to force persistence (tests), pass `null`
+ * to force memory-only even when the env opts in.
+ */
+export function createImageDataStore(dir?: string | null): ImageDataStore {
+	return {
+		map: new Map(),
+		totalBytes: 0,
+		diskDir: dir === undefined ? resolveRecallDir() : (dir ?? undefined),
+		pending: new Set(),
+		diskTotalBytes: 0,
+	};
 }
 
 /** Default byte budget for retained image data (decoded bytes, ≈64 MB). */
@@ -271,6 +344,238 @@ export function storeImageData(store: ImageDataStore, hash: string, data: string
 	store.map.set(hash, { data, mimeType });
 	store.totalBytes += Buffer.byteLength(data, "base64");
 	evictImageData(store);
+	// Only mirror to disk what the in-memory store actually kept: a recall
+	// budget of 0 disables persistence along with recall itself.
+	if (store.map.has(hash)) persistImageData(store, hash, data, mimeType);
+}
+
+/**
+ * Write one retained image through to the opt-in disk store. Best-effort and
+ * fire-and-forget: a failed write must never break the vision pipeline, and the
+ * in-memory store is authoritative for this process either way.
+ */
+function persistImageData(store: ImageDataStore, hash: string, data: string, mimeType: string): void {
+	const dir = store.diskDir;
+	if (!dir || imageDataMaxBytes() === 0) return;
+	const key = hash.toLowerCase();
+	// Never build a path from anything but a well-formed recall id (defense in
+	// depth: callers normally pass hashImageData output).
+	if (!isRecallHash(key)) return;
+	let tmp: string | undefined;
+	const run = async () => {
+		try {
+			// Owner-only modes: the store holds raw screenshots and pasted images.
+			await mkdir(dir, { recursive: true, mode: 0o700 });
+			tmp = join(dir, `.${key}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
+			// Single JSON file per image, written atomically (tmp + rename) so a
+			// crash can never leave a half-written record behind.
+			await writeFile(tmp, JSON.stringify({ mimeType, data }), { encoding: "utf8", mode: 0o600 });
+			const target = join(dir, `${key}.json`);
+			try {
+				await rename(tmp, target);
+			} catch {
+				// Windows can refuse to rename onto an existing or locked destination
+				// (EPERM/EEXIST, e.g. a fresh store re-persisting a hash after a
+				// resume) — drop ours and retry once.
+				await unlink(target).catch(() => {});
+				await rename(tmp, target);
+			}
+			await evictDisk(store, key);
+		} catch {
+			// Persistence is a convenience — swallow and keep the memory copy. Also
+			// drop the temp file: it sits outside the byte budget, so a leak would be
+			// unbounded.
+			if (tmp) await unlink(tmp).catch(() => {});
+		}
+	};
+	// Serialize persist+evict per store: concurrent writers each rebuild the
+	// disk index and evict "oldest first", so two racing evictions could unlink
+	// each other's just-written file and leave nothing persisted. Chained on
+	// `queue`, each writer evicts a deterministic victim (the previous oldest),
+	// matching the in-memory LRU outcome.
+	const tracked: Promise<void> = (store.queue ?? Promise.resolve()).then(run);
+	store.queue = tracked;
+	store.pending.add(tracked);
+	void tracked.finally(() => store.pending.delete(tracked));
+}
+
+/** Wait for all in-flight recall writes (bounded, in case a write queues more). */
+export async function flushRecallWrites(store: ImageDataStore): Promise<void> {
+	for (let i = 0; i < 10 && store.pending.size > 0; i++) {
+		await Promise.allSettled([...store.pending]);
+	}
+}
+
+/** Rebuild the disk index from the directory (fresh stats). */
+async function loadDiskIndex(store: ImageDataStore): Promise<void> {
+	if (!store.diskDir) return;
+	const index = new Map<string, { size: number; mtimeMs: number }>();
+	let total = 0;
+	try {
+		const names = await readdir(store.diskDir);
+		for (const name of names) {
+			if (name.endsWith(".json") && isRecallHash(name.slice(0, -".json".length))) {
+				const st = await stat(join(store.diskDir, name));
+				if (!st.isFile()) continue;
+				const key = name.slice(0, -".json".length).toLowerCase();
+				index.set(key, { size: st.size, mtimeMs: st.mtimeMs });
+				total += st.size;
+				continue;
+			}
+			// Stale temp file from an interrupted write — only our own shape, and
+			// only old ones, so an in-flight rename is never pulled out from under
+			// a writer.
+			if (isOwnedTempFile(name)) {
+				const st = await stat(join(store.diskDir, name));
+				if (st.isFile() && Date.now() - st.mtimeMs > 60 * 60 * 1000) {
+					await unlink(join(store.diskDir, name)).catch(() => {});
+				}
+			}
+		}
+	} catch {
+		// Missing/unreadable directory = nothing persisted yet.
+	}
+	store.diskIndex = index;
+	store.diskTotalBytes = total;
+}
+
+async function removeDiskEntry(store: ImageDataStore, key: string): Promise<void> {
+	const dir = store.diskDir;
+	if (!dir || !isRecallHash(key)) return;
+	const entry = store.diskIndex?.get(key);
+	await unlink(join(dir, `${key}.json`)).catch(() => {});
+	if (entry) {
+		store.diskIndex?.delete(key);
+		store.diskTotalBytes = Math.max(0, store.diskTotalBytes - entry.size);
+	}
+}
+
+/**
+ * Enforce the byte budget on the disk store (oldest file first, mirroring the
+ * in-memory LRU). The just-written `keep` entry is never evicted and at least
+ * one file survives an oversized budget, exactly like the memory store.
+ */
+async function evictDisk(store: ImageDataStore, keep?: string): Promise<void> {
+	if (!store.diskDir) return;
+	await loadDiskIndex(store); // fresh stats: concurrent writes may not be indexed yet
+	const index = store.diskIndex;
+	if (!index) return;
+	const budget = imageDataMaxBytes();
+	if (budget === 0) {
+		for (const key of [...index.keys()]) {
+			if (key !== keep) await removeDiskEntry(store, key);
+		}
+		return;
+	}
+	const ordered = [...index.entries()].sort(
+		(a, b) => a[1].mtimeMs - b[1].mtimeMs || a[0].localeCompare(b[0]),
+	);
+	let count = index.size;
+	while (store.diskTotalBytes > budget && count > 1) {
+		const oldest = ordered.shift();
+		if (!oldest) break;
+		if (oldest[0] === keep) continue;
+		await removeDiskEntry(store, oldest[0]);
+		count--;
+	}
+}
+
+/**
+ * Fetch retained image bytes by hash, falling back to the opt-in disk store
+ * when the in-memory copy is gone (resume/fork, LRU eviction). A disk hit is
+ * rehydrated into the in-memory store so later recalls stay cheap.
+ */
+export async function recallImageData(
+	store: ImageDataStore,
+	hash: string,
+): Promise<{ data: string; mimeType: string } | undefined> {
+	const hit = getImageData(store, hash);
+	if (hit) return hit;
+	if (!store.diskDir || imageDataMaxBytes() === 0) return undefined;
+	const key = hash.trim().toLowerCase();
+	if (!isRecallHash(key)) return undefined;
+	await flushRecallWrites(store); // a just-stored image may still be in flight
+	try {
+		const raw = await readFile(join(store.diskDir, `${key}.json`), "utf8");
+		const parsed = JSON.parse(raw) as { mimeType?: unknown; data?: unknown };
+		if (typeof parsed.mimeType !== "string" || typeof parsed.data !== "string") return undefined;
+		const entry = { data: parsed.data, mimeType: parsed.mimeType };
+		const prev = store.map.get(key);
+		if (prev) store.totalBytes = Math.max(0, store.totalBytes - Buffer.byteLength(prev.data, "base64"));
+		store.map.delete(key);
+		store.map.set(key, entry);
+		store.totalBytes += Buffer.byteLength(entry.data, "base64");
+		evictImageData(store);
+		return store.map.get(key) ?? entry;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Hashes persisted on disk for this store (newest insertion not tracked — readdir order). */
+export async function listDiskHashes(store: ImageDataStore): Promise<string[]> {
+	if (!store.diskDir || imageDataMaxBytes() === 0) return [];
+	await flushRecallWrites(store);
+	await loadDiskIndex(store);
+	return [...(store.diskIndex?.keys() ?? [])];
+}
+
+/**
+ * Prime the disk index without touching the in-memory store — called on
+ * session start so sync consumers (`#` autocomplete) can see persisted
+ * images immediately after a resume, before any async recall runs.
+ */
+export async function primeRecallDiskIndex(store: ImageDataStore): Promise<void> {
+	if (!store.diskDir || imageDataMaxBytes() === 0) return;
+	await flushRecallWrites(store);
+	await loadDiskIndex(store);
+}
+
+/** Disk hashes from the primed index, synchronously ([] when not yet primed). */
+export function cachedDiskHashes(store: ImageDataStore): string[] {
+	if (!store.diskDir || imageDataMaxBytes() === 0) return [];
+	return [...(store.diskIndex?.keys() ?? [])];
+}
+
+/** Disk-store usage for diagnostics: directory, file count, total bytes. */
+export async function diskRecallUsage(
+	store: ImageDataStore,
+): Promise<{ dir: string; count: number; bytes: number }> {
+	const dir = store.diskDir ?? "";
+	if (!dir) return { dir, count: 0, bytes: 0 };
+	await flushRecallWrites(store);
+	await loadDiskIndex(store);
+	return { dir, count: store.diskIndex?.size ?? 0, bytes: store.diskTotalBytes };
+}
+
+/**
+ * Wipe the opt-in disk store for this project (`/multimodal-proxy recall
+ * clear`). Deletes only the files this extension owns (recall records and its
+ * own temp files), never anything else in the directory — the store path is
+ * user-configurable and may be shared. Returns false when persistence is off
+ * or the removal failed.
+ */
+export async function clearDiskRecall(store: ImageDataStore): Promise<boolean> {
+	const dir = store.diskDir;
+	if (!dir) return false;
+	await flushRecallWrites(store);
+	try {
+		let names: string[] = [];
+		try {
+			names = await readdir(dir);
+		} catch (err) {
+			// Already gone = nothing left to clear, still a success.
+			if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+		}
+		for (const name of names) {
+			if (isOwnedRecallFile(name)) await unlink(join(dir, name)).catch(() => {});
+		}
+	} catch {
+		return false;
+	}
+	store.diskIndex = new Map();
+	store.diskTotalBytes = 0;
+	return true;
 }
 
 /** Fetch retained image bytes by hash, bumping recency. Undefined if not retained. */

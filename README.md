@@ -8,17 +8,17 @@ Media understanding for [Pi](https://pi.dev): images, video, audio, and YouTube 
 - **Vision for text-only models** — a large slice of Pi's catalog (DeepSeek, GLM, Nemotron, Devstral, gpt-oss, …) still has no image input. When an image reaches such a model, the extension describes it via your configured vision model, persists the description in the session, and injects it into context. The model "sees" images across turns, cached by content hash.
 - **Cheaper vision for multimodal models** — select `Multimodal Auto` and media turns escalate natively to the vision model (real pixels, no text fence; prompt caches survive the routing) while text turns stay on your base model. Pin it with `/multimodal-proxy virtual-base` to keep the cheap model after media turns too: unpinned, a text turn reuses whatever physical model handled the turn before, which after a media turn is the vision model. Or proxy every image through a flash-priced describer with mode `always`.
 - **Media memory that outlives the turn** — every image the agent can re-query gets a stable `image="<id>"`: described images (text-only base models, mode `always`, or explicit `analyze_image` calls) carry a description snippet, and pasted attachments on a vision-capable base model are retained in the recall store without a description. The agent can re-query or crop an earlier screenshot without a re-attachment ("zoom into that screenshot from before"), `#` autocompletes image ids in the prompt, and descriptions survive compaction via a recall digest. `analyze_image` answers targeted questions with locally applied crops; `generate_image` creates images that flow straight back through the same pipeline.
-- **Governed by default** — first-use data-egress consent per provider, persisted pre-consent lists, crops applied locally before upload, upload downscaling, decode-bomb protection, and recall bytes kept in memory only. See [Privacy & security](#privacy--security).
+- **Governed by default** — first-use data-egress consent per provider, persisted pre-consent lists, crops applied locally before upload, upload downscaling, decode-bomb protection, and recall bytes kept in memory only unless you opt in to local disk persistence. See [Privacy & security](#privacy--security).
 
 Media routing is automatic: content sniffing and path detection feed a pipeline with transient-error retry and model fallback on the image path (the native xAI video path is one-shot), plus compact transcript rows for `analyze_image`/`generate_image` (Pi ≥ 1.0.1).
 
-## What's new in 1.25.0
+## What's new in 1.26.0
 
-Two themes: time-based model switching (issue #42) and Pi 1.2.0 run-safety.
+One theme: recall that outlives the process.
 
-- **Scheduled model slots** — the vision, video, fallback, and virtual-base models can now resolve by wall-clock schedule, evaluated at request time. Built for flat-rate time-block subscriptions (e.g. CheapestInference: unlimited inside your 08:00–16:00 block, key errors outside), it also covers off-peak pricing, free-tier windows, and overnight heavyweight models. First match wins, windows wrap midnight, per-entry IANA timezones are DST-aware, and the status line shows `⏱ until 16:00`. See [Scheduled model slots](#scheduled-model-slots).
-- **Manual picks override temporarily** — `/multimodal-proxy model` (or `pick`, `video-model`, …) issued while a slot's schedule is active shadows it until the schedule's window ends, then the schedule resumes on its own.
-- **`before_agent_start` crash fixed on Pi ≥ 1.2.0 custom-message runs** — runs started by `pi.sendMessage(..., { triggerTurn: true })` while idle no longer hit `undefined.matchAll`; their image blocks now go through the normal proxy pipeline (described on text-only models, retained for recall on vision-capable ones).
+- **Opt-in disk-backed recall** — recall bytes were memory-only, so a resumed or forked agent kept the descriptions but lost the pixels behind `image="<id>"`. Set `PI_VISION_PROXY_RECALL_PERSIST=1` (or `PI_VISION_PROXY_RECALL_DIR=<path>`) and retained bytes are mirrored to a local, project-keyed directory; `recallImageData` pulls them back and rehydrates the in-memory LRU afterwards. Off by default, bounded by the same byte budget, never uploaded. See [Session image recall](#session-image-recall).
+- **`/multimodal-proxy recall [status|clear]`** — reports both stores (in-memory, plus the disk directory with file count and bytes) and the exact switch to enable persistence, or wipes the persisted directory in one command.
+- **Recovery after a restart** — `#` recall suggestions and the "close ids still retained" error now include disk-stored ids, and `doctor` prints the disk store next to the in-memory one.
 
 ## Release notes
 
@@ -140,6 +140,7 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
 /multimodal-proxy allowed-providers remove *|all        → remove global consent wildcard
 /multimodal-proxy allowed-providers clear              → clear the pre-consent list
 /multimodal-proxy tool on | off                        → enable/disable analyze_image tool
+/multimodal-proxy recall [status | clear]              → show / clear the opt-in disk recall store (see "Session image recall")
 /multimodal-proxy max-images-per-call <1-20>           → max images per tool call
 /multimodal-proxy max-batch <1-10>                     → max images in auto-proxy joint call
 /multimodal-proxy cache-size <0-500>                   → tool result cache entries
@@ -179,7 +180,9 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_MAX_BATCH` | 1–10 | `4` |
 | `PI_VISION_PROXY_CACHE_SIZE` | 0–500 | `50` |
 | `PI_VISION_PROXY_MAX_IMAGE_BYTES` | positive integer | `10485760` (10 MB) |
-| `PI_VISION_PROXY_IMAGE_RECALL_BYTES` | non-negative integer | `67108864` (64 MB) — in-memory budget for session image recall |
+| `PI_VISION_PROXY_IMAGE_RECALL_BYTES` | non-negative integer | `67108864` (64 MB) — budget for session image recall, applied per store (in-memory, and on disk when persistence is on) |
+| `PI_VISION_PROXY_RECALL_PERSIST` | `1`, `true`, `yes`, `on` enables disk persistence of recall bytes (survives resume/fork) | not set — recall bytes stay in memory only |
+| `PI_VISION_PROXY_RECALL_DIR` | directory for persisted recall bytes (`~` is expanded); a falsy value (`0`/`off`) forces persistence off | `~/.pi/agent/multimodal-proxy/recall/<project-key>` when persistence is enabled |
 | `PI_VISION_PROXY_ALLOW_HOME` | `1` to allow files under your home directory on non-drive platforms/volumes (persisted equivalent: `/multimodal-proxy allow-home on`) | not set |
 | `PI_VISION_PROXY_ALLOWED_FOLDERS` | list of absolute folder paths, separated by the platform path delimiter (`:` on Unix, `;` on Windows); overrides the persisted `/multimodal-proxy folders` list | not set |
 | `PI_VISION_PROXY_ALLOW_DRIVES` | `0`/`false`/`off` to disable local Windows drive paths; otherwise local drive paths like `D:\Downloads\video.mp4` are allowed | enabled by default |
@@ -247,10 +250,21 @@ it is no longer attached to the current message (e.g. *"zoom into that
 screenshot from before"*). Pasted attachments on a vision-capable base model
 are also retained (no description; labeled by filename, or by hash prefix when
 the paste carries no filename), so `#` recall works in every mode except `off`.
-The image bytes are retained **in memory only** for
+By default the image bytes are retained **in memory only** for
 the life of the session, never written to the session log or disk, and are
 evicted oldest-first once the recall budget (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`,
 default 64 MB) is exceeded.
+
+**Surviving a resume or fork (opt-in).** A process restart empties that
+in-memory store, so a resumed or forked agent can see the earlier descriptions
+but can no longer pull back the actual pixels. Two opt-in switches fix that,
+without changing the default posture:
+
+- **`PI_VISION_PROXY_RECALL_PERSIST=1`**: also write retained bytes to `~/.pi/agent/multimodal-proxy/recall/<project-key>/`. A restart finds them again, so `analyze_image` keeps working on screenshots from before the resume.
+- **Why project-keyed**: the directory name derives from the project path, so every session in this project shares its images while unrelated projects never see each other's bytes.
+- **Why opt-in**: nothing is written to disk unless you ask for it, so installs that rely on the "memory only" guarantee are unaffected.
+- **Bounded and local**: the same byte budget governs the disk store (oldest file first), the bytes never leave your machine, and `/multimodal-proxy recall clear` removes the extension's own records on demand. It never deletes unrelated files that may share the directory, and the directory and its records are created owner-only (`0700`/`0600`).
+- **`PI_VISION_PROXY_RECALL_DIR=<path>`**: pick the location yourself (`~` expands). Use a dedicated directory: only files this extension owns (its `<hash>.json` records and temp files) are ever written or deleted there. A falsy value (`off`) forces persistence off, even if `PI_VISION_PROXY_RECALL_PERSIST` is set.
 
 ## How it works — Video & Audio
 
@@ -342,7 +356,7 @@ This extension **sends data to a third-party provider**. By default that is `zai
 9. **Upload downscale** — oversized images (>2048 px long edge or >5 MB by default) are downscaled and re-encoded as JPEG **before** upload; only the shrunken payload leaves the machine.
 10. **Decode bomb protection** — images exceeding 16 384 × 16 384 pixels are rejected before full decode to prevent memory exhaustion.
 11. **Telemetry sanitisation** — all fields logged in session entries (question, reason) are stripped of control characters and length-limited to 200 characters.
-12. **Session image recall** — to support re-querying an earlier image, the raw image bytes are retained **in process memory only**, never persisted to the session log or disk. The store is bounded (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`, default 64 MB) with oldest-first eviction, and is discarded when the process exits — it does not survive a resume or fork.
+12. **Session image recall** — to support re-querying an earlier image, the raw image bytes are retained **in process memory only** by default: never written to the session log or disk. The store is bounded (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`, default 64 MB) with oldest-first eviction and is discarded when the process exits, so it does not survive a resume or fork. **Opt-in disk persistence** (`PI_VISION_PROXY_RECALL_PERSIST=1`, or `PI_VISION_PROXY_RECALL_DIR=<path>`) additionally writes those bytes to a local, project-keyed directory under `~/.pi/agent/multimodal-proxy/recall/` so a resumed session can recall the actual pixels instead of only the description. It is off by default, uploaded nowhere, bounded by the same budget with oldest-first file eviction, and wiped on demand by `/multimodal-proxy recall clear` (which deletes only the extension's own records, never other contents of the directory). The session log never receives image bytes, with or without persistence.
 
 For the full security audit see [`SECURITY-REVIEW.md`](./SECURITY-REVIEW.md).
 
