@@ -9,7 +9,7 @@
 
 import { strict as assert } from "node:assert";
 import { after, describe, it } from "node:test";
-import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { delimiter, join, parse } from "node:path";
 import {
@@ -97,6 +97,12 @@ import {
 	storeImageData,
 	getImageData,
 	createImageDataStore,
+	recallImageData,
+	resolveRecallDir,
+	flushRecallWrites,
+	listDiskHashes,
+	diskRecallUsage,
+	clearDiskRecall,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
@@ -754,6 +760,158 @@ describe("session image recall store", () => {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
 		}
+	});
+});
+
+describe("disk-backed recall persistence (1.26.0)", () => {
+	const HASH_A = "0123456789abcdef0123456789abcdef";
+	const HASH_B = "89abcdef0123456789abcdef01234567";
+	const HASH_C = "fedcba9876543210fedcba9876543210";
+
+	it("is off by default — memory-only, matching the documented posture", async () => {
+		const store = createImageDataStore(null);
+		assert.equal(store.diskDir, undefined);
+		assert.equal(store.diskTotalBytes, 0);
+		assert.deepEqual(await listDiskHashes(store), []);
+	});
+
+	it("resolveRecallDir: DIR override wins, falsy literal disables, ~ expands", () => {
+		assert.equal(resolveRecallDir({ PI_VISION_PROXY_RECALL_DIR: "/data/recall" }, "/p"), "/data/recall");
+		assert.equal(
+			resolveRecallDir({ PI_VISION_PROXY_RECALL_PERSIST: "1", PI_VISION_PROXY_RECALL_DIR: "/data/recall" }, "/p"),
+			"/data/recall",
+		);
+		assert.equal(
+			resolveRecallDir({ PI_VISION_PROXY_RECALL_PERSIST: "1", PI_VISION_PROXY_RECALL_DIR: "off" }, "/p"),
+			undefined,
+		);
+		assert.equal(resolveRecallDir({ PI_VISION_PROXY_RECALL_DIR: "~/recall" }, "/p"), join(os.homedir(), "recall"));
+		assert.equal(resolveRecallDir({}, "/p"), undefined);
+		assert.equal(resolveRecallDir({ PI_VISION_PROXY_RECALL_PERSIST: "0" }, "/p"), undefined);
+	});
+
+	it("resolveRecallDir: default dir is stable per project path", () => {
+		const env = { PI_VISION_PROXY_RECALL_PERSIST: "1" };
+		const a = resolveRecallDir(env, "/projects/alpha");
+		const a2 = resolveRecallDir(env, "/projects/alpha");
+		const b = resolveRecallDir(env, "/projects/beta");
+		assert.ok(a?.includes(join("multimodal-proxy", "recall")), `unexpected default dir: ${a}`);
+		assert.equal(a, a2);
+		assert.notEqual(a, b);
+	});
+
+	it("persists bytes and recalls them from a fresh store (resume/fork)", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		try {
+			const data = Buffer.from("hello recall").toString("base64");
+			const s1 = createImageDataStore(dir);
+			assert.equal(s1.diskDir, dir);
+			storeImageData(s1, HASH_A, data, "image/webp");
+			await flushRecallWrites(s1);
+			assert.deepEqual(await readdir(dir), [`${HASH_A}.json`]);
+
+			// A resumed/forked session starts with an empty in-memory store…
+			const s2 = createImageDataStore(dir);
+			assert.equal(getImageData(s2, HASH_A), undefined);
+			const got = await recallImageData(s2, HASH_A);
+			assert.deepEqual(got, { data, mimeType: "image/webp" });
+			// …and the disk hit is rehydrated into memory for later recalls.
+			assert.deepEqual(getImageData(s2, HASH_A), { data, mimeType: "image/webp" });
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects malformed ids and misses without creating files", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		try {
+			const store = createImageDataStore(dir);
+			assert.equal(await recallImageData(store, "../escape"), undefined);
+			assert.equal(await recallImageData(store, "a".repeat(31)), undefined);
+			assert.equal(await recallImageData(store, HASH_B), undefined);
+			// An unvalidated id never reaches the disk path either.
+			storeImageData(store, "../../evil", "QUJD", "image/png");
+			await flushRecallWrites(store);
+			assert.deepEqual(await readdir(dir), []);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("enforces the byte budget on disk, oldest first", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		try {
+			// Disk budget counts the stored JSON file size, written with the same
+			// shape: one image fits twice, three do not.
+			const per = Buffer.byteLength(JSON.stringify({ mimeType: "image/png", data: "AAAAAAAA" }));
+			process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = String(per * 2 + 1);
+			const store = createImageDataStore(dir);
+			const put = async (hash: string, mtimeMs: number) => {
+				storeImageData(store, hash, "AAAAAAAA", "image/png");
+				await flushRecallWrites(store);
+				await utimes(join(dir, `${hash}.json`), new Date(mtimeMs), new Date(mtimeMs));
+			};
+			const now = Date.now();
+			await put(HASH_A, now - 10_000);
+			await put(HASH_B, now - 9_000);
+			await put(HASH_C, now - 8_000); // 3 files > budget → oldest (HASH_A) evicted
+
+			// Assert against a fresh store so only the disk state is under test.
+			const s2 = createImageDataStore(dir);
+			const hashes = await listDiskHashes(s2);
+			assert.equal(hashes.length, 2);
+			assert.ok(!hashes.includes(HASH_A));
+			assert.ok(hashes.includes(HASH_B));
+			assert.ok(hashes.includes(HASH_C));
+			assert.equal(await recallImageData(s2, HASH_A), undefined);
+			assert.deepEqual(await recallImageData(s2, HASH_C), { data: "AAAAAAAA", mimeType: "image/png" });
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not persist when the recall budget is 0", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		try {
+			process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "0";
+			const store = createImageDataStore(dir);
+			storeImageData(store, HASH_A, "AAAAAAAA", "image/png");
+			await flushRecallWrites(store);
+			assert.equal(store.map.size, 0);
+			assert.deepEqual(await readdir(dir), []);
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("clearDiskRecall wipes the project directory; usage reports it", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		try {
+			const store = createImageDataStore(dir);
+			storeImageData(store, HASH_A, "AAAAAAAA", "image/png");
+			await flushRecallWrites(store);
+			const usage = await diskRecallUsage(store);
+			assert.equal(usage.dir, dir);
+			assert.equal(usage.count, 1);
+			assert.ok(usage.bytes > 0);
+
+			assert.equal(await clearDiskRecall(store), true);
+			assert.equal((await diskRecallUsage(store)).count, 0);
+			const fresh = createImageDataStore(dir);
+			assert.equal(await recallImageData(fresh, HASH_A), undefined);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("clearDiskRecall is a no-op when persistence is off", async () => {
+		assert.equal(await clearDiskRecall(createImageDataStore(null)), false);
 	});
 });
 
