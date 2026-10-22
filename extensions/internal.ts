@@ -4,7 +4,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, parse, relative } from "node:path";
 import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
@@ -245,6 +245,16 @@ function isRecallHash(hash: string): boolean {
 	return new RegExp(`^[a-f0-9]{${HASH_HEX_LEN}}$`, "i").test(hash);
 }
 
+/** True for a temp file this extension writes (`.<hash>.<pid>.<rand>.tmp`). */
+function isOwnedTempFile(name: string): boolean {
+	return new RegExp(`^\\.[a-f0-9]{${HASH_HEX_LEN}}\\.[0-9a-z]+\\.[0-9a-z]+\\.tmp$`, "i").test(name);
+}
+
+/** True for a file this extension owns: a recall record or one of its temp files. */
+function isOwnedRecallFile(name: string): boolean {
+	return (name.endsWith(".json") && isRecallHash(name.slice(0, -".json".length))) || isOwnedTempFile(name);
+}
+
 /**
  * Resolve the opt-in disk-backed recall directory (1.26.0), or undefined when
  * persistence is off — the default, which keeps recall bytes memory-only.
@@ -349,17 +359,31 @@ function persistImageData(store: ImageDataStore, hash: string, data: string, mim
 	// Never build a path from anything but a well-formed recall id (defense in
 	// depth: callers normally pass hashImageData output).
 	if (!isRecallHash(key)) return;
+	let tmp: string | undefined;
 	const write = (async () => {
 		try {
-			await mkdir(dir, { recursive: true });
-			const tmp = join(dir, `.${key}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
+			// Owner-only modes: the store holds raw screenshots and pasted images.
+			await mkdir(dir, { recursive: true, mode: 0o700 });
+			tmp = join(dir, `.${key}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
 			// Single JSON file per image, written atomically (tmp + rename) so a
 			// crash can never leave a half-written record behind.
-			await writeFile(tmp, JSON.stringify({ mimeType, data }), "utf8");
-			await rename(tmp, join(dir, `${key}.json`));
+			await writeFile(tmp, JSON.stringify({ mimeType, data }), { encoding: "utf8", mode: 0o600 });
+			const target = join(dir, `${key}.json`);
+			try {
+				await rename(tmp, target);
+			} catch {
+				// Windows can refuse to rename onto an existing or locked destination
+				// (EPERM/EEXIST, e.g. a fresh store re-persisting a hash after a
+				// resume) — drop ours and retry once.
+				await unlink(target).catch(() => {});
+				await rename(tmp, target);
+			}
 			await evictDisk(store, key);
 		} catch {
-			// Persistence is a convenience — swallow and keep the memory copy.
+			// Persistence is a convenience — swallow and keep the memory copy. Also
+			// drop the temp file: it sits outside the byte budget, so a leak would be
+			// unbounded.
+			if (tmp) await unlink(tmp).catch(() => {});
 		}
 	})();
 	const tracked: Promise<void> = write.finally(() => store.pending.delete(tracked));
@@ -389,9 +413,10 @@ async function loadDiskIndex(store: ImageDataStore): Promise<void> {
 				total += st.size;
 				continue;
 			}
-			// Stale temp file from an interrupted write — only clean up old ones
-			// so an in-flight rename is never pulled out from under a writer.
-			if (name.startsWith(".") && name.endsWith(".tmp")) {
+			// Stale temp file from an interrupted write — only our own shape, and
+			// only old ones, so an in-flight rename is never pulled out from under
+			// a writer.
+			if (isOwnedTempFile(name)) {
 				const st = await stat(join(store.diskDir, name));
 				if (st.isFile() && Date.now() - st.mtimeMs > 60 * 60 * 1000) {
 					await unlink(join(store.diskDir, name)).catch(() => {});
@@ -499,13 +524,26 @@ export async function diskRecallUsage(
 
 /**
  * Wipe the opt-in disk store for this project (`/multimodal-proxy recall
- * clear`). Returns false when persistence is off or the removal failed.
+ * clear`). Deletes only the files this extension owns (recall records and its
+ * own temp files), never anything else in the directory — the store path is
+ * user-configurable and may be shared. Returns false when persistence is off
+ * or the removal failed.
  */
 export async function clearDiskRecall(store: ImageDataStore): Promise<boolean> {
-	if (!store.diskDir) return false;
+	const dir = store.diskDir;
+	if (!dir) return false;
 	await flushRecallWrites(store);
 	try {
-		await rm(store.diskDir, { recursive: true, force: true });
+		let names: string[] = [];
+		try {
+			names = await readdir(dir);
+		} catch (err) {
+			// Already gone = nothing left to clear, still a success.
+			if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+		}
+		for (const name of names) {
+			if (isOwnedRecallFile(name)) await unlink(join(dir, name)).catch(() => {});
+		}
 	} catch {
 		return false;
 	}

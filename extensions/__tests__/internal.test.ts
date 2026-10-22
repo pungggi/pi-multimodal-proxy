@@ -890,7 +890,7 @@ describe("disk-backed recall persistence (1.26.0)", () => {
 		}
 	});
 
-	it("clearDiskRecall wipes the project directory; usage reports it", async () => {
+	it("clearDiskRecall removes only its own files, leaving the directory intact", async () => {
 		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
 		try {
 			const store = createImageDataStore(dir);
@@ -901,10 +901,35 @@ describe("disk-backed recall persistence (1.26.0)", () => {
 			assert.equal(usage.count, 1);
 			assert.ok(usage.bytes > 0);
 
+			// A user-chosen PI_VISION_PROXY_RECALL_DIR may hold unrelated files —
+			// they must survive `recall clear`.
+			await writeFile(join(dir, "keepme.png"), "precious");
 			assert.equal(await clearDiskRecall(store), true);
+			assert.deepEqual(await readdir(dir), ["keepme.png"]);
 			assert.equal((await diskRecallUsage(store)).count, 0);
 			const fresh = createImageDataStore(dir);
 			assert.equal(await recallImageData(fresh, HASH_A), undefined);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans up only its own stale temp files, ignoring foreign ones", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "mmp-recall-"));
+		try {
+			const staleName = `.${HASH_A}.${process.pid}.abc.tmp`;
+			const foreignName = ".notes.tmp";
+			const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+			await writeFile(join(dir, staleName), "partial");
+			await utimes(join(dir, staleName), twoHoursAgo, twoHoursAgo);
+			await writeFile(join(dir, foreignName), "not ours");
+			await utimes(join(dir, foreignName), twoHoursAgo, twoHoursAgo);
+
+			const store = createImageDataStore(dir);
+			await listDiskHashes(store); // forces an index load + stale-temp sweep
+			const names = await readdir(dir);
+			assert.ok(!names.includes(staleName));
+			assert.ok(names.includes(foreignName));
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
