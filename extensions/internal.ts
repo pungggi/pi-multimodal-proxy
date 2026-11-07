@@ -2823,6 +2823,60 @@ export interface ReadImageResult {
 	reason?: ReadImageReason;
 	bytes?: number;
 	filename?: string; // basename of the file
+	/**
+	 * Preview of the file's first bytes (rendered text, or a hex dump when the
+	 * content is binary) when the read failed. Set for "invalid-image" and
+	 * post-read "not-an-image" so the caller's error can show *what* the file
+	 * actually starts with instead of only "extension does not match contents".
+	 */
+	head?: string;
+}
+
+/** Number of leading bytes rendered in a read-failure head preview. */
+const HEAD_PREVIEW_BYTES = 80;
+
+/**
+ * Render the first bytes of a failed read as a short, terminal-safe preview.
+ *
+ * Why: "extension does not match contents" is undiagnosable on its own. The
+ * motivating case was `adb exec-out screencap -p > file.png`, where the adb
+ * client printed `[Warning] Multiple displays were found...` to stdout BEFORE
+ * the PNG stream — the file began with ASCII text, and the error gave no hint
+ * of it. Surfacing the head turns a cryptic mismatch into an obvious one.
+ *
+ * Mostly-printable content is returned as a single line (newlines collapsed,
+ * control characters and quotes escaped so the preview stays one line and
+ * cannot break out of the surrounding error text). Anything else falls back to
+ * a hex dump of the first 16 bytes so a wrong magic-number signature is visible.
+ */
+export function describeFileHead(content: Uint8Array, maxBytes = HEAD_PREVIEW_BYTES): string {
+	if (content.length === 0) return "";
+	const slice = content.subarray(0, maxBytes);
+	const text = new TextDecoder("utf-8").decode(slice);
+	let printable = 0;
+	let total = 0;
+	for (const ch of text) {
+		total++;
+		const code = ch.codePointAt(0)!;
+		// U+FFFD is what TextDecoder yields for invalid UTF-8 — binary bytes,
+		// so they must not count as printable or the hex fallback never fires.
+		if (code === 0xfffd) continue;
+		if (code === 0x09 || (code >= 0x20 && code !== 0x7f)) printable++;
+	}
+	if (total === 0 || printable / total < 0.85) {
+		const hex = Array.from(slice.subarray(0, 16), (b) => b.toString(16).padStart(2, "0")).join(" ");
+		return content.length > 16 ? `${hex} ...` : hex;
+	}
+	const oneLine = text
+		.replace(/[\r\n]+/g, " ")
+		.replace(/\t/g, " ")
+		.replace(/[\u0000-\u001f\u007f\\"]/g, (c) => {
+			if (c === "\\") return "\\\\";
+			if (c === '"') return '\\"';
+			return `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`;
+		})
+		.trim();
+	return content.length > maxBytes ? `${oneLine}…` : oneLine;
 }
 
 async function canonical(p: string | undefined): Promise<string | null> {
@@ -2971,9 +3025,9 @@ export async function readImageFileWithReason(
 	}
 	const decision = decideImageMime(mimeType, sniffed, content);
 	if (decision.reject) {
-		return { image: null, reason: "invalid-image", bytes: content.length, filename: basename(filePath) };
+		return { image: null, reason: "invalid-image", bytes: content.length, filename: basename(filePath), head: describeFileHead(content) };
 	}
-	if (!decision.mime) return { image: null, reason: "not-an-image", bytes: content.length };
+	if (!decision.mime) return { image: null, reason: "not-an-image", bytes: content.length, head: describeFileHead(content) };
 	return {
 		image: { type: "image", data: content.toString("base64"), mimeType: decision.mime },
 		bytes: content.length,

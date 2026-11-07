@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.26.1] - 2026-11-07
+
+### Changed
+
+- **Read-failure errors now show what the file actually starts with** — `analyze_image` (and the path-detection / `describe` notifications) used to answer `could not read image: file contents are not a recognized image (extension does not match contents)` with no clue about the actual contents, which is undiagnosable when the file is a capture that got polluted: a real session hit `adb exec-out screencap -p > file.png` where adb (platform-tools 35.x) printed `[Warning] Multiple displays were found, but no display id was specified!` to **stdout before the PNG stream**, so the file began with ASCII text and every retry just repeated the generic mismatch. The reader now attaches a `head` preview of the first 80 bytes to `invalid-image` and post-read `not-an-image` results, and `describeReadReason` appends it as `; starts with: "…"`. The preview is rendered for diagnosis, not for parsing: mostly-printable content is collapsed to a single line with control characters, backslashes and quotes escaped (it sits inside a quoted error string, so it must not break out or inject newlines), and anything else falls back to a hex dump of the first 16 bytes so a wrong magic-number signature is visible at a glance. Invalid UTF-8 (what `TextDecoder` yields for raw binary) deliberately does not count as printable, or the hex fallback would never fire. Six new tests (626 total, all green; syntax check clean): the two `readImageFileWithReason` previews and `describeFileHead` covering text collapse, escaping, hex fallback, truncation markers at both budgets, and empty content.
+
 ## [1.26.0] - 2026-10-21
 
 ### Added
