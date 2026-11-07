@@ -2825,9 +2825,12 @@ export interface ReadImageResult {
 	filename?: string; // basename of the file
 	/**
 	 * Preview of the file's first bytes (rendered text, or a hex dump when the
-	 * content is binary) when the read failed. Set for "invalid-image" and
-	 * post-read "not-an-image" so the caller's error can show *what* the file
-	 * actually starts with instead of only "extension does not match contents".
+	 * content is binary) when the read failed. Set ONLY for "invalid-image"
+	 * (extension claimed an image, contents didn't match), so the caller's
+	 * error can show *what* the file actually starts with instead of only
+	 * "extension does not match contents". Deliberately never set for
+	 * post-read "not-an-image": that file may be arbitrary (e.g. `.env`) and
+	 * returning its bytes to the model would be content disclosure.
 	 */
 	head?: string;
 }
@@ -3027,7 +3030,13 @@ export async function readImageFileWithReason(
 	if (decision.reject) {
 		return { image: null, reason: "invalid-image", bytes: content.length, filename: basename(filePath), head: describeFileHead(content) };
 	}
-	if (!decision.mime) return { image: null, reason: "not-an-image", bytes: content.length, head: describeFileHead(content) };
+	// No `head` for post-read "not-an-image": the extension never claimed to be
+	// an image, so the file may be arbitrary (e.g. `.env`) — returning its bytes
+	// in the error would hand the model a content-disclosure channel that the
+	// old generic "unsupported extension" message did not open (CodeRabbit,
+	// PR #46). The diagnosis that motivated the preview (adb's stdout warning
+	// prepended to a `.png`) is always an `invalid-image`.
+	if (!decision.mime) return { image: null, reason: "not-an-image", bytes: content.length };
 	return {
 		image: { type: "image", data: content.toString("base64"), mimeType: decision.mime },
 		bytes: content.length,

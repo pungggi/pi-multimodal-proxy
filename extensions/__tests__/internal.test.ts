@@ -2019,16 +2019,17 @@ describe("readImageFileWithReason", () => {
 		}
 	});
 
-	it("carries a head preview when the contents are not-an-image", async () => {
+	it("does NOT leak a head preview for post-read not-an-image (content disclosure)", async () => {
 		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
-		const file = join(dir, "mystery.bin");
-		const contents = Buffer.from("[Warning] Multiple displays were found, but no display id was specified!");
-		await writeFile(file, contents);
+		const file = join(dir, "secrets.env");
+		await writeFile(file, Buffer.from("API_KEY=hunter2"));
 		try {
 			const r = await readImageFileWithReason(file, undefined, async () => null);
 			assert.equal(r.image, null);
 			assert.equal(r.reason, "not-an-image");
-			assert.ok(r.head?.startsWith("[Warning] Multiple displays"), `head=${JSON.stringify(r.head)}`);
+			// The extension never claimed to be an image — the error must stay
+			// generic or the tool becomes a content-disclosure channel.
+			assert.equal(r.head, undefined);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

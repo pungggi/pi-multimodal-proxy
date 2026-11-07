@@ -1293,7 +1293,9 @@ function describeReadReason(reason: ReadImageReason, bytes?: number, head?: stri
 		case "too-large":
 			return `${bytes ?? "?"} bytes exceeds limit (override with PI_VISION_PROXY_MAX_IMAGE_BYTES)`;
 		case "not-an-image":
-			return "unsupported extension" + headHint;
+			// head is never set for this reason (see ReadImageResult.head) —
+			// keep the message generic: no content disclosure to the model.
+			return "unsupported extension";
 		case "invalid-image":
 			return "file contents are not a recognized image (extension does not match contents — e.g. a non-image renamed to .png)" + headHint;
 		default:
