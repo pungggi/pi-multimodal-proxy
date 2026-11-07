@@ -77,6 +77,7 @@ import {
 	hammingDistance,
 	computePHash,
 	cropImage,
+	describeFileHead,
 	shutdownCropWorkers,
 	piAiImageToBuffer,
 	bufferToPiAiImage,
@@ -1858,6 +1859,34 @@ describe("pathAccessFromConfig", () => {
 	});
 });
 
+describe("describeFileHead", () => {
+	it("renders printable text as a single line with newlines collapsed", () => {
+		const head = describeFileHead(Buffer.from("[Warning] Multiple displays\nwere found\r\n"));
+		assert.equal(head, "[Warning] Multiple displays were found");
+	});
+
+	it("escapes control characters and quotes so the preview stays one line", () => {
+		const head = describeFileHead(Buffer.from('bad\x00"quote"\\path'));
+		assert.equal(head, 'bad\\x00\\"quote\\"\\\\path');
+	});
+
+	it("falls back to a hex dump for binary content", () => {
+		const head = describeFileHead(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3]));
+		assert.equal(head, "89 50 4e 47 0d 0a 1a 0a 00 01 02 03");
+	});
+
+	it("marks truncation at the byte budget (text) and beyond 16 bytes (hex)", () => {
+		const longText = "a".repeat(120);
+		assert.ok(describeFileHead(Buffer.from(longText)).endsWith("…"));
+		const longBin = new Uint8Array(32).fill(0xab);
+		assert.ok(describeFileHead(longBin).endsWith(" ..."));
+	});
+
+	it("returns an empty string for empty content", () => {
+		assert.equal(describeFileHead(new Uint8Array(0)), "");
+	});
+});
+
 describe("readImageFileWithReason", () => {
 	it("reads valid PNG inside tmpdir", async () => {
 		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
@@ -1982,6 +2011,25 @@ describe("readImageFileWithReason", () => {
 			assert.equal(r.image, null);
 			assert.equal(r.reason, "invalid-image");
 			assert.equal(r.bytes, contents.length);
+			// Head preview: the error must show what the file actually starts with
+			// (adb-screencap-style stdout warnings prepended to the payload).
+			assert.equal(r.head, "this is actually text, not an image");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does NOT leak a head preview for post-read not-an-image (content disclosure)", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "secrets.env");
+		await writeFile(file, Buffer.from("API_KEY=hunter2"));
+		try {
+			const r = await readImageFileWithReason(file, undefined, async () => null);
+			assert.equal(r.image, null);
+			assert.equal(r.reason, "not-an-image");
+			// The extension never claimed to be an image — the error must stay
+			// generic or the tool becomes a content-disclosure channel.
+			assert.equal(r.head, undefined);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

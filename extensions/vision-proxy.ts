@@ -1277,7 +1277,12 @@ async function withProgress<T>(
 /** Cached config loaded from persistent file on startup */
 let _fileConfig: Partial<VisionConfig> = {};
 
-function describeReadReason(reason: ReadImageReason, bytes?: number): string {
+function describeReadReason(reason: ReadImageReason, bytes?: number, head?: string): string {
+	// Head preview: what the file actually starts with (text or hex). This is
+	// the difference between "extension does not match contents" and seeing
+	// `[Warning] Multip...` — e.g. an adb screencap warning line that got
+	// prepended to the PNG stream.
+	const headHint = head ? `; starts with: "${head}"` : "";
 	switch (reason) {
 		case "denied":
 			return "path outside allowed directories (tmp / cwd / local Windows drives; grant more with /multimodal-proxy folders add <path> or /multimodal-proxy allow-home on)";
@@ -1288,9 +1293,11 @@ function describeReadReason(reason: ReadImageReason, bytes?: number): string {
 		case "too-large":
 			return `${bytes ?? "?"} bytes exceeds limit (override with PI_VISION_PROXY_MAX_IMAGE_BYTES)`;
 		case "not-an-image":
+			// head is never set for this reason (see ReadImageResult.head) —
+			// keep the message generic: no content disclosure to the model.
 			return "unsupported extension";
 		case "invalid-image":
-			return "file contents are not a recognized image (extension does not match contents — e.g. a non-image renamed to .png)";
+			return "file contents are not a recognized image (extension does not match contents — e.g. a non-image renamed to .png)" + headHint;
 		default:
 			return reason;
 	}
@@ -2464,7 +2471,7 @@ async function handleAnalyzeImage(
 		}
 		const r = await readImageFileWithReason(ref, pathAccessFromConfig(config), sniffImageFile);
 		if (!r.image) {
-			return analysisError(`Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`);
+			return analysisError(`Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes, r.head)}`);
 		}
 		const hash = hashImageData(r.image.data);
 		storeImageMeta(imageMeta, hash, r.image.data, r.filename);
@@ -3431,7 +3438,7 @@ export default function (pi: ExtensionAPI) {
 					storeImageData(imageData, hash, r.image.data, r.image.mimeType);
 				} else if (r.reason && r.reason !== "not-an-image") {
 					ctx.ui.notify(
-						`[multimodal-proxy] Skipped ${fp}: ${describeReadReason(r.reason, r.bytes)}`,
+						`[multimodal-proxy] Skipped ${fp}: ${describeReadReason(r.reason, r.bytes, r.head)}`,
 						"warning",
 					);
 				}
@@ -5398,7 +5405,7 @@ Use "*" or "all" to grant consent for all providers globally.`,
 					}
 					const r = await readImageFileWithReason(ref, pathAccessFromConfig(effective), sniffImageFile);
 					if (!r.image) {
-						ctx.ui.notify(`[multimodal-proxy] Could not read image: ${ref} (${describeReadReason(r.reason ?? "not-an-image", r.bytes)})`, "error");
+						ctx.ui.notify(`[multimodal-proxy] Could not read image: ${ref} (${describeReadReason(r.reason ?? "not-an-image", r.bytes, r.head)})`, "error");
 						return;
 					}
 					const hash = hashImageData(r.image.data);
