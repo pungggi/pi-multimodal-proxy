@@ -1,0 +1,80 @@
+name: AI PR Review
+
+# Per-Repo-Variante (standalone): Review bei PR-Öffnung/Reopen im Zeitblock.
+# Voraussetzungen in DIESEM Repo:
+#   - Secret CHEAPESTINFERENCE_API_KEY
+#   - Optional: Variablen AI_REVIEW_SLOT_START/END (UTC-Stunden), AI_API_BASE, AI_MODEL
+# Für PRs, die außerhalb des Zeitblocks GEÖFFNET werden, zusätzlich den
+# ai-review-sweep.yml installieren (oder den zentralen Sweep in pungggi/ai-review nutzen).
+
+# Trigger-Politik (2026-11-03, Issue pungggi/ai-review#2): KEIN synchronize —
+# jeder Fix-Push feuerte sonst automatisch das nächste Review und der Loop
+# trug sich selbst (ztilt#24: 17+ Runden). Re-Review ist bewusst manuell:
+# workflow_dispatch (umgeht auch den Slot-Check). Referenz-Stub: ztilt cfeec3d.
+on:
+  pull_request:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR-Nummer (optional; leer = PR des aktuellen Branches)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Manuelle Mehrfach-Auslösungen desselben PRs stapeln nicht: die neueste gewinnt.
+  group: ai-review-${{ inputs.pr_number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Slot-Check (CheapestInference Zeitblock)
+        id: slot
+        run: |
+          START="${{ vars.AI_REVIEW_SLOT_START }}"
+          END="${{ vars.AI_REVIEW_SLOT_END }}"
+          if [ -z "$START" ] || [ -z "$END" ]; then
+            echo "Kein Slot gesetzt — Review läuft jederzeit."
+            echo "in_slot=true" >> "$GITHUB_OUTPUT"
+          elif ! [[ "$START" =~ ^[0-9]+$ && "$END" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Slot-Variablen nicht numerisch (START='$START' END='$END') — Review läuft jederzeit."
+            echo "in_slot=true" >> "$GITHUB_OUTPUT"
+          else
+            H=$(date -u +%H); H=$((10#$H)); S=$((10#$START)); E=$((10#$END))
+            if [ "$S" -lt "$E" ]; then
+              if [ "$H" -ge "$S" ] && [ "$H" -lt "$E" ]; then IN=true; else IN=false; fi
+            else
+              if [ "$H" -ge "$S" ] || [ "$H" -lt "$E" ]; then IN=true; else IN=false; fi
+            fi
+            echo "UTC-Stunde $H, Slot $START-$END → in_slot=$IN"
+            if [ "$IN" = "false" ]; then
+              echo "::notice::Außerhalb des Review-Slots ($START-$END UTC) — der Sweep holt diesen PR als First-Review nach (nie gereviewete PRs only). Manuelles Re-Review: Run workflow."
+            fi
+            echo "in_slot=$IN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review ausführen
+        # Manueller Re-Review umgeht den Slot (analog review.yml, 1735e64):
+        # workflow_dispatch ist der dokumentierte Weg, ein Review zu ERZWINGEN —
+        # er muss auch außerhalb des Blocks laufen. Event-getriebene Runs
+        # (pull_request) skippen außerhalb des Blocks sauber; der Sweep holt nach.
+        if: steps.slot.outputs.in_slot == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHEAPESTINFERENCE_API_KEY: ${{ secrets.CHEAPESTINFERENCE_API_KEY }}
+          AI_API_BASE: ${{ vars.AI_API_BASE }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_LANGUAGE: ${{ vars.AI_LANGUAGE }}
+          AI_REVIEW_INCLUDE_DRAFTS: ${{ vars.AI_REVIEW_INCLUDE_DRAFTS }}
+        run: python3 .github/scripts/ai_review.py
