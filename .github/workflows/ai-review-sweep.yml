@@ -1,0 +1,69 @@
+name: AI PR Review Sweep
+
+# Per-Repo-Nachzieh-Sweep: reviewt PRs, deren HEAD neuer ist als das letzte
+# Review. Fängt Pushes ab, die außerhalb des CheapestInference-Zeitblocks
+# gemacht wurden. Optional — alternativ reicht der zentrale Sweep in
+# pungggi/ai-review (dann diese Datei weglassen).
+#
+# Cron-Regeln (aus den Re-Arming-Sagen im Zentral-Repo, 2026-11-02/03):
+# - EINE cron-Zeile = EINE Registration; Komma-Range in einem Ausdruck ist ok,
+#   zwei cron-Einträge waren die Stumm-Registrations-Falle.
+# - Immer unter schedule: einrücken (nicht auf on:-Ebene).
+# - Nach jeder Änderung an Triggern: dispatch-Test machen.
+
+on:
+  schedule:
+    # Americas-Block 17–1 UTC (Slot-Ende exklusiv, wie im Slot-Check).
+    # Andere Blöcke: Asia-Pacific 00–08 UTC · Europe 08–16 UTC.
+    - cron: "*/20 0-1,17-23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Slot-Check (CheapestInference Zeitblock)
+        id: slot
+        run: |
+          START="${{ vars.AI_REVIEW_SLOT_START }}"
+          END="${{ vars.AI_REVIEW_SLOT_END }}"
+          if [ -z "$START" ] || [ -z "$END" ]; then
+            echo "Kein Slot gesetzt — Sweep läuft jederzeit."
+            echo "in_slot=true" >> "$GITHUB_OUTPUT"
+          elif ! [[ "$START" =~ ^[0-9]+$ && "$END" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Slot-Variablen nicht numerisch (START='$START' END='$END') — Sweep läuft jederzeit."
+            echo "in_slot=true" >> "$GITHUB_OUTPUT"
+          else
+            H=$(date -u +%H); H=$((10#$H)); S=$((10#$START)); E=$((10#$END))
+            if [ "$S" -lt "$E" ]; then
+              if [ "$H" -ge "$S" ] && [ "$H" -lt "$E" ]; then IN=true; else IN=false; fi
+            else
+              if [ "$H" -ge "$S" ] || [ "$H" -lt "$E" ]; then IN=true; else IN=false; fi
+            fi
+            echo "UTC-Stunde $H, Slot $START-$END → in_slot=$IN"
+            echo "in_slot=$IN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sweep ausführen
+        if: steps.slot.outputs.in_slot == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHEAPESTINFERENCE_API_KEY: ${{ secrets.CHEAPESTINFERENCE_API_KEY }}
+          SWEEP: "1"
+          AI_API_BASE: ${{ vars.AI_API_BASE }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_LANGUAGE: ${{ vars.AI_LANGUAGE }}
+          AI_REVIEW_INCLUDE_DRAFTS: ${{ vars.AI_REVIEW_INCLUDE_DRAFTS }}
+        run: python3 .github/scripts/ai_review.py
