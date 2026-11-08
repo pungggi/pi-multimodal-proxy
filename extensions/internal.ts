@@ -1596,6 +1596,17 @@ export function browserProfileCandidates(
 }
 
 /**
+ * Version-probe flag for an external CLI (doctor's toolVersion). The
+ * FFmpeg family parses single-dash options only: `ffmpeg --version` prints its
+ * banner to stderr and exits non-zero (8 on current builds), which execFile
+ * surfaces as a rejection so doctor misreports an installed ffmpeg as "not
+ * found". Everything else probed (yt-dlp) is GNU-style and wants `--version`.
+ */
+export function versionProbeArg(bin: string): string {
+	return bin === "ffmpeg" || bin === "ffprobe" ? "-version" : "--version";
+}
+
+/**
  * Reduce an execFile failure dump to the single actionable yt-dlp line: the
  * last `ERROR: …` from stderr, else the last non-empty line. Keeps user-facing
  * notifications to one line instead of echoing the full command (1.24.0).

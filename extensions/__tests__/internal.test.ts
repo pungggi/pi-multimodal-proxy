@@ -56,6 +56,7 @@ import {
 	sanitizeYtdlpExtractorArgs,
 	browserProfileCandidates,
 	summarizeYtDlpError,
+	versionProbeArg,
 	sanitizeProviderHeaders,
 	YTDLP_COOKIES_BROWSERS,
 	pathAccessFromConfig,
@@ -431,6 +432,20 @@ describe("summarizeYtDlpError", () => {
 	});
 	it("returns the message itself when it has no non-empty lines", () => {
 		assert.equal(summarizeYtDlpError(""), "");
+	});
+});
+
+describe("versionProbeArg", () => {
+	it("uses single-dash -version for the ffmpeg family (issue #45)", () => {
+		// ffmpeg --version prints its banner to stderr and exits non-zero
+		// (8 on current builds), so execFile rejects and doctor reported
+		// "not found" for a perfectly installed binary.
+		assert.equal(versionProbeArg("ffmpeg"), "-version");
+		assert.equal(versionProbeArg("ffprobe"), "-version");
+	});
+	it("keeps GNU-style --version for everything else", () => {
+		assert.equal(versionProbeArg("yt-dlp"), "--version");
+		assert.equal(versionProbeArg("anything-else"), "--version");
 	});
 });
 

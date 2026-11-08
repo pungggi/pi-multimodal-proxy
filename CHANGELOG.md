@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.26.2] - 2026-11-08
+
+### Fixed
+
+- **`doctor` no longer misreports an installed `ffmpeg` as "not found" (issue #45)** — the version probe ran `ffmpeg --version`, but the FFmpeg family parses single-dash options only: `--version` is unrecognized, so ffmpeg prints its banner to **stderr** (stdout stays empty) and exits non-zero (code 8 on current builds). `execFile` turns that non-zero exit into a rejection, the catch returned `""`, and doctor concluded the binary was missing — while `yt-dlp` next to it, whose CLI is GNU-style and does accept `--version`, was detected fine. A new pure helper `versionProbeArg(bin)` picks `-version` for `ffmpeg`/`ffprobe` and `--version` for everything else, so the probe now exits 0 with the real version line (`ffmpeg version N.N.N Copyright …`) on stdout. Two new tests pin the mapping (628 total, all green; syntax check clean).
+
 ## [1.26.1] - 2026-11-07
 
 ### Changed

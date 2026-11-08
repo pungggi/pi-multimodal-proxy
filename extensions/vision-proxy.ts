@@ -325,6 +325,7 @@ import {
 	MAX_ALLOWED_FOLDERS,
 	sanitizeYtdlpExtractorArgs,
 	summarizeYtDlpError,
+	versionProbeArg,
 	YTDLP_COOKIES_BROWSERS,
 
 	readMediaFileWithReason,
@@ -4212,7 +4213,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		const toolVersion = async (bin: string): Promise<string> => {
 			try {
-				const { stdout } = await execFileAsync(bin, ["--version"], { windowsHide: true, timeout: 10_000 });
+				const { stdout } = await execFileAsync(bin, [versionProbeArg(bin)], {
+				windowsHide: true,
+				timeout: 10_000,
+			});
 				return (stdout.trim().split(/\r?\n/)[0] ?? "").slice(0, 48);
 			} catch {
 				return "";
